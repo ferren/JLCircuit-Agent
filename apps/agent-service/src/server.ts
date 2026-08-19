@@ -7,7 +7,7 @@ import {
   type ToolRequest,
   type ToolResponse,
 } from "../../../packages/bridge/src/index.ts";
-import type { ChangeSet } from "../../../packages/contracts/src/index.ts";
+import type { ChangeOperation, ChangeSet } from "../../../packages/contracts/src/index.ts";
 import { JLCIRCUIT_TOOLS, getTool } from "../../../packages/mcp/src/index.ts";
 import { runAgentTurn } from "./llm.ts";
 
@@ -140,16 +140,136 @@ const callTool = async (
   return bridge.send(createToolRequest(sessionId, toolName, payload));
 };
 
-const runModelTurn = async (sessionId: string, instruction: string) => {
-  log("[llm] turn started", { sessionId, provider: process.env.JLCIRCUIT_MODEL_PROVIDER ?? "stub" });
+type TaskStatus = "planning" | "waiting_confirmation" | "executing" | "completed" | "failed" | "cancelled";
+
+type TaskExecution = {
+  operations: Array<{ operationId: string; tool: string; ok: boolean; data?: unknown; error?: string }>;
+  verification?: { ok: boolean; data?: unknown; error?: string };
+};
+
+type AgentTask = {
+  taskId: string;
+  sessionId: string;
+  instruction: string;
+  status: TaskStatus;
+  model: string;
+  message: string;
+  context: unknown;
+  toolTrace: unknown[];
+  changeSet: ChangeSet;
+  confirmationToken?: string;
+  execution?: TaskExecution;
+  createdAt: string;
+  updatedAt: string;
+};
+
+const tasks = new Map<string, AgentTask>();
+
+const runModelTurn = async (sessionId: string, instruction: string, mode: "chat" | "plan" = "chat") => {
+  log("[llm] turn started", { sessionId, mode, provider: process.env.JLCIRCUIT_MODEL_PROVIDER ?? "stub" });
   const result = await runAgentTurn({
     instruction,
     sessionId,
     toolDefinitions: JLCIRCUIT_TOOLS,
     executeTool: callTool,
+    mode,
   });
-  log("[llm] turn completed", { model: result.model, toolCount: result.toolTrace.length });
+  log("[llm] turn completed", {
+    model: result.model,
+    toolCount: result.toolTrace.length,
+    plannedOperationCount: result.plannedOperations.length,
+  });
   return result;
+};
+
+const createChangeSet = (result: Awaited<ReturnType<typeof runModelTurn>>): ChangeSet => ({
+  id: crypto.randomUUID(),
+  projectId: (result.context as { project?: { id?: string } } | undefined)?.project?.id,
+  documentId: (result.context as { activeDocument?: { id?: string } } | undefined)?.activeDocument?.id,
+  summary: result.message || "待确认的设计修改",
+  operations: result.plannedOperations,
+  requiresConfirmation: result.plannedOperations.length > 0,
+  createdAt: new Date().toISOString(),
+  createdBy: "agent",
+});
+
+const taskView = (task: AgentTask) => ({ ...task });
+
+const getTaskIdFromPath = (pathname: string, suffix: string): string | undefined => {
+  const prefix = "/v1/tasks/";
+  if (!pathname.startsWith(prefix) || !pathname.endsWith(suffix)) return undefined;
+  const taskId = pathname.slice(prefix.length, pathname.length - suffix.length);
+  return taskId || undefined;
+};
+
+const executeTask = async (task: AgentTask): Promise<boolean> => {
+  task.status = "executing";
+  task.updatedAt = new Date().toISOString();
+  const currentContext = await callTool("easyeda_get_context", task.sessionId, {});
+  if (!currentContext.ok) {
+    task.status = "failed";
+    task.execution = {
+      operations: [],
+      verification: { ok: false, error: currentContext.error?.message ?? "无法在写入前读取当前设计。" },
+    };
+    task.updatedAt = new Date().toISOString();
+    return false;
+  }
+  const plannedProjectId = (task.context as { project?: { id?: string } } | undefined)?.project?.id;
+  const currentProjectId = (currentContext.data as { project?: { id?: string } } | undefined)?.project?.id;
+  const plannedDocumentId = (task.context as { activeDocument?: { id?: string } } | undefined)?.activeDocument?.id;
+  const currentDocumentId = (currentContext.data as { activeDocument?: { id?: string } } | undefined)?.activeDocument?.id;
+  if ((plannedProjectId && currentProjectId && plannedProjectId !== currentProjectId) ||
+      (plannedDocumentId && currentDocumentId && plannedDocumentId !== currentDocumentId)) {
+    task.status = "failed";
+    task.execution = {
+      operations: [],
+      verification: { ok: false, error: "计划生成后当前项目或文档已发生变化，已阻止写入。请重新生成计划。" },
+    };
+    task.updatedAt = new Date().toISOString();
+    return false;
+  }
+  const operations: TaskExecution["operations"] = [];
+  for (const operation of task.changeSet.operations) {
+    if (operation.tool !== "easyeda_schematic_move_component") {
+      operations.push({
+        operationId: operation.id,
+        tool: operation.tool,
+        ok: false,
+        error: "当前阶段只允许执行原理图元件移动操作。",
+      });
+      continue;
+    }
+    const result = await callTool(operation.tool, task.sessionId, {
+      ...operation.args,
+      confirmWrite: true,
+      verifyVisual: false,
+    });
+    operations.push({
+      operationId: operation.id,
+      tool: operation.tool,
+      ok: result.ok,
+      data: result.ok ? result.data : undefined,
+      error: result.ok ? undefined : result.error?.message,
+    });
+  }
+
+  const verification = await callTool("easyeda_post_write_verify", task.sessionId, {
+    runDrc: true,
+    capture: true,
+  });
+  task.execution = {
+    operations,
+    verification: {
+      ok: verification.ok,
+      data: verification.ok ? verification.data : undefined,
+      error: verification.ok ? undefined : verification.error?.message,
+    },
+  };
+  const operationsOk = operations.length > 0 && operations.every((operation) => operation.ok);
+  task.status = operationsOk && verification.ok ? "completed" : "failed";
+  task.updatedAt = new Date().toISOString();
+  return task.status === "completed";
 };
 
 const server = createServer(async (request, response) => {
@@ -193,7 +313,7 @@ const server = createServer(async (request, response) => {
       return;
     }
 
-    if (request.method === "POST" && (url.pathname === "/v1/chat" || url.pathname === "/v1/plan")) {
+    if (request.method === "POST" && url.pathname === "/v1/chat") {
       const body = (await readBody(request)) as { sessionId?: string; instruction?: string };
       const sessionId = body.sessionId ?? "default";
       const instruction = body.instruction?.trim();
@@ -203,29 +323,103 @@ const server = createServer(async (request, response) => {
         return;
       }
       const result = await runModelTurn(sessionId, instruction);
-      if (url.pathname === "/v1/chat") {
-        json(response, 200, { sessionId, status: "completed", ...result });
+      json(response, 200, { sessionId, status: "completed", ...result });
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/plan") {
+      const body = (await readBody(request)) as { sessionId?: string; instruction?: string };
+      const sessionId = body.sessionId ?? "default";
+      const instruction = body.instruction?.trim();
+      log(`[http] POST ${url.pathname}`, { sessionId, instructionLength: instruction?.length ?? 0 });
+      if (!instruction) {
+        json(response, 400, { error: "invalid_request", message: "instruction is required." });
         return;
       }
-      const changeSet: ChangeSet = {
-        id: crypto.randomUUID(),
-        projectId: (result.context as { project?: { id?: string } } | undefined)?.project?.id,
-        documentId: (result.context as { activeDocument?: { id?: string } } | undefined)?.activeDocument?.id,
-        summary: result.message,
-        operations: [],
-        requiresConfirmation: true,
-        createdAt: new Date().toISOString(),
-        createdBy: "agent",
-      };
-      json(response, 200, {
+      const result = await runModelTurn(sessionId, instruction, "plan");
+      const changeSet = createChangeSet(result);
+      const now = new Date().toISOString();
+      const task: AgentTask = {
+        taskId: crypto.randomUUID(),
         sessionId,
-        status: "completed",
-        message: result.message,
+        instruction,
+        status: changeSet.operations.length > 0 ? "waiting_confirmation" : "completed",
         model: result.model,
+        message: result.message,
         context: result.context,
         toolTrace: result.toolTrace,
         changeSet,
-      });
+        confirmationToken: changeSet.operations.length > 0 ? crypto.randomUUID() : undefined,
+        createdAt: now,
+        updatedAt: now,
+      };
+      tasks.set(task.taskId, task);
+      json(response, 200, taskView(task));
+      return;
+    }
+
+    const taskIdForGet = request.method === "GET" && url.pathname.startsWith("/v1/tasks/")
+      ? url.pathname.slice("/v1/tasks/".length)
+      : undefined;
+    if (taskIdForGet) {
+      const task = tasks.get(taskIdForGet);
+      if (!task) {
+        json(response, 404, { error: "not_found", message: "task not found" });
+        return;
+      }
+      json(response, 200, taskView(task));
+      return;
+    }
+
+    const taskIdForConfirm = request.method === "POST"
+      ? getTaskIdFromPath(url.pathname, "/confirm")
+      : undefined;
+    if (taskIdForConfirm) {
+      const task = tasks.get(taskIdForConfirm);
+      if (!task) {
+        json(response, 404, { error: "not_found", message: "task not found" });
+        return;
+      }
+      const body = (await readBody(request)) as { confirmationToken?: string };
+      if (task.status !== "waiting_confirmation") {
+        json(response, 409, { error: "invalid_state", message: `任务当前状态为 ${task.status}，不能确认执行。`, task: taskView(task) });
+        return;
+      }
+      if (!task.confirmationToken || body.confirmationToken !== task.confirmationToken) {
+        json(response, 403, { error: "confirmation_required", message: "确认令牌无效。" });
+        return;
+      }
+      task.confirmationToken = undefined;
+      let succeeded = false;
+      try {
+        succeeded = await executeTask(task);
+      } catch (error) {
+        task.status = "failed";
+        task.execution = {
+          operations: [],
+          verification: { ok: false, error: error instanceof Error ? error.message : String(error) },
+        };
+        task.updatedAt = new Date().toISOString();
+      }
+      json(response, succeeded ? 200 : 502, taskView(task));
+      return;
+    }
+
+    const taskIdForCancel = request.method === "POST"
+      ? getTaskIdFromPath(url.pathname, "/cancel")
+      : undefined;
+    if (taskIdForCancel) {
+      const task = tasks.get(taskIdForCancel);
+      if (!task) {
+        json(response, 404, { error: "not_found", message: "task not found" });
+        return;
+      }
+      if (task.status === "waiting_confirmation") {
+        task.confirmationToken = undefined;
+        task.status = "cancelled";
+        task.updatedAt = new Date().toISOString();
+      }
+      json(response, 200, taskView(task));
       return;
     }
 

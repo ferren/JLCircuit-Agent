@@ -30,6 +30,22 @@ flowchart TD
 5. 用户确认后执行有限的原理图和 PCB 变更。
 6. 执行 DRC 并保存审计信息。
 
+## 当前阶段：多步修改闭环
+
+当前版本已经加入最小的任务状态流：
+
+```text
+POST /v1/plan
+  -> Agent 读取上下文并生成 ChangeSet
+  -> waiting_confirmation
+  -> POST /v1/tasks/:taskId/confirm
+  -> 写入前重新校验项目/文档
+  -> 执行受限写工具
+  -> DRC/ERC + 画布验证
+```
+
+第一条真实执行链只开放 `easyeda_schematic_move_component`。任务暂存于 Agent Service 内存中，服务重启后任务会丢失；后续再接入持久化任务、审计日志和更完整的回滚点。EDA 面板已经从单次分析按钮改为消息列表、计划卡片和确认/取消操作。
+
 ## 当前 Bridge 协议
 
 Agent Service 监听 `ws://127.0.0.1:49630/bridge`，EDA 扩展主动连接，消息使用 JSON 封装：

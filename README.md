@@ -40,7 +40,7 @@ npm run build:extension
 输出文件：
 
 ```text
-extensions/jlcircuit-eda/build/dist/jlcircuit-agent_v0.1.4.eext
+extensions/jlcircuit-eda/build/dist/jlcircuit-agent_v0.2.0.eext
 ```
 
 在嘉立创EDA专业版 V3 中选择“高级 → 扩展管理器 → 导入”，导入上面的 `.eext` 文件；V2 可从“设置 → 扩展 → 扩展管理器 → 导入扩展”进入。扩展需要开启 External Interaction 权限，运行时通过官方 `eda.sys_WebSocket` 连接本地 Agent 服务。
@@ -60,6 +60,9 @@ POST /v1/context
 POST /v1/drc
 POST /v1/chat
 POST /v1/plan
+GET  /v1/tasks/:taskId
+POST /v1/tasks/:taskId/confirm
+POST /v1/tasks/:taskId/cancel
 POST /v1/tools/easyeda_canvas_locate
 POST /v1/tools/easyeda_canvas_capture
 POST /v1/tools/easyeda_canvas_capture_region
@@ -112,6 +115,10 @@ JLCIRCUIT_LLM_CONTEXT_MAX_ITEMS=200
 模型调用画布截图时会先保留结构化工具结果，再追加一条包含 PNG Base64 的视觉消息，并要求模型检查元件/网络标签、断线悬空、文字碰撞、拥挤和不合理交叉。没有截图时仍只调用当前语言模型。
 
 `JLCIRCUIT_LLM_MAX_TOKENS` 限制单次模型输出（包括 reasoning）长度；`JLCIRCUIT_LLM_CONTEXT_MAX_CHARS` 限制发送给模型的设计上下文字符数；`JLCIRCUIT_LLM_CONTEXT_MAX_ITEMS` 限制元件和导线样例数量。服务会保留总数和截断标记，Agent 返回的原始上下文不受影响。
+
+### 多步修改流程
+
+当前版本的“生成修改计划”会调用 `/v1/plan`，只生成待确认的 `ChangeSet`，不会直接写入 EDA。用户确认后调用 `/v1/tasks/:taskId/confirm`，服务会在写入前重新读取项目和文档 ID，防止计划针对的设计已经变化；当前第一条真实执行链只支持 `easyeda_schematic_move_component`，执行后自动调用 `easyeda_post_write_verify`。取消计划调用 `/v1/tasks/:taskId/cancel`。
 
 测试接口：
 

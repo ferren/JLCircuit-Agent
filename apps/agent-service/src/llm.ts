@@ -1,4 +1,4 @@
-import type { EdaToolDefinition, ToolContent, ToolResponse } from "../../../packages/contracts/src/index.ts";
+import type { ChangeOperation, EdaToolDefinition, ToolContent, ToolResponse } from "../../../packages/contracts/src/index.ts";
 
 type LlmMessage = Record<string, unknown>;
 
@@ -41,6 +41,7 @@ export type AgentTurnResult = {
   message: string;
   model: string;
   context: unknown;
+  plannedOperations: ChangeOperation[];
   toolTrace: Array<{
     tool: string;
     arguments: Record<string, unknown>;
@@ -356,6 +357,7 @@ export const runAgentTurn = async (args: {
   sessionId: string;
   toolDefinitions: EdaToolDefinition[];
   executeTool: AgentToolExecutor;
+  mode?: "chat" | "plan";
 }): Promise<AgentTurnResult> => {
   const contextResponse = await args.executeTool("easyeda_get_context", args.sessionId, {});
   if (!contextResponse.ok) {
@@ -383,7 +385,10 @@ export const runAgentTurn = async (args: {
     },
   ];
   const toolTrace: AgentTurnResult["toolTrace"] = [];
+  const plannedOperations: ChangeOperation[] = [];
+  const plannedOperationKeys = new Set<string>();
   let route: CompletionRoute = "language";
+  const mode = args.mode ?? "chat";
 
   for (let round = 0; round < maxToolRounds(); round += 1) {
     const completion = await complete(messages, tools, route);
@@ -395,6 +400,7 @@ export const runAgentTurn = async (args: {
         message: assistant.content ?? "模型没有返回文本结果。",
         model: completion.model ?? model(),
         context,
+        plannedOperations,
         toolTrace,
       };
     }
@@ -424,6 +430,36 @@ export const runAgentTurn = async (args: {
       }
 
       if (!definition || definition.riskLevel !== "read") {
+        if (mode === "plan" && definition) {
+          const plannedArgs = { ...argumentsValue };
+          delete plannedArgs.confirmWrite;
+          const operationKey = `${call.function.name}:${stringifyForModel(plannedArgs)}`;
+          const existingOperation = plannedOperations.find((operation) => operationKey === `${operation.tool}:${stringifyForModel(operation.args)}`);
+          const operation = existingOperation ?? {
+            id: crypto.randomUUID(),
+            tool: call.function.name,
+            args: plannedArgs,
+            targets: [],
+            riskLevel: definition.riskLevel,
+            description: definition.description,
+          } satisfies ChangeOperation;
+          if (!plannedOperationKeys.has(operationKey)) {
+            plannedOperationKeys.add(operationKey);
+            plannedOperations.push(operation);
+          }
+          messages.push({
+            role: "tool",
+            tool_call_id: call.id,
+            content: stringifyForModel({
+              ok: true,
+              planned: true,
+              requiresConfirmation: true,
+              operationId: operation.id,
+              message: "写操作已加入待确认计划，尚未执行。",
+            }),
+          });
+          continue;
+        }
         const error = "当前模型回合只允许只读工具；写操作需要单独的用户确认流程。";
         toolTrace.push({ tool: call.function.name, arguments: argumentsValue, status: "blocked", error });
         messages.push({
@@ -459,6 +495,7 @@ export const runAgentTurn = async (args: {
     message: `模型连续请求了超过 ${maxToolRounds()} 轮工具调用，已停止本次回合，请缩小问题范围后重试。`,
     model: model(),
     context,
+    plannedOperations,
     toolTrace,
   };
 };

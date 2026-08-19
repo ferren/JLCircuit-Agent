@@ -5,172 +5,344 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>JLCircuit Agent</title>
     <style>
-      :root { color-scheme: light; font-family: system-ui, sans-serif; }
-      body { margin: 0; padding: 16px; color: #172033; background: #f6f8fb; }
-      h1 { margin: 0 0 8px; font-size: 20px; }
-      p { color: #5d687a; font-size: 13px; }
-      textarea { width: 100%; min-height: 90px; box-sizing: border-box; padding: 10px; border: 1px solid #ccd4e0; border-radius: 8px; resize: vertical; }
-      button { margin-top: 10px; padding: 9px 14px; border: 0; border-radius: 7px; color: white; background: #2463eb; cursor: pointer; }
-      button.secondary { margin-left: 6px; color: #172033; background: #dce5f5; }
-      pre { white-space: pre-wrap; word-break: break-word; padding: 10px; border-radius: 8px; background: #182233; color: #dbeafe; font-size: 12px; }
+      :root {
+        color-scheme: light;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        --ink: #172033;
+        --muted: #657187;
+        --line: #d8e0ec;
+        --panel: #ffffff;
+        --canvas: #f3f6fa;
+        --blue: #2463eb;
+        --green: #16834f;
+        --green-soft: #e8f7ef;
+        --orange: #a86408;
+        --orange-soft: #fff4df;
+        --red: #b42318;
+        --red-soft: #fff0ee;
+      }
+      * { box-sizing: border-box; }
+      body { margin: 0; min-height: 100vh; color: var(--ink); background: var(--canvas); }
+      button, textarea { font: inherit; }
+      button { border: 0; border-radius: 8px; cursor: pointer; }
+      button:disabled { cursor: wait; opacity: .55; }
+      .app { display: flex; flex-direction: column; height: 100vh; min-height: 480px; }
+      .header { padding: 14px 16px 10px; background: var(--panel); border-bottom: 1px solid var(--line); }
+      .header-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+      h1 { margin: 0; font-size: 18px; }
+      .subtitle { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
+      .connection { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+      .dot { width: 8px; height: 8px; border-radius: 50%; background: #9aa7b8; }
+      .dot.connected { background: var(--green); }
+      .dot.error { background: var(--red); }
+      .conversation { flex: 1; overflow: auto; padding: 14px 16px 10px; }
+      .welcome { margin: 12px auto 20px; max-width: 620px; color: var(--muted); text-align: center; font-size: 13px; }
+      .message { display: flex; margin: 0 auto 12px; max-width: 760px; }
+      .message.user { justify-content: flex-end; }
+      .bubble { max-width: 88%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); white-space: pre-wrap; word-break: break-word; line-height: 1.5; font-size: 13px; }
+      .message.user .bubble { color: white; border-color: var(--blue); background: var(--blue); }
+      .message.pending .bubble { color: var(--muted); background: #fafbfd; }
+      .message.error .bubble { color: var(--red); border-color: #f0b4ae; background: var(--red-soft); }
+      .message-meta { margin-top: 5px; color: var(--muted); font-size: 11px; }
+      .plan-card { width: min(760px, 100%); margin: 0 auto 14px; padding: 12px; border: 1px solid #b9c9ee; border-radius: 12px; background: var(--panel); box-shadow: 0 2px 10px rgb(31 60 120 / 5%); }
+      .plan-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+      .plan-title { font-weight: 650; font-size: 14px; }
+      .badge { padding: 3px 7px; border-radius: 999px; color: var(--orange); background: var(--orange-soft); font-size: 11px; }
+      .badge.done { color: var(--green); background: var(--green-soft); }
+      .badge.failed, .badge.cancelled { color: var(--red); background: var(--red-soft); }
+      .plan-summary { margin: 8px 0; color: var(--muted); white-space: pre-wrap; font-size: 13px; line-height: 1.45; }
+      .operations { margin: 8px 0 0; padding-left: 20px; color: var(--ink); font-size: 12px; }
+      .operations li { margin: 5px 0; }
+      .plan-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+      .primary { padding: 8px 12px; color: white; background: var(--blue); }
+      .success { padding: 8px 12px; color: white; background: var(--green); }
+      .secondary { padding: 8px 12px; color: var(--ink); background: #e7edf7; }
+      .danger { padding: 8px 12px; color: var(--red); background: var(--red-soft); }
+      .details { margin-top: 10px; padding: 9px; border-radius: 8px; background: #f7f9fc; color: var(--muted); white-space: pre-wrap; font-size: 11px; line-height: 1.45; }
+      .composer { padding: 10px 16px 14px; border-top: 1px solid var(--line); background: var(--panel); }
+      textarea { display: block; width: min(760px, 100%); min-height: 72px; margin: 0 auto; padding: 10px 12px; resize: vertical; border: 1px solid #c7d2e2; border-radius: 10px; outline: none; color: var(--ink); background: #fbfcfe; font-size: 13px; line-height: 1.45; }
+      textarea:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgb(36 99 235 / 12%); }
+      .composer-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: min(760px, 100%); margin: 8px auto 0; }
+      .hint { color: var(--muted); font-size: 11px; }
+      .actions { display: flex; flex-wrap: wrap; gap: 7px; justify-content: flex-end; }
+      .actions button { padding: 7px 10px; font-size: 12px; }
+      .small { color: var(--muted); background: transparent; }
     </style>
   </head>
   <body>
-    <h1>JLCircuit Agent</h1>
-      <p>先读取当前设计上下文，再生成可确认的变更计划。</p>
-      <textarea id="instruction" placeholder="例如：检查当前选中的电源部分是否缺少去耦电容"></textarea>
-    <div>
-      <button id="analyze">分析当前设计</button>
-      <button id="refresh" class="secondary">刷新摘要</button>
-    </div>
-    <pre id="output">等待操作…</pre>
+    <main class="app">
+      <header class="header">
+        <div class="header-row">
+          <div>
+            <h1>JLCircuit Agent</h1>
+            <p class="subtitle">先分析，再生成计划；写入操作必须确认。</p>
+          </div>
+          <div class="connection"><span id="connectionDot" class="dot"></span><span id="connectionText">检查连接中</span></div>
+        </div>
+      </header>
+      <section id="conversation" class="conversation" aria-live="polite">
+        <div id="welcome" class="welcome">可以连续输入多个问题。按 Enter 发送分析，按 Shift + Enter 换行；需要修改设计时点击“生成修改计划”。</div>
+      </section>
+      <footer class="composer">
+        <textarea id="instruction" placeholder="例如：检查当前原理图，或者把选中的 R1 移到 U1 左侧并保持接线不变"></textarea>
+        <div class="composer-row">
+          <span class="hint">当前会话：<span id="sessionLabel"></span></span>
+          <div class="actions">
+            <button id="clear" class="small" type="button">清空对话</button>
+            <button id="refresh" class="secondary" type="button">刷新摘要</button>
+            <button id="analyze" class="primary" type="button">发送分析</button>
+            <button id="plan" class="success" type="button">生成修改计划</button>
+          </div>
+        </div>
+      </footer>
+    </main>
     <script>
-      const output = document.querySelector('#output');
+      const API_ORIGIN = 'http://127.0.0.1:49630';
       const runtime = globalThis.eda;
-
-      const read = async (target, method) => {
-        const fn = target && target[method];
-        if (typeof fn !== 'function') return { value: undefined };
+      const conversation = document.querySelector('#conversation');
+      const welcome = document.querySelector('#welcome');
+      const instructionInput = document.querySelector('#instruction');
+      const connectionDot = document.querySelector('#connectionDot');
+      const connectionText = document.querySelector('#connectionText');
+      const sessionLabel = document.querySelector('#sessionLabel');
+      const sessionId = (() => {
         try {
-          return { value: await fn.call(target) };
+          const existing = globalThis.sessionStorage?.getItem('jlcircuit-agent-session');
+          const value = existing || 'jlcircuit-agent-ui';
+          globalThis.sessionStorage?.setItem('jlcircuit-agent-session', value);
+          return value;
+        } catch {
+          return 'jlcircuit-agent-ui';
+        }
+      })();
+      let busy = false;
+      sessionLabel.textContent = sessionId;
+
+      const setConnection = (state, text) => {
+        connectionDot.className = `dot ${state || ''}`;
+        connectionText.textContent = text;
+      };
+
+      const addMessage = (role, text, meta = '', extraClass = '') => {
+        welcome.style.display = 'none';
+        const wrapper = document.createElement('div');
+        wrapper.className = `message ${role} ${extraClass}`;
+        const bubble = document.createElement('div');
+        bubble.className = 'bubble';
+        bubble.textContent = text;
+        wrapper.appendChild(bubble);
+        if (meta) {
+          const metaNode = document.createElement('div');
+          metaNode.className = 'message-meta';
+          metaNode.textContent = meta;
+          bubble.appendChild(metaNode);
+        }
+        conversation.appendChild(wrapper);
+        conversation.scrollTop = conversation.scrollHeight;
+        return wrapper;
+      };
+
+      const addDetails = (text) => {
+        const wrapper = document.createElement('div');
+        wrapper.className = 'message assistant';
+        const details = document.createElement('div');
+        details.className = 'details';
+        details.textContent = text;
+        wrapper.appendChild(details);
+        conversation.appendChild(wrapper);
+        conversation.scrollTop = conversation.scrollHeight;
+      };
+
+      const request = async (path, method = 'POST', body) => {
+        const clientUrl = runtime && runtime.sys_ClientUrl;
+        if (!clientUrl || typeof clientUrl.request !== 'function') throw new Error('当前 EDA 没有提供 sys_ClientUrl.request。');
+        const response = await clientUrl.request(
+          `${API_ORIGIN}${path}`,
+          method,
+          body === undefined ? undefined : JSON.stringify(body),
+          { headers: { 'content-type': 'application/json' } },
+        );
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.message || payload.error || `Agent 服务返回 HTTP ${response.status}`);
+        return payload;
+      };
+
+      const compactContextLabel = (context) => {
+        const summary = context?.summary || {};
+        const components = Array.isArray(summary.components) ? summary.components.length : summary.components?.total;
+        const wires = Array.isArray(summary.wires) ? summary.wires.length : summary.wires?.total;
+        const drc = Array.isArray(context?.drc) ? context.drc.length : 0;
+        return `${context?.project?.name || '当前项目'} · ${context?.activeDocument?.type || '未知文档'} · 元件 ${components ?? '-'} · 导线 ${wires ?? '-'} · DRC ${drc}`;
+      };
+
+      const operationLabel = (operation) => {
+        if (operation.tool === 'easyeda_schematic_move_component') {
+          const id = operation.args?.primitiveId || '未指定元件';
+          return `移动原理图元件 ${id} 到 (${operation.args?.x}, ${operation.args?.y})，保持接线：${operation.args?.preserveConnections !== false ? '是' : '否'}`;
+        }
+        return `${operation.tool}: ${JSON.stringify(operation.args || {})}`;
+      };
+
+      const statusLabel = (status) => ({ waiting_confirmation: '等待确认', executing: '执行中', completed: '已完成', failed: '执行失败', cancelled: '已取消', planning: '规划中' }[status] || status || '未知状态');
+
+      const renderTask = (task) => {
+        const card = document.createElement('article');
+        card.className = 'plan-card';
+        const head = document.createElement('div');
+        head.className = 'plan-head';
+        const title = document.createElement('div');
+        title.className = 'plan-title';
+        title.textContent = '修改计划';
+        const badge = document.createElement('span');
+        badge.className = `badge ${task.status === 'completed' ? 'done' : task.status === 'failed' || task.status === 'cancelled' ? 'failed' : ''}`;
+        badge.textContent = statusLabel(task.status);
+        head.append(title, badge);
+        card.appendChild(head);
+
+        const summary = document.createElement('div');
+        summary.className = 'plan-summary';
+        summary.textContent = task.message || task.changeSet?.summary || '模型生成了一个待确认计划。';
+        card.appendChild(summary);
+
+        const operations = document.createElement('ol');
+        operations.className = 'operations';
+        (task.changeSet?.operations || []).forEach((operation) => {
+          const item = document.createElement('li');
+          item.textContent = operationLabel(operation);
+          operations.appendChild(item);
+        });
+        if (!operations.children.length) {
+          const item = document.createElement('li');
+          item.textContent = '本次没有生成可执行的写操作。';
+          operations.appendChild(item);
+        }
+        card.appendChild(operations);
+
+        const actions = document.createElement('div');
+        actions.className = 'plan-actions';
+        if (task.status === 'waiting_confirmation') {
+          const confirm = document.createElement('button');
+          confirm.className = 'success';
+          confirm.textContent = '确认执行';
+          confirm.addEventListener('click', () => confirmTask(task, confirm));
+          const cancel = document.createElement('button');
+          cancel.className = 'danger';
+          cancel.textContent = '取消计划';
+          cancel.addEventListener('click', () => cancelTask(task, cancel));
+          actions.append(confirm, cancel);
+        }
+        if (task.execution) {
+          const verification = task.execution.verification;
+          const detail = document.createElement('div');
+          detail.className = 'details';
+          const operationResults = (task.execution.operations || []).map((item) => `${item.ok ? '通过' : '失败'} · ${item.tool}${item.error ? ` · ${item.error}` : ''}`).join('\n');
+          const semantic = verification?.data?.semantic;
+          detail.textContent = [
+            '执行结果：', operationResults || '无操作结果', '',
+            `验证：${verification?.ok ? '已完成' : '失败'}`,
+            semantic ? `DRC/ERC：检查 ${semantic.drcChecked ? '已执行' : '未执行'}，问题 ${semantic.drcIssueCount ?? '-'}` : '',
+            verification?.data?.visual?.captured ? '画布截图：已获取，可进行视觉复核' : '画布截图：未获取',
+          ].filter(Boolean).join('\n');
+          card.appendChild(detail);
+        }
+        card.appendChild(actions);
+        conversation.appendChild(card);
+        conversation.scrollTop = conversation.scrollHeight;
+      };
+
+      const sendAnalysis = async () => {
+        const instruction = instructionInput.value.trim();
+        if (!instruction || busy) return;
+        busy = true;
+        instructionInput.value = '';
+        addMessage('user', instruction);
+        const pending = addMessage('assistant', '正在读取设计并分析…', '', 'pending');
+        try {
+          const result = await request('/v1/chat', 'POST', { sessionId, instruction });
+          pending.remove();
+          const trace = (result.toolTrace || []).map((item) => `${item.status}: ${item.tool}`).join('\n');
+          addMessage('assistant', result.message || '模型没有返回文本结果。', `模型：${result.model || 'unknown'}`);
+          if (trace) addDetails(`工具调用：\n${trace}`);
+          setConnection('connected', 'Agent 已连接');
         } catch (error) {
-          return { error: String(error) };
+          pending.remove();
+          addMessage('assistant', `分析失败：${String(error)}`, '', 'error');
+          setConnection('error', '请求失败');
+        } finally { busy = false; }
+      };
+
+      const createPlan = async () => {
+        const instruction = instructionInput.value.trim();
+        if (!instruction || busy) return;
+        busy = true;
+        instructionInput.value = '';
+        addMessage('user', `生成修改计划：${instruction}`);
+        const pending = addMessage('assistant', '正在读取设计并生成待确认计划…', '', 'pending');
+        try {
+          const task = await request('/v1/plan', 'POST', { sessionId, instruction });
+          pending.remove();
+          addMessage('assistant', task.status === 'waiting_confirmation' ? '计划已生成，请确认后执行。' : (task.message || '计划处理完成。'), `任务：${task.taskId}`);
+          renderTask(task);
+          setConnection('connected', 'Agent 已连接');
+        } catch (error) {
+          pending.remove();
+          addMessage('assistant', `生成计划失败：${String(error)}`, '', 'error');
+          setConnection('error', '请求失败');
+        } finally { busy = false; }
+      };
+
+      const confirmTask = async (task, button) => {
+        if (busy) return;
+        busy = true;
+        button.disabled = true;
+        addMessage('assistant', '已确认，正在执行修改并进行 DRC/ERC 与画布验证…', `任务：${task.taskId}`, 'pending');
+        try {
+          const result = await request(`/v1/tasks/${encodeURIComponent(task.taskId)}/confirm`, 'POST', { confirmationToken: task.confirmationToken });
+          renderTask(result);
+          addMessage('assistant', result.status === 'completed' ? '修改已完成，验证结果已附在任务卡片中。' : '修改执行未完全成功，请查看任务卡片中的错误和验证结果。', '', result.status === 'completed' ? '' : 'error');
+        } catch (error) { addMessage('assistant', `执行失败：${String(error)}`, '', 'error'); }
+        finally { busy = false; button.disabled = false; }
+      };
+
+      const cancelTask = async (task, button) => {
+        if (busy) return;
+        busy = true;
+        button.disabled = true;
+        try {
+          const result = await request(`/v1/tasks/${encodeURIComponent(task.taskId)}/cancel`, 'POST', {});
+          renderTask(result);
+          addMessage('assistant', '修改计划已取消，未执行写操作。');
+        } catch (error) { addMessage('assistant', `取消失败：${String(error)}`, '', 'error'); }
+        finally { busy = false; button.disabled = false; }
+      };
+
+      const refresh = async (quiet = false) => {
+        if (!quiet) addMessage('assistant', '正在刷新当前设计摘要…', '', 'pending');
+        try {
+          const result = await request('/v1/context', 'POST', { sessionId });
+          setConnection('connected', 'Agent 已连接');
+          if (!quiet) addMessage('assistant', compactContextLabel(result.data), '上下文已刷新');
+        } catch (error) {
+          setConnection('error', 'Bridge 未连接');
+          if (!quiet) addMessage('assistant', `刷新失败：${String(error)}`, '', 'error');
         }
       };
 
-      const safeValue = (value) => {
-        if (!value || typeof value !== 'object') return value;
-        const record = value;
-        const rawType = record.documentType ?? record.type;
-        const type = rawType === 1 || rawType === '1'
-          ? 'schematic-page'
-          : rawType === 3 || rawType === '3'
-            ? 'pcb'
-            : rawType === 5 || rawType === '5'
-              ? 'project'
-              : rawType;
-        return {
-          id: record.uuid ?? record.id,
-          name: record.name,
-          type,
-        };
-      };
-
-      async function requestAgentContext() {
-        const clientUrl = runtime && runtime.sys_ClientUrl;
-        if (!clientUrl || typeof clientUrl.request !== 'function') {
-          throw new Error('当前 EDA 没有提供 sys_ClientUrl.request。');
-        }
-        const response = await clientUrl.request(
-          'http://127.0.0.1:49630/v1/context',
-          'POST',
-          JSON.stringify({ sessionId: 'jlcircuit-agent-ui' }),
-          { headers: { 'content-type': 'application/json' } },
-        );
-        const body = await response.json();
-        if (!response.ok || !body.ok) {
-          throw new Error(body.error?.message ?? `Agent 服务返回 HTTP ${response.status}`);
-        }
-        return body.data;
-      }
-
-      async function requestAgentChat(instruction) {
-        const clientUrl = runtime && runtime.sys_ClientUrl;
-        if (!clientUrl || typeof clientUrl.request !== 'function') {
-          throw new Error('当前 EDA 没有提供 sys_ClientUrl.request。');
-        }
-        const response = await clientUrl.request(
-          'http://127.0.0.1:49630/v1/chat',
-          'POST',
-          JSON.stringify({ sessionId: 'jlcircuit-agent-ui', instruction }),
-          { headers: { 'content-type': 'application/json' } },
-        );
-        const body = await response.json();
-        if (!response.ok) {
-          throw new Error(body.message ?? body.error ?? `Agent 服务返回 HTTP ${response.status}`);
-        }
-        return body;
-      }
-
-      async function readSummary() {
-        if (!runtime) throw new Error('当前 EDA 没有向 iframe 注入 eda API。');
-        let agentError;
-        try {
-          const context = await requestAgentContext();
-          return {
-            source: 'agent-service → WebSocket → EasyEDA extension',
-            ...context,
-            capturedAt: new Date().toISOString(),
-          };
-        } catch (error) {
-          agentError = String(error);
-        }
-
-        const projectResult = await read(runtime.dmt_Project, 'getCurrentProjectInfo');
-        const documentResult = await read(runtime.dmt_SelectControl, 'getCurrentDocumentInfo');
-        const project = projectResult.value;
-        const document = documentResult.value;
-        const documentType = String(document?.documentType ?? document?.type ?? '').toLowerCase();
-        const schematic = documentType.includes('sch');
-        const componentsResult = schematic
-          ? await read(runtime.sch_PrimitiveComponent, 'getAllPrimitiveId')
-          : { value: undefined };
-        const wiresResult = schematic
-          ? await read(runtime.sch_PrimitiveWire, 'getAllPrimitiveId')
-          : { value: undefined };
-        const selectedApi = schematic ? runtime.sch_SelectControl : runtime.pcb_SelectControl;
-        const selectedResult = await read(selectedApi, 'getAllSelectedPrimitives_PrimitiveId');
-        return {
-          project: safeValue(project),
-          document: safeValue(document),
-          selectedCount: Array.isArray(selectedResult.value) ? selectedResult.value.length : 0,
-          schematic: schematic ? {
-            componentCount: Array.isArray(componentsResult.value) ? componentsResult.value.length : 0,
-            wireCount: Array.isArray(wiresResult.value) ? wiresResult.value.length : 0,
-          } : undefined,
-          apiDiagnostics: {
-            agentService: agentError,
-            project: projectResult.error,
-            document: documentResult.error,
-            components: componentsResult.error,
-            wires: wiresResult.error,
-            selected: selectedResult.error,
-          },
-          capturedAt: new Date().toISOString(),
-        };
-      }
-
-      async function refresh() {
-        output.textContent = '正在读取当前设计…';
-        try {
-          const summary = await readSummary();
-          output.textContent = JSON.stringify(summary, null, 2);
-        } catch (error) {
-          output.textContent = `读取失败：${String(error)}`;
-        }
-      }
-
-      document.querySelector('#analyze').addEventListener('click', async () => {
-        const instruction = document.querySelector('#instruction').value.trim()
-          || '请总结当前设计，并指出最值得优先检查的问题。';
-        output.textContent = '正在读取上下文并请求大语言模型…';
-        try {
-          const result = await requestAgentChat(instruction);
-          const trace = (result.toolTrace || [])
-            .map((item) => `${item.status}: ${item.tool}`)
-            .join('\n');
-          output.textContent = [
-            `模型：${result.model || 'unknown'}`,
-            '',
-            result.message || '模型没有返回文本结果。',
-            trace ? `\n工具调用：\n${trace}` : '',
-          ].join('\n');
-        } catch (error) {
-          output.textContent = `模型请求失败：${String(error)}\n\n可先点击“刷新摘要”确认 EDA 桥接是否正常。`;
+      document.querySelector('#analyze').addEventListener('click', sendAnalysis);
+      document.querySelector('#plan').addEventListener('click', createPlan);
+      document.querySelector('#refresh').addEventListener('click', () => refresh(false));
+      document.querySelector('#clear').addEventListener('click', () => {
+        conversation.innerHTML = '';
+        conversation.appendChild(welcome);
+        welcome.style.display = '';
+      });
+      instructionInput.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' && !event.shiftKey) {
+          event.preventDefault();
+          sendAnalysis();
         }
       });
-      document.querySelector('#refresh').addEventListener('click', refresh);
-      refresh();
+      refresh(true);
     </script>
   </body>
 </html>

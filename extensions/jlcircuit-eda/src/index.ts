@@ -20,7 +20,7 @@ const notify = (message: string, title = "JLCircuit Agent"): void => {
 export async function connectAgentBridge(): Promise<void> {
   bridgeClient ??= new EdaBridgeClient(eda, {
     url: "ws://127.0.0.1:49630/bridge",
-    extensionVersion: "0.1.4",
+    extensionVersion: "0.2.0",
   });
   await bridgeClient.connect();
 }
