@@ -1,0 +1,33 @@
+node_modules/
+dist/
+build/
+.env
+.env.*
+!.env.example
+coverage/
+.DS_Store
+*.log
+
+# Local build/package artifacts
+*.eext
+*.zip
+*.tar
+*.tgz
+
+# Credentials, API keys, certificates, and local secret material
+*.key
+*.apikey
+*.secret
+*.secrets
+*.pem
+*.crt
+*.cer
+*.p12
+*.pfx
+*.jks
+secrets/
+**/secrets/
+credentials*.json
+**/credentials*.json
+*-credentials.json
+**/*-credentials.json

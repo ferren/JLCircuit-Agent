@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>JLCircuit Agent</title>
+    <style>
+      :root { color-scheme: light; font-family: system-ui, sans-serif; }
+      body { margin: 0; padding: 16px; color: #172033; background: #f6f8fb; }
+      h1 { margin: 0 0 8px; font-size: 20px; }
+      p { color: #5d687a; font-size: 13px; }
+      textarea { width: 100%; min-height: 90px; box-sizing: border-box; padding: 10px; border: 1px solid #ccd4e0; border-radius: 8px; resize: vertical; }
+      button { margin-top: 10px; padding: 9px 14px; border: 0; border-radius: 7px; color: white; background: #2463eb; cursor: pointer; }
+      button.secondary { margin-left: 6px; color: #172033; background: #dce5f5; }
+      pre { white-space: pre-wrap; word-break: break-word; padding: 10px; border-radius: 8px; background: #182233; color: #dbeafe; font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <h1>JLCircuit Agent</h1>
+      <p>先读取当前设计上下文，再生成可确认的变更计划。</p>
+      <textarea id="instruction" placeholder="例如：检查当前选中的电源部分是否缺少去耦电容"></textarea>
+    <div>
+      <button id="analyze">分析当前设计</button>
+      <button id="refresh" class="secondary">刷新摘要</button>
+    </div>
+    <pre id="output">等待操作…</pre>
+    <script>
+      const output = document.querySelector('#output');
+      const runtime = globalThis.eda;
+
+      const read = async (target, method) => {
+        const fn = target && target[method];
+        if (typeof fn !== 'function') return { value: undefined };
+        try {
+          return { value: await fn.call(target) };
+        } catch (error) {
+          return { error: String(error) };
+        }
+      };
+
+      const safeValue = (value) => {
+        if (!value || typeof value !== 'object') return value;
+        const record = value;
+        const rawType = record.documentType ?? record.type;
+        const type = rawType === 1 || rawType === '1'
+          ? 'schematic-page'
+          : rawType === 3 || rawType === '3'
+            ? 'pcb'
+            : rawType === 5 || rawType === '5'
+              ? 'project'
+              : rawType;
+        return {
+          id: record.uuid ?? record.id,
+          name: record.name,
+          type,
+        };
+      };
+
+      async function requestAgentContext() {
+        const clientUrl = runtime && runtime.sys_ClientUrl;
+        if (!clientUrl || typeof clientUrl.request !== 'function') {
+          throw new Error('当前 EDA 没有提供 sys_ClientUrl.request。');
+        }
+        const response = await clientUrl.request(
+          'http://127.0.0.1:49630/v1/context',
+          'POST',
+          JSON.stringify({ sessionId: 'jlcircuit-agent-ui' }),
+          { headers: { 'content-type': 'application/json' } },
+        );
+        const body = await response.json();
+        if (!response.ok || !body.ok) {
+          throw new Error(body.error?.message ?? `Agent 服务返回 HTTP ${response.status}`);
+        }
+        return body.data;
+      }
+
+      async function requestAgentChat(instruction) {
+        const clientUrl = runtime && runtime.sys_ClientUrl;
+        if (!clientUrl || typeof clientUrl.request !== 'function') {
+          throw new Error('当前 EDA 没有提供 sys_ClientUrl.request。');
+        }
+        const response = await clientUrl.request(
+          'http://127.0.0.1:49630/v1/chat',
+          'POST',
+          JSON.stringify({ sessionId: 'jlcircuit-agent-ui', instruction }),
+          { headers: { 'content-type': 'application/json' } },
+        );
+        const body = await response.json();
+        if (!response.ok) {
+          throw new Error(body.message ?? body.error ?? `Agent 服务返回 HTTP ${response.status}`);
+        }
+        return body;
+      }
+
+      async function readSummary() {
+        if (!runtime) throw new Error('当前 EDA 没有向 iframe 注入 eda API。');
+        let agentError;
+        try {
+          const context = await requestAgentContext();
+          return {
+            source: 'agent-service → WebSocket → EasyEDA extension',
+            ...context,
+            capturedAt: new Date().toISOString(),
+          };
+        } catch (error) {
+          agentError = String(error);
+        }
+
+        const projectResult = await read(runtime.dmt_Project, 'getCurrentProjectInfo');
+        const documentResult = await read(runtime.dmt_SelectControl, 'getCurrentDocumentInfo');
+        const project = projectResult.value;
+        const document = documentResult.value;
+        const documentType = String(document?.documentType ?? document?.type ?? '').toLowerCase();
+        const schematic = documentType.includes('sch');
+        const componentsResult = schematic
+          ? await read(runtime.sch_PrimitiveComponent, 'getAllPrimitiveId')
+          : { value: undefined };
+        const wiresResult = schematic
+          ? await read(runtime.sch_PrimitiveWire, 'getAllPrimitiveId')
+          : { value: undefined };
+        const selectedApi = schematic ? runtime.sch_SelectControl : runtime.pcb_SelectControl;
+        const selectedResult = await read(selectedApi, 'getAllSelectedPrimitives_PrimitiveId');
+        return {
+          project: safeValue(project),
+          document: safeValue(document),
+          selectedCount: Array.isArray(selectedResult.value) ? selectedResult.value.length : 0,
+          schematic: schematic ? {
+            componentCount: Array.isArray(componentsResult.value) ? componentsResult.value.length : 0,
+            wireCount: Array.isArray(wiresResult.value) ? wiresResult.value.length : 0,
+          } : undefined,
+          apiDiagnostics: {
+            agentService: agentError,
+            project: projectResult.error,
+            document: documentResult.error,
+            components: componentsResult.error,
+            wires: wiresResult.error,
+            selected: selectedResult.error,
+          },
+          capturedAt: new Date().toISOString(),
+        };
+      }
+
+      async function refresh() {
+        output.textContent = '正在读取当前设计…';
+        try {
+          const summary = await readSummary();
+          output.textContent = JSON.stringify(summary, null, 2);
+        } catch (error) {
+          output.textContent = `读取失败：${String(error)}`;
+        }
+      }
+
+      document.querySelector('#analyze').addEventListener('click', async () => {
+        const instruction = document.querySelector('#instruction').value.trim()
+          || '请总结当前设计，并指出最值得优先检查的问题。';
+        output.textContent = '正在读取上下文并请求大语言模型…';
+        try {
+          const result = await requestAgentChat(instruction);
+          const trace = (result.toolTrace || [])
+            .map((item) => `${item.status}: ${item.tool}`)
+            .join('\n');
+          output.textContent = [
+            `模型：${result.model || 'unknown'}`,
+            '',
+            result.message || '模型没有返回文本结果。',
+            trace ? `\n工具调用：\n${trace}` : '',
+          ].join('\n');
+        } catch (error) {
+          output.textContent = `模型请求失败：${String(error)}\n\n可先点击“刷新摘要”确认 EDA 桥接是否正常。`;
+        }
+      });
+      document.querySelector('#refresh').addEventListener('click', refresh);
+      refresh();
+    </script>
+  </body>
+</html>

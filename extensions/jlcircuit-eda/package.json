@@ -1,0 +1,23 @@
+{
+	"name": "@jlcircuit/eda-extension",
+	"version": "0.1.4",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"compile": "rimraf ./dist/ && ts-node ./config/esbuild.prod.ts",
+		"build": "npm run compile && ts-node ./build/packaged.ts",
+		"lint": "eslint"
+	},
+	"devDependencies": {
+		"@jlceda/pro-api-types": "^0.4.8",
+		"@types/fs-extra": "^11.0.4",
+		"esbuild": "^0.24.2",
+		"eslint": "^9.37.0",
+		"fs-extra": "^11.3.0",
+		"ignore": "^7.0.3",
+		"jszip": "^3.10.1",
+		"rimraf": "^6.0.1",
+		"ts-node": "^10.9.2",
+		"typescript": "^5.7.3"
+	}
+}

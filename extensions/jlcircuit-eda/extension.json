@@ -1,0 +1,65 @@
+{
+  "name": "jlcircuit-agent",
+  "uuid": "234378fa9bd24c41be893b5e7b0ce0f7",
+  "displayName": "JLCircuit Agent",
+  "description": "嘉立创智能电路助手：读取设计上下文并生成可确认的结构化变更。",
+  "version": "0.1.4",
+  "publisher": "JLCircuit Agent",
+  "engines": {
+    "eda": "^3.2.0"
+  },
+  "license": "MIT",
+  "categories": "Other",
+  "keywords": [
+    "ai",
+    "mcp",
+    "schematic",
+    "pcb",
+    "drc"
+  ],
+  "allowExternalInteraction": true,
+  "activationEvents": {},
+  "dependentExtensions": {},
+  "entry": "./dist/index",
+  "headerMenus": {
+    "home": [
+      {
+        "id": "jlcircuit-agent-home",
+        "title": "JLCircuit Agent",
+        "menuItems": [
+          {
+            "id": "jlcircuit-agent-open",
+            "title": "打开智能助手",
+            "registerFn": "openAssistantPanel"
+          }
+        ]
+      }
+    ],
+    "sch": [
+      {
+        "id": "jlcircuit-agent-sch",
+        "title": "JLCircuit Agent",
+        "menuItems": [
+          {
+            "id": "jlcircuit-agent-open-sch",
+            "title": "分析当前原理图",
+            "registerFn": "openAssistantPanel"
+          }
+        ]
+      }
+    ],
+    "pcb": [
+      {
+        "id": "jlcircuit-agent-pcb",
+        "title": "JLCircuit Agent",
+        "menuItems": [
+          {
+            "id": "jlcircuit-agent-open-pcb",
+            "title": "分析当前PCB",
+            "registerFn": "openAssistantPanel"
+          }
+        ]
+      }
+    ]
+  }
+}

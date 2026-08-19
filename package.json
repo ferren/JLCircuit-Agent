@@ -1,0 +1,27 @@
+{
+  "name": "jlcircuit-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "嘉立创智能电路助手：本地 EDA 扩展与 Agent 编排服务",
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*",
+    "extensions/*"
+  ],
+  "scripts": {
+    "dev": "node --env-file-if-exists=.env --experimental-strip-types apps/agent-service/src/server.ts",
+    "start": "node --env-file-if-exists=.env --experimental-strip-types apps/agent-service/src/server.ts",
+    "build:extension": "npm --workspace @jlcircuit/eda-extension run build",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "typescript": "^5.7.2"
+  }
+}
