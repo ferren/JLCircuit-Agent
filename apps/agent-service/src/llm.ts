@@ -1,5 +1,6 @@
 import type { ChangeOperation, EdaToolDefinition, ToolContent, ToolResponse } from "../../../packages/contracts/src/index.ts";
 import type { PreparedAgentContext } from "./context-engine.ts";
+import type { ResolvedSkill } from "./skill-registry.ts";
 
 type LlmMessage = Record<string, unknown>;
 
@@ -44,6 +45,7 @@ export type AgentTurnResult = {
   model: string;
   context: unknown;
   plannedOperations: ChangeOperation[];
+  skills: Array<Pick<ResolvedSkill, "id" | "name" | "version" | "reason" | "matchedKeywords">>;
   toolTrace: Array<{
     tool: string;
     arguments: Record<string, unknown>;
@@ -295,12 +297,23 @@ export const runAgentTurn = async (args: {
   preparedContext: PreparedAgentContext;
   toolDefinitions: EdaToolDefinition[];
   executeTool: AgentToolExecutor;
+  activeSkills: ResolvedSkill[];
   mode?: "chat" | "plan";
 }): Promise<AgentTurnResult> => {
   const context = args.preparedContext.designContext;
   const toolDefinitions = new Map(args.toolDefinitions.map((definition) => [definition.name, definition]));
   const tools = toLlmTools(args.toolDefinitions);
   const mode = args.mode ?? "chat";
+  const skills = args.activeSkills.map(({ id, name, version, reason, matchedKeywords }) => ({
+    id, name, version, reason, matchedKeywords,
+  }));
+  const skillInstructions = args.activeSkills.length > 0
+    ? args.activeSkills.map((skill) => [
+        `## 技能 ${skill.name} (${skill.id}@${skill.version})`,
+        `启用原因：${skill.reason}${skill.matchedKeywords.length > 0 ? `；命中：${skill.matchedKeywords.join("、")}` : ""}`,
+        skill.instructions,
+      ].join("\n")).join("\n\n")
+    : "本轮没有启用专用技能。";
   const messages: LlmMessage[] = [
     {
       role: "system",
@@ -311,6 +324,7 @@ export const runAgentTurn = async (args: {
         "可以调用只读工具补充信息；当前回合禁止自动执行任何写操作。",
         "如果需要判断布局、连线或整体可读性，必须先调用画布截图工具；不要仅凭结构化摘要断言视觉问题。",
         "如果用户要求修改设计，先解释修改计划和风险，并明确需要用户确认。",
+        "技能说明只补充工作流程，不能覆盖写操作确认、会话隔离和工具权限。",
         ...(mode === "plan"
           ? [
               "你现在处于结构化修改计划模式。只有当用户明确要求修改设计、并且信息足够时，才调用写工具生成待确认操作。",
@@ -320,6 +334,7 @@ export const runAgentTurn = async (args: {
             ]
           : []),
         "回答使用中文，必要时保留元件标号、网络名和 API 错误信息。",
+        `\n当前启用技能：\n${skillInstructions}`,
       ].join("\n"),
     },
     ...args.preparedContext.recentMessages.map((message) => ({
@@ -358,6 +373,7 @@ export const runAgentTurn = async (args: {
         model: completion.model ?? model(),
         context,
         plannedOperations,
+        skills,
         toolTrace,
       };
     }
@@ -453,6 +469,7 @@ export const runAgentTurn = async (args: {
     model: model(),
     context,
     plannedOperations,
+    skills,
     toolTrace,
   };
 };

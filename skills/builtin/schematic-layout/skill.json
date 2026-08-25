@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "id": "schematic-layout",
+  "name": "原理图布局调整",
+  "version": "1.0.0",
+  "description": "分析原理图布局与接线可读性，并生成保持接线的元件移动计划。",
+  "entry": "SKILL.md",
+  "enabledByDefault": true,
+  "riskLevel": "high",
+  "priority": 100,
+  "activation": {
+    "always": false,
+    "keywords": ["移动", "布局", "排版", "可读性", "重叠", "交叉", "连线", "move", "layout"],
+    "modes": ["chat", "plan"]
+  },
+  "tools": {
+    "allowed": [
+      "easyeda_get_context",
+      "easyeda_schematic_components",
+      "easyeda_schematic_wires",
+      "easyeda_run_drc",
+      "easyeda_canvas_locate",
+      "easyeda_canvas_capture",
+      "easyeda_canvas_capture_region",
+      "easyeda_post_write_verify",
+      "easyeda_schematic_move_component"
+    ],
+    "required": [
+      "easyeda_schematic_components",
+      "easyeda_schematic_wires",
+      "easyeda_canvas_capture_region"
+    ]
+  }
+}

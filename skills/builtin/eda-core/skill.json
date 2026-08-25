@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "id": "eda-core",
+  "name": "EDA 核心分析",
+  "version": "1.0.0",
+  "description": "读取当前设计、元件、连线、DRC 与画布证据，回答电路设计问题。",
+  "entry": "SKILL.md",
+  "enabledByDefault": true,
+  "riskLevel": "read",
+  "priority": 1000,
+  "activation": {
+    "always": true,
+    "keywords": [],
+    "modes": ["chat", "plan"]
+  },
+  "tools": {
+    "allowed": [
+      "easyeda_health_check",
+      "easyeda_get_context",
+      "easyeda_schematic_components",
+      "easyeda_schematic_wires",
+      "easyeda_run_drc",
+      "easyeda_canvas_locate",
+      "easyeda_canvas_capture",
+      "easyeda_canvas_capture_region",
+      "easyeda_post_write_verify"
+    ],
+    "required": ["easyeda_get_context"]
+  }
+}

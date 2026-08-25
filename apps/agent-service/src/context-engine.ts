@@ -147,9 +147,14 @@ export class ContextEngine {
     this.designMaxItems = positiveInteger(process.env.JLCIRCUIT_LLM_CONTEXT_MAX_ITEMS, 200);
   }
 
-  public beginTurn(sessionId: string, content: string, mode: ConversationMode): ConversationMessage {
+  public beginTurn(
+    sessionId: string,
+    content: string,
+    mode: ConversationMode,
+    metadata?: Record<string, unknown>,
+  ): ConversationMessage {
     this.store.ensureSession(sessionId);
-    const message = this.store.appendMessage({ sessionId, role: "user", mode, content });
+    const message = this.store.appendMessage({ sessionId, role: "user", mode, content, metadata });
     this.store.appendAuditEvent({
       sessionId,
       eventType: "turn.started",
@@ -165,6 +170,7 @@ export class ContextEngine {
     model: string;
     toolCount: number;
     plannedOperationCount: number;
+    metadata?: Record<string, unknown>;
   }): ConversationMessage {
     const message = this.store.appendMessage({
       sessionId: input.sessionId,
@@ -172,6 +178,7 @@ export class ContextEngine {
       mode: input.mode,
       content: input.content,
       model: input.model,
+      metadata: input.metadata,
     });
     this.store.refreshSessionSummary(
       input.sessionId,

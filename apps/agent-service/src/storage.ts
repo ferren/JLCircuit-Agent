@@ -19,6 +19,13 @@ export type TaskExecution = {
   verification?: { ok: boolean; data?: unknown; error?: string };
 };
 
+export type PersistedSkillRef = {
+  id: string;
+  name: string;
+  version: string;
+  reason: "always" | "keyword" | "requested";
+};
+
 export type PersistedTask = {
   taskId: string;
   sessionId: string;
@@ -31,6 +38,7 @@ export type PersistedTask = {
   changeSet: ChangeSet;
   confirmationToken?: string;
   execution?: TaskExecution;
+  skills?: PersistedSkillRef[];
   createdAt: string;
   updatedAt: string;
 };
@@ -139,6 +147,7 @@ const rowToTask = (row: SqlRow): PersistedTask => ({
   }),
   confirmationToken: optionalString(row.confirmation_token),
   execution: jsonParse<TaskExecution | undefined>(row.execution_json, undefined),
+  skills: jsonParse<PersistedSkillRef[]>(row.skills_json, []),
   createdAt: String(row.created_at),
   updatedAt: String(row.updated_at),
 });
@@ -204,6 +213,7 @@ export class AgentStore {
         change_set_json TEXT NOT NULL,
         confirmation_token TEXT,
         execution_json TEXT,
+        skills_json TEXT NOT NULL DEFAULT '[]',
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
@@ -232,8 +242,18 @@ export class AgentStore {
       CREATE INDEX IF NOT EXISTS idx_audit_session_sequence
         ON audit_events(session_id, sequence);
 
-      PRAGMA user_version = 1;
+      CREATE TABLE IF NOT EXISTS skill_states (
+        skill_id TEXT PRIMARY KEY,
+        enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+        updated_at TEXT NOT NULL
+      );
+
+      PRAGMA user_version = 2;
     `);
+    const taskColumns = this.database.prepare("PRAGMA table_info(tasks)").all() as SqlRow[];
+    if (!taskColumns.some((column) => column.name === "skills_json")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN skills_json TEXT NOT NULL DEFAULT '[]';");
+    }
   }
 
   public ensureSession(
@@ -372,8 +392,8 @@ export class AgentStore {
       INSERT INTO tasks (
         task_id, session_id, instruction, status, model, message,
         context_json, tool_trace_json, change_set_json, confirmation_token,
-        execution_json, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        execution_json, skills_json, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(task_id) DO UPDATE SET
         status = excluded.status,
         model = excluded.model,
@@ -383,6 +403,7 @@ export class AgentStore {
         change_set_json = excluded.change_set_json,
         confirmation_token = excluded.confirmation_token,
         execution_json = excluded.execution_json,
+        skills_json = excluded.skills_json,
         updated_at = excluded.updated_at
     `).run(
       task.taskId,
@@ -396,6 +417,7 @@ export class AgentStore {
       jsonStringify(task.changeSet),
       task.confirmationToken ?? null,
       task.execution ? jsonStringify(task.execution) : null,
+      jsonStringify(task.skills ?? []),
       task.createdAt,
       task.updatedAt,
     );
@@ -412,6 +434,21 @@ export class AgentStore {
       SELECT * FROM tasks WHERE session_id = ? ORDER BY updated_at DESC LIMIT ?
     `).all(sessionId, safeLimit) as SqlRow[];
     return rows.map(rowToTask);
+  }
+
+  public listSkillStates(): Map<string, boolean> {
+    const rows = this.database.prepare("SELECT skill_id, enabled FROM skill_states").all() as SqlRow[];
+    return new Map(rows.map((row) => [String(row.skill_id), Number(row.enabled) === 1]));
+  }
+
+  public setSkillEnabled(skillId: string, enabled: boolean): void {
+    this.database.prepare(`
+      INSERT INTO skill_states (skill_id, enabled, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(skill_id) DO UPDATE SET
+        enabled = excluded.enabled,
+        updated_at = excluded.updated_at
+    `).run(skillId, enabled ? 1 : 0, new Date().toISOString());
   }
 
   public upsertContextSnapshot(input: {

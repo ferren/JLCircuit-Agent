@@ -11,6 +11,7 @@ import type { ChangeOperation, ChangeSet } from "../../../packages/contracts/src
 import { JLCIRCUIT_TOOLS, getTool } from "../../../packages/mcp/src/index.ts";
 import { ContextEngine } from "./context-engine.ts";
 import { runAgentTurn } from "./llm.ts";
+import { SkillRegistry, SkillRegistryError } from "./skill-registry.ts";
 import {
   AgentStore,
   type PersistedTask as AgentTask,
@@ -28,6 +29,7 @@ const log = (message: string, details?: unknown): void => {
 
 const store = new AgentStore();
 const contextEngine = new ContextEngine(store, log);
+const skillRegistry = new SkillRegistry(store, JLCIRCUIT_TOOLS);
 
 class LocalBridgeGateway {
   private socket?: WebSocket;
@@ -204,9 +206,22 @@ const runModelTurn = async (
   instruction: string,
   mode: "chat" | "plan" = "chat",
   userInstruction = instruction,
+  requestedSkillIds?: string[],
 ) => {
   log("[llm] turn started", { sessionId, mode, provider: process.env.JLCIRCUIT_MODEL_PROVIDER ?? "stub" });
-  const userMessage = contextEngine.beginTurn(sessionId, userInstruction, mode);
+  const resolvedSkills = skillRegistry.resolve({
+    instruction: userInstruction,
+    mode,
+    requestedSkillIds,
+  });
+  const skillRefs = resolvedSkills.skills.map(({ id, name, version, reason }) => ({ id, name, version, reason }));
+  const userMessage = contextEngine.beginTurn(sessionId, userInstruction, mode, { skills: skillRefs });
+  const toolDefinitions = JLCIRCUIT_TOOLS.filter((tool) => resolvedSkills.allowedToolNames.has(tool.name));
+  store.appendAuditEvent({
+    sessionId,
+    eventType: "skills.resolved",
+    payload: { mode, requestedSkillIds: requestedSkillIds ?? [], skills: skillRefs, tools: toolDefinitions.map((tool) => tool.name) },
+  });
   try {
     const preparedContext = await contextEngine.prepareTurn({
       sessionId,
@@ -217,8 +232,9 @@ const runModelTurn = async (
       instruction,
       sessionId,
       preparedContext,
-      toolDefinitions: JLCIRCUIT_TOOLS,
+      toolDefinitions,
       executeTool: callTool,
+      activeSkills: resolvedSkills.skills,
       mode,
     });
     contextEngine.completeTurn({
@@ -228,11 +244,13 @@ const runModelTurn = async (
       model: result.model,
       toolCount: result.toolTrace.length,
       plannedOperationCount: result.plannedOperations.length,
+      metadata: { skills: skillRefs },
     });
     log("[llm] turn completed", {
       model: result.model,
       toolCount: result.toolTrace.length,
       plannedOperationCount: result.plannedOperations.length,
+      skills: skillRefs.map((skill) => skill.id),
     });
     return result;
   } catch (error) {
@@ -404,6 +422,28 @@ const server = createServer(async (request, response) => {
       return;
     }
 
+    if (request.method === "GET" && url.pathname === "/v1/skills") {
+      json(response, 200, { skills: skillRegistry.list(), diagnostics: skillRegistry.getDiagnostics() });
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/skills/reload") {
+      const result = skillRegistry.reload();
+      store.appendAuditEvent({ eventType: "skills.reloaded", payload: result });
+      json(response, 200, result);
+      return;
+    }
+
+    const skillStateMatch = /^\/v1\/skills\/([^/]+)\/(enable|disable)$/.exec(url.pathname);
+    if (request.method === "POST" && skillStateMatch) {
+      const skillId = decodeURIComponent(skillStateMatch[1] as string);
+      const enabled = skillStateMatch[2] === "enable";
+      const skill = skillRegistry.setEnabled(skillId, enabled);
+      store.appendAuditEvent({ eventType: enabled ? "skill.enabled" : "skill.disabled", payload: { skillId } });
+      json(response, 200, { skill });
+      return;
+    }
+
     if (request.method === "POST" && url.pathname === "/v1/sessions") {
       const body = (await readBody(request)) as { projectId?: string };
       const session = store.createSession(body.projectId);
@@ -441,7 +481,7 @@ const server = createServer(async (request, response) => {
     }
 
     if (request.method === "POST" && url.pathname === "/v1/chat") {
-      const body = (await readBody(request)) as { sessionId?: string; instruction?: string };
+      const body = (await readBody(request)) as { sessionId?: string; instruction?: string; skillIds?: string[] };
       const sessionId = body.sessionId ?? "default";
       const instruction = body.instruction?.trim();
       log(`[http] POST ${url.pathname}`, { sessionId, instructionLength: instruction?.length ?? 0 });
@@ -449,13 +489,13 @@ const server = createServer(async (request, response) => {
         json(response, 400, { error: "invalid_request", message: "instruction is required." });
         return;
       }
-      const result = await runModelTurn(sessionId, instruction);
+      const result = await runModelTurn(sessionId, instruction, "chat", instruction, body.skillIds);
       json(response, 200, { sessionId, status: "completed", ...result });
       return;
     }
 
     if (request.method === "POST" && url.pathname === "/v1/plan") {
-      const body = (await readBody(request)) as { sessionId?: string; instruction?: string; forceExecutionPlan?: boolean };
+      const body = (await readBody(request)) as { sessionId?: string; instruction?: string; forceExecutionPlan?: boolean; skillIds?: string[] };
       const sessionId = body.sessionId ?? "default";
       const instruction = body.instruction?.trim();
       const forceExecutionPlan = body.forceExecutionPlan === true;
@@ -469,6 +509,7 @@ const server = createServer(async (request, response) => {
         buildPlanInstruction(instruction, forceExecutionPlan),
         "plan",
         instruction,
+        body.skillIds,
       );
       const changeSet = createChangeSet(result);
       const now = new Date().toISOString();
@@ -483,6 +524,7 @@ const server = createServer(async (request, response) => {
         toolTrace: result.toolTrace,
         changeSet,
         confirmationToken: changeSet.operations.length > 0 ? crypto.randomUUID() : undefined,
+        skills: result.skills.map(({ id, name, version, reason }) => ({ id, name, version, reason })),
         createdAt: now,
         updatedAt: now,
       };
@@ -606,6 +648,13 @@ const server = createServer(async (request, response) => {
 
     json(response, 404, { error: "not_found" });
   } catch (error) {
+    if (error instanceof SkillRegistryError) {
+      json(response, error.code === "SKILL_NOT_FOUND" ? 404 : 400, {
+        error: error.code.toLowerCase(),
+        message: error.message,
+      });
+      return;
+    }
     json(response, 400, errorResponse(error));
   }
 });

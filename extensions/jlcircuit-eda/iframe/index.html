@@ -63,6 +63,8 @@
       textarea { display: block; width: min(760px, 100%); min-height: 72px; margin: 0 auto; padding: 10px 12px; resize: vertical; border: 1px solid #c7d2e2; border-radius: 10px; outline: none; color: var(--ink); background: #fbfcfe; font-size: 13px; line-height: 1.45; }
       textarea:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgb(36 99 235 / 12%); }
       .composer-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: min(760px, 100%); margin: 8px auto 0; }
+      .composer-options { display: flex; align-items: center; gap: 8px; min-width: 0; }
+      select { max-width: 190px; padding: 6px 8px; border: 1px solid #c7d2e2; border-radius: 8px; color: var(--ink); background: #fbfcfe; font-size: 11px; }
       .hint { color: var(--muted); font-size: 11px; }
       .actions { display: flex; flex-wrap: wrap; gap: 7px; justify-content: flex-end; }
       .actions button { padding: 7px 10px; font-size: 12px; }
@@ -86,7 +88,10 @@
       <footer class="composer">
         <textarea id="instruction" placeholder="例如：检查当前原理图，或者把选中的 R1 移到 U1 左侧并保持接线不变"></textarea>
         <div class="composer-row">
-          <span class="hint">当前会话：<span id="sessionLabel"></span></span>
+          <div class="composer-options">
+            <span class="hint">当前会话：<span id="sessionLabel"></span></span>
+            <select id="skill" title="选择本轮技能"><option value="">技能：自动</option></select>
+          </div>
           <div class="actions">
             <button id="clear" class="small" type="button">清空对话</button>
             <button id="refresh" class="secondary" type="button">刷新摘要</button>
@@ -105,6 +110,7 @@
       const connectionDot = document.querySelector('#connectionDot');
       const connectionText = document.querySelector('#connectionText');
       const sessionLabel = document.querySelector('#sessionLabel');
+      const skillSelect = document.querySelector('#skill');
       let sessionId = (() => {
         try {
           const existing = globalThis.sessionStorage?.getItem('jlcircuit-agent-last-session');
@@ -116,6 +122,29 @@
       })();
       let busy = false;
       sessionLabel.textContent = sessionId;
+
+      const selectedSkillIds = () => skillSelect.value ? [skillSelect.value] : undefined;
+      const skillLabel = (skills) => Array.isArray(skills) && skills.length
+        ? `技能：${skills.map((skill) => skill.name || skill.id).join('、')}`
+        : '';
+
+      const loadSkills = async () => {
+        try {
+          const result = await request('/v1/skills', 'GET');
+          const previous = skillSelect.value;
+          skillSelect.innerHTML = '<option value="">技能：自动</option>';
+          (result.skills || []).filter((skill) => skill.enabled).forEach((skill) => {
+            const option = document.createElement('option');
+            option.value = skill.id;
+            option.textContent = `技能：${skill.name}`;
+            option.title = skill.description;
+            skillSelect.appendChild(option);
+          });
+          if ([...skillSelect.options].some((option) => option.value === previous)) skillSelect.value = previous;
+        } catch (error) {
+          addMessage('assistant', `技能列表读取失败：${String(error)}`, '', 'error');
+        }
+      };
 
       const useProjectSession = (context) => {
         const scopeId = context?.project?.id || context?.activeDocument?.id;
@@ -210,6 +239,12 @@
         summary.className = 'plan-summary';
         summary.textContent = task.message || task.changeSet?.summary || '模型生成了一个待确认计划。';
         card.appendChild(summary);
+        if (skillLabel(task.skills)) {
+          const skillMeta = document.createElement('div');
+          skillMeta.className = 'message-meta';
+          skillMeta.textContent = skillLabel(task.skills);
+          card.appendChild(skillMeta);
+        }
 
         const operations = document.createElement('ol');
         operations.className = 'operations';
@@ -272,10 +307,10 @@
         addMessage('user', instruction);
         const pending = addMessage('assistant', '正在读取设计并分析…', '', 'pending');
         try {
-          const result = await request('/v1/chat', 'POST', { sessionId, instruction });
+          const result = await request('/v1/chat', 'POST', { sessionId, instruction, skillIds: selectedSkillIds() });
           pending.remove();
           const trace = (result.toolTrace || []).map((item) => `${item.status}: ${item.tool}`).join('\n');
-          addMessage('assistant', result.message || '模型没有返回文本结果。', `模型：${result.model || 'unknown'}`);
+          addMessage('assistant', result.message || '模型没有返回文本结果。', [`模型：${result.model || 'unknown'}`, skillLabel(result.skills)].filter(Boolean).join(' · '));
           if (trace) addDetails(`工具调用：\n${trace}`);
           setConnection('connected', 'Agent 已连接');
         } catch (error) {
@@ -293,7 +328,7 @@
         addMessage('user', `生成修改计划：${instruction}`);
         const pending = addMessage('assistant', '正在读取设计并生成待确认计划…', '', 'pending');
         try {
-          const task = await request('/v1/plan', 'POST', { sessionId, instruction });
+          const task = await request('/v1/plan', 'POST', { sessionId, instruction, skillIds: selectedSkillIds() });
           pending.remove();
           addMessage('assistant', task.status === 'waiting_confirmation'
             ? '计划已生成，请确认后执行。'
@@ -319,6 +354,7 @@
             sessionId,
             instruction: task.instruction,
             forceExecutionPlan: true,
+            skillIds: selectedSkillIds(),
           });
           renderTask(result);
           addMessage('assistant', result.status === 'waiting_confirmation'
@@ -374,6 +410,7 @@
           (state.messages || []).forEach((message) => {
             const meta = [
               message.model ? `模型：${message.model}` : '',
+              skillLabel(message.metadata?.skills),
               message.createdAt ? new Date(message.createdAt).toLocaleString() : '',
             ].filter(Boolean).join(' · ');
             addMessage(message.role === 'user' ? 'user' : 'assistant', message.content, meta, message.metadata?.failed ? 'error' : '');
@@ -395,6 +432,7 @@
         } catch {
           // Bridge may still be starting. Restore the last known project session first.
         }
+        await loadSkills();
         await restoreSession();
       };
 

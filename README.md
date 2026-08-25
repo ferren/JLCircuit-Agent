@@ -17,10 +17,11 @@ Local EDA Bridge
 ## 目录
 
 - `apps/agent-service`：会话、规划和工具编排服务。
+- `skills/builtin`：受控的声明式技能清单与工作流说明。
 - `packages/contracts`：前后端共享的 Design IR、ChangeSet 和消息协议。
 - `packages/bridge`：面向 EDA 执行端的类型化能力边界。
 - `extensions/jlcircuit-eda`：嘉立创EDA扩展入口、助手面板和 API 适配器。
-- `docs/current-architecture.md`：与当前代码一致的完整架构、流程、接口、安全边界和已知限制。
+- `docs/current-architecture.md`：完整目标架构、当前实现状态、流程、接口、安全边界和分阶段开发路线。
 
 ## 本地运行
 
@@ -55,6 +56,10 @@ GET /health
 
 ```text
 GET  /v1/tools
+GET  /v1/skills
+POST /v1/skills/reload
+POST /v1/skills/:skillId/enable
+POST /v1/skills/:skillId/disable
 POST /v1/tools/:toolName
 POST /v1/sessions
 GET  /v1/sessions/:sessionId
@@ -137,6 +142,25 @@ JLCIRCUIT_CONTEXT_TASK_MAX_CHARS=6000
 `GET /v1/sessions/:sessionId` 可恢复最近消息和任务；EDA 助手面板启动时会自动调用该接口。界面的“清空对话”会删除该会话的消息和滚动摘要，但不会删除任务及审计记录。服务重启后，待确认任务和确认令牌仍可恢复。
 
 EDA 面板会按当前项目 ID 生成独立的 `sessionId`，不同工程不会共享对话历史。后端也会校验会话绑定的项目；如果 API 客户端错误地把同一会话用于另一个项目，请求会被阻止并要求创建新的会话。
+
+### 声明式技能
+
+服务启动时会加载 `skills/builtin/*/skill.json`，并可通过 `JLCIRCUIT_SKILL_ROOTS` 加载额外的受信目录。每个技能由 `skill.json` 和同目录内的 `SKILL.md` 组成，声明启用条件、适用模式、允许/必需工具和风险级别。当前内置 `eda-core` 与 `schematic-layout`；面板可选择“自动”或明确指定一个技能。
+
+```env
+JLCIRCUIT_SKILL_ROOTS=C:\trusted\jlcircuit-skills
+JLCIRCUIT_SKILL_AUTO_ACTIVATE=true
+JLCIRCUIT_SKILL_MAX_ACTIVE=3
+JLCIRCUIT_SKILL_MAX_INSTRUCTION_CHARS=20000
+```
+
+自动模式会启用 always 技能，并按用户指令关键字选择专用技能。模型只会看到这些技能联合允许的工具；Chat 模式仍禁止写入，Plan 模式仍只产生待确认 ChangeSet。技能启停状态保存在 SQLite。技能入口必须留在自身目录内，未知工具、重复 ID、越界入口和过大的说明文件会被拒绝。当前技能是声明和提示词，不会执行技能目录中的任意脚本；外部 MCP 插件仍属于后续阶段。
+
+`POST /v1/chat` 和 `POST /v1/plan` 可传 `skillIds` 数组明确选择技能；省略时自动选择：
+
+```json
+{"sessionId":"demo","instruction":"检查并改善原理图布局","skillIds":["schematic-layout"]}
+```
 
 ### 多步修改流程
 

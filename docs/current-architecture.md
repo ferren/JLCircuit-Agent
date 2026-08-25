@@ -1,31 +1,42 @@
-# JLCircuit Agent 当前架构
+# JLCircuit Agent 完整架构与实现状态
 
-> 文档状态：与当前仓库实现对齐
+> 文档状态：唯一维护的架构文档；同时描述当前实现和完整目标架构
 > 最后复核：2026-08-25
 > Agent Service：0.1.0
 > 嘉立创 EDA 扩展：0.2.0
 
 ## 1. 文档目的
 
-本文描述当前已经运行在仓库中的 JLCircuit Agent 架构，包括：
+本文同时描述 JLCircuit Agent 的完整目标架构和当前仓库中已经运行的实现，包括：
 
-- 嘉立创 EDA 扩展、Agent Service、LLM 和 SQLite 的进程边界；
+- 完整分层架构、模块边界及开发状态；
+- 嘉立创 EDA 扩展、Agent Service、LLM、MCP/插件和数据层的目标关系；
 - 会话、上下文、工作记忆和任务状态的实际实现；
+- Skill Registry、插件、外部目录、芯片手册和参考电路的接入方式；
 - 只读分析、修改计划、用户确认、执行和视觉验证流程；
 - HTTP、WebSocket、工具目录、配置和持久化数据结构；
-- 当前安全边界、已知限制和下一阶段扩展方向。
+- 当前安全边界、已知限制和分阶段演进方向。
 
-本文严格区分“已实现”和“规划中”。目前系统是一个可验证的本地 EDA Agent MVP，还不是完整的动态 MCP Host，也还没有 Skill Registry、插件管理器、外部文档知识库或项目级语义长期记忆。
+本文使用三种状态，任何未完成能力都不会按现成功能描述：
 
-## 2. 架构结论
+| 状态 | 含义 |
+| --- | --- |
+| **已实现** | 当前仓库已有可运行代码，并完成了至少本地自动化或接口验证 |
+| **部分实现** | 主链路存在，但能力范围、兼容性或真实 EDA 验证仍不完整 |
+| **开发中** | 属于目标架构，当前没有可依赖的完整运行链路 |
 
-当前架构采用“模型负责理解和规划，确定性工具负责读取、写入和验证”的分层方式。LLM 不直接访问嘉立创 EDA 原始 API，也不能执行任意 JavaScript。所有 EDA 操作必须经过静态工具目录、Agent Service 风险判断、本地 WebSocket Bridge 和 EDA 扩展适配器。
+目前系统是一个带声明式 Skill Registry 的本地 EDA Agent MVP。完整 MCP Host、插件生命周期、外部资料知识库、项目语义长期记忆、通用回滚和多数 PCB 写入能力仍为**开发中**。
+
+## 2. 架构原则与当前结论
+
+架构采用“模型负责理解和规划，确定性工具负责读取、写入和验证”的分层方式。LLM 不直接访问嘉立创 EDA 原始 API，也不能执行任意 JavaScript。所有 EDA 操作必须经过工具权限、Agent Service 风险判断、本地 Bridge 和 EDA 扩展适配器。
 
 已经形成的主闭环是：
 
 ```text
 用户输入
   -> Context Engine 组装会话历史、任务和最新 EDA 快照
+  -> Skill Registry 自动或显式选择工作流并裁剪可见工具
   -> LLM 分析或生成结构化 ChangeSet
   -> 用户确认高风险操作
   -> EDA 扩展执行受限工具
@@ -33,7 +44,134 @@
   -> SQLite 保存消息、任务、快照和审计事件
 ```
 
-## 3. 当前运行时拓扑
+当前闭环已经可运行，但只覆盖有限的 EDA 工具。目标架构会在不破坏这条安全链的前提下增加 MCP 插件、外部知识、长期记忆、更多设计工具和通用事务执行器。
+
+## 3. 完整架构图
+
+### 3.1 完整目标架构及开发状态（合并前述补充架构图）
+
+下面的图是系统应达到的完整架构，已合并最初分层方案以及后续补充的 Context/Memory、Skill、Plugin/MCP、外部知识、视觉验证、治理和评测层。图中已把尚未实现的组件直接标为“开发中”，而不是省略。
+
+```mermaid
+flowchart TB
+    classDef done fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef partial fill:#fef3c7,stroke:#d97706,color:#78350f
+    classDef developing fill:#e0e7ff,stroke:#4f46e5,color:#312e81,stroke-dasharray: 5 5
+
+    subgraph UX[用户与嘉立创 EDA 前端]
+        USER[自然语言与多轮交互<br/>已实现]:::done
+        SELECT[当前项目/文档/选区<br/>已实现]:::done
+        PANEL[计划卡片、技能选择、确认/取消<br/>已实现]:::done
+        PREVIEW[结构化差异预览与回滚入口<br/>开发中]:::developing
+    end
+
+    subgraph ACCESS[交互与安全接入层]
+        HTTP[Assistant HTTP API<br/>已实现]:::done
+        SESSION[Session / Project 隔离<br/>已实现]:::done
+        POLICY[风险分级与写操作确认<br/>已实现]:::done
+        AUTH[Bridge Token、HTTP 鉴权、严格 CORS<br/>开发中]:::developing
+    end
+
+    subgraph AGENT[主智能体编排层]
+        ORCH[任务编排与状态机<br/>部分实现]:::partial
+        INTENT[显式意图分类与专业路由<br/>开发中]:::developing
+        PLANNER[多步规划 / ChangeSet<br/>部分实现]:::partial
+        EXECUTOR[事务执行、旧值校验、回滚点<br/>开发中]:::developing
+        VERIFY[DRC/ERC + 截图验证闭环<br/>部分实现]:::partial
+    end
+
+    subgraph CONTEXT[上下文与记忆层]
+        CTX[Context Engine 与预算压缩<br/>已实现]:::done
+        HISTORY[消息、摘要、活动任务、EDA 快照<br/>已实现]:::done
+        MEMORY[项目约束/决策/器件长期记忆<br/>开发中]:::developing
+        ARTIFACT[版本、制品、差异和回滚快照<br/>开发中]:::developing
+    end
+
+    subgraph EXTENSIBILITY[技能、插件与知识扩展层]
+        SKILL[声明式 Skill Registry<br/>已实现]:::done
+        SKILLPKG[技能依赖、版本与热安装<br/>开发中]:::developing
+        MCP[MCP Gateway / Server 生命周期<br/>开发中]:::developing
+        PLUGIN[插件注册、权限与隔离<br/>开发中]:::developing
+        FILES[授权外部目录与文件读取<br/>开发中]:::developing
+        KNOWLEDGE[Datasheet / PDF / 参考电路知识库<br/>开发中]:::developing
+        SEARCH[全文/向量检索与来源引用<br/>开发中]:::developing
+    end
+
+    subgraph MODELS[模型路由层]
+        ROUTER[OpenAI-compatible LLM Router<br/>部分实现]:::partial
+        LANGUAGE[语言模型<br/>已实现]:::done
+        VISION[当前模型或独立视觉模型<br/>已实现]:::done
+        FALLBACK[按任务/成本/失败自动路由与降级<br/>开发中]:::developing
+    end
+
+    subgraph TOOLS[工具与执行适配层]
+        CATALOG[静态 EDA 工具目录<br/>已实现]:::done
+        SCHREAD[原理图读取、DRC、截图<br/>部分实现]:::partial
+        SCHWRITE[元件移动并补偿部分导线<br/>部分实现]:::partial
+        PCBRW[PCB 布线、铺铜、规则修复<br/>开发中]:::developing
+        BOM[BOM、器件库、封装校验<br/>开发中]:::developing
+        SCRIPT[规则与自动检查脚本<br/>开发中]:::developing
+    end
+
+    subgraph BRIDGE[EDA Bridge 与核心数据]
+        WS[本地 WebSocket Bridge<br/>已实现]:::done
+        ADAPTER[嘉立创 EDA API Adapter<br/>部分实现]:::partial
+        EDAAPI[嘉立创 EDA Pro API<br/>外部依赖]:::partial
+        PROJECT[原理图 / PCB / 元件库 / DRC<br/>外部设计数据]:::partial
+    end
+
+    subgraph DATA[持久化与治理]
+        SQLITE[(SQLite 会话/任务/技能/审计<br/>已实现)]:::done
+        OBS[指标、Trace、评测与回归集<br/>开发中]:::developing
+        SECRETS[密钥托管与敏感数据策略<br/>开发中]:::developing
+    end
+
+    USER --> PANEL
+    SELECT --> PANEL
+    PANEL --> HTTP
+    PREVIEW --> HTTP
+    HTTP --> SESSION --> ORCH
+    POLICY --> ORCH
+    AUTH --> HTTP
+    ORCH --> INTENT
+    ORCH --> PLANNER --> EXECUTOR --> VERIFY
+    ORCH --> CTX
+    CTX --> HISTORY
+    CTX --> MEMORY
+    CTX --> ARTIFACT
+    ORCH --> SKILL
+    SKILL --> SKILLPKG
+    ORCH --> MCP --> PLUGIN
+    PLUGIN --> FILES --> KNOWLEDGE --> SEARCH
+    SEARCH --> CTX
+    ORCH --> ROUTER
+    ROUTER --> LANGUAGE
+    ROUTER --> VISION
+    ROUTER --> FALLBACK
+    SKILL --> CATALOG
+    MCP --> CATALOG
+    PLANNER --> CATALOG
+    CATALOG --> SCHREAD
+    CATALOG --> SCHWRITE
+    CATALOG --> PCBRW
+    CATALOG --> BOM
+    CATALOG --> SCRIPT
+    SCHREAD --> WS
+    SCHWRITE --> WS
+    PCBRW --> WS
+    BOM --> WS
+    SCRIPT --> WS
+    WS --> ADAPTER --> EDAAPI --> PROJECT
+    SESSION --> SQLITE
+    HISTORY --> SQLITE
+    SKILL --> SQLITE
+    ORCH --> OBS
+    AUTH --> SECRETS
+```
+
+### 3.2 当前实际运行时拓扑
+
+以下是当前代码真正运行的子集，不包含开发中的占位组件。
 
 ```mermaid
 flowchart LR
@@ -51,6 +189,7 @@ flowchart LR
         HTTP[HTTP API]
         SESSION[Session / Task Orchestrator]
         CONTEXT[Context Engine]
+        SKILLS[Skill Registry]
         LLM[LLM Router]
         CATALOG[静态工具目录]
         BRIDGE[WebSocket Bridge Gateway]
@@ -60,6 +199,10 @@ flowchart LR
         SESSION --> CONTEXT
         CONTEXT --> STORE
         SESSION --> LLM
+        SESSION --> SKILLS
+        SKILLS --> LLM
+        SKILLS --> CATALOG
+        SKILLS --> STORE
         LLM --> CATALOG
         LLM --> BRIDGE
         SESSION --> STORE
@@ -72,7 +215,24 @@ flowchart LR
     LLM -- OpenAI-compatible HTTPS --> PROVIDER[语言模型 / 视觉模型]
 ```
 
-### 3.1 进程边界
+### 3.3 组件实现状态总表
+
+| 层 | 当前状态 | 当前边界 | 下一完整能力 |
+| --- | --- | --- | --- |
+| EDA 多轮交互面板 | 已实现 | 对话、计划、确认、历史、技能选择 | 差异预览、任务树、回滚入口 |
+| Session / Context Engine | 已实现 | 项目隔离、消息、摘要、任务、最新快照 | 项目语义长期记忆与来源置信度 |
+| Agent Orchestrator | 部分实现 | Chat/Plan、ChangeSet、确认、单类写操作 | 显式意图节点、通用状态图、事务与恢复 |
+| Skill Registry | 已实现 | 声明式清单、提示、启停、自动选择、工具裁剪 | 依赖、签名、版本、安装和热更新 |
+| LLM Router | 部分实现 | 单语言路由及独立视觉路由 | 多供应商策略、重试、降级、成本/延迟策略 |
+| MCP / Plugin Gateway | 开发中 | 仅有静态 MCP 风格工具目录 | 标准 MCP 客户端、外部 Server 生命周期和权限隔离 |
+| 外部资料与知识库 | 开发中 | 尚未读取外部目录或手册 | 授权目录、PDF/网页解析、检索、来源引用 |
+| EDA 工具 | 部分实现 | 读取、DRC、截图、实验性元件移动 | 完整原理图、PCB、BOM、规则和脚本工具 |
+| 执行与验证 | 部分实现 | 确认、项目校验、DRC、截图 | 通用前置条件、差异、事务、回滚和视觉评分 |
+| 持久化与审计 | 已实现 | SQLite 会话、消息、任务、技能、快照、审计 | 制品存储、防篡改审计、保留和迁移策略 |
+| 鉴权与部署安全 | 开发中 | 当前仅依赖回环地址 | Token、身份、权限、严格 CORS、TLS/代理 |
+| 评测与可观测性 | 开发中 | 单元测试和控制台日志 | Trace、固定电路集、视觉/电气正确性评测 |
+
+### 3.4 进程边界
 
 | 组件 | 所在进程 | 当前职责 |
 | --- | --- | --- |
@@ -80,7 +240,7 @@ flowchart LR
 | EDA 扩展入口 | 嘉立创 EDA | 打开 iframe、启动 Bridge Client |
 | EDA Adapter | 嘉立创 EDA | 调用官方 Pro API，读取图元、执行移动、DRC 和截图 |
 | Agent Service | 独立 Node.js 进程 | HTTP API、会话、任务、上下文、模型调用、风险控制和审计 |
-| SQLite | Agent Service 本地文件 | 消息、任务、快照和审计持久化 |
+| SQLite | Agent Service 本地文件 | 消息、任务、技能状态、快照和审计持久化 |
 | LLM Provider | 本地或远端服务 | 语言理解、规划、工具选择和视觉分析 |
 
 嘉立创 EDA API 只能在扩展运行环境中调用。Agent Service 不假设自己能够直接读取 EDA 内部对象。
@@ -93,10 +253,12 @@ apps/agent-service/
   src/context-engine.ts     上下文预算、历史、摘要、任务和设计快照组装
   src/storage.ts            SQLite schema 和持久化访问
   src/llm.ts                OpenAI-compatible 模型调用和工具循环
+  src/skill-registry.ts     技能扫描、校验、选择、启停与工具权限并集
 
 packages/contracts/         DesignContext、ChangeSet、ToolRequest 等共享契约
 packages/bridge/            Bridge 消息和类型化传输封装
 packages/mcp/               当前静态 MCP 风格工具目录
+skills/builtin/             内置声明式技能（skill.json + SKILL.md）
 
 extensions/jlcircuit-eda/
   src/index.ts              扩展入口和助手窗口
@@ -108,6 +270,8 @@ docs/current-architecture.md 本文档
 ```
 
 `packages/mcp` 当前只保存 `EdaToolDefinition[]` 静态目录。它不是完整的 MCP JSON-RPC Server，也没有动态 `tools/list`、`resources/list`、`prompts/list` 或外部 MCP Server 生命周期管理。
+
+Skill Registry 只加载声明式清单和 Markdown 工作流，不执行技能目录中的脚本。它不等同于插件系统或 MCP Host。
 
 ## 5. 核心数据契约
 
@@ -245,7 +409,66 @@ flowchart TD
 
 滚动摘要是确定性的摘录压缩，不是额外调用模型生成的语义摘要。当前没有自动提取“项目约束、器件决策、用户偏好”等长期事实，也不会把模型推测自动写成项目知识。
 
-## 7. SQLite 持久化
+## 7. Skill Registry 与扩展边界
+
+### 7.1 当前已实现
+
+Skill Registry 在服务启动时扫描：
+
+```text
+skills/builtin/<skill-id>/skill.json
+skills/builtin/<skill-id>/SKILL.md
+```
+
+也可通过 `JLCIRCUIT_SKILL_ROOTS` 增加管理员预先授权的技能根目录。当前技能是“声明 + Markdown 指令”，不会加载或执行技能目录中的 JavaScript、Python、Shell 或二进制文件。
+
+`skill.json` 声明以下内容：
+
+- `id`、名称、版本、描述和入口文件；
+- 默认启用状态、优先级和最大风险级别；
+- `always`、关键字和适用的 Chat/Plan 模式；
+- `tools.allowed` 和 `tools.required`。
+
+加载时会检查技能 ID、重复项、入口越界、符号链接后的真实路径、说明文件大小、未知工具、必需工具和工具风险是否超过技能声明。启用/禁用覆盖状态写入 SQLite 的 `skill_states`。
+
+当前内置技能：
+
+| 技能 | 状态 | 用途 | 工具权限 |
+| --- | --- | --- | --- |
+| `eda-core` | 已实现 | 当前设计、元件、导线、DRC 和画布的只读分析 | 只读 EDA 工具 |
+| `schematic-layout` | 已实现 | 布局可读性分析和元件移动计划 | 只读工具 + 高风险移动工具 |
+
+### 7.2 每轮技能解析
+
+```mermaid
+flowchart LR
+    INPUT[用户指令 + Chat/Plan 模式] --> REQUESTED[显式 skillIds]
+    INPUT --> AUTO[always 与关键字自动匹配]
+    REQUESTED --> VALIDATE[启用状态与模式校验]
+    AUTO --> VALIDATE
+    VALIDATE --> LIMIT[按原因、命中和优先级排序<br/>限制最大活动技能数]
+    LIMIT --> PROMPT[注入所选 SKILL.md]
+    LIMIT --> UNION[合并 tools.allowed]
+    UNION --> FILTER[裁剪模型可见工具]
+    FILTER --> SAFETY[叠加 Chat/Plan 与确认安全策略]
+```
+
+技能权限只会缩小模型可见工具，不会扩大系统权限。即使技能允许高风险工具，Chat 模式仍阻止写入；Plan 模式仍只记录 ChangeSet；真实执行仍需要确认令牌和执行器 allowlist。
+
+### 7.3 开发中的技能与插件能力
+
+以下目标尚未实现：
+
+- 技能包安装、卸载、依赖解析、签名、来源信任和版本锁定；
+- 技能热更新、冲突解决、项目级启用范围和细粒度参数配置；
+- 标准 MCP Client，以及 stdio/HTTP/SSE 外部 MCP Server 生命周期管理；
+- MCP `tools`、`resources`、`prompts` 的发现、缓存、命名空间和权限审批；
+- 插件进程隔离、超时、资源限制、密钥注入和审计；
+- 从授权外部目录读取文件，解析 PDF/芯片手册/参考电路并建立可引用索引。
+
+声明式 Skill Registry 是 MCP/插件体系的上层工作流选择器，未来的 MCP Gateway 是工具、资源和提示的连接层，两者不会合并成同一个无边界执行入口。
+
+## 8. SQLite 持久化
 
 默认数据库：
 
@@ -255,21 +478,22 @@ flowchart TD
 
 可通过 `JLCIRCUIT_DB_PATH` 修改。数据库启用外键、WAL 和 `synchronous=NORMAL`。服务收到 `SIGINT` 或 `SIGTERM` 时会关闭 Bridge、HTTP Server 和数据库。
 
-### 7.1 表结构
+### 8.1 表结构
 
 | 表 | 主键 | 内容 | 保留策略 |
 | --- | --- | --- | --- |
 | `sessions` | `id` | 项目绑定、滚动摘要、摘要游标 | 长期保留 |
 | `messages` | `sequence` | 用户/助手消息、模式、模型、元数据 | 清空对话时删除 |
-| `tasks` | `task_id` | 状态、上下文、ChangeSet、确认令牌、执行结果 | 清空对话时保留 |
+| `tasks` | `task_id` | 状态、上下文、技能、ChangeSet、确认令牌、执行结果 | 清空对话时保留 |
 | `context_snapshots` | `session_id` | 每个会话最新完整 EDA 快照及 SHA-256 | 新快照覆盖旧快照 |
 | `audit_events` | `sequence` | 回合、工具、任务状态和错误事件 | 清空对话时保留 |
+| `skill_states` | `skill_id` | 技能启用/禁用覆盖状态 | 长期保留 |
 
 审计记录不会保存截图 Base64，只记录 `mimeType` 和字节数。较大的工具输入或结果会保存截断预览。审计表目前不是防篡改日志，也没有签名或远端备份。
 
-## 8. 模型和工具循环
+## 9. 模型和工具循环
 
-### 8.1 模型协议
+### 9.1 模型协议
 
 Agent Service 使用 OpenAI-compatible `POST /chat/completions`，发送：
 
@@ -282,7 +506,7 @@ Agent Service 使用 OpenAI-compatible `POST /chat/completions`，发送：
 
 支持当前语言模型直接看图，或单独配置视觉模型。Base URL 可以是 `/v1` 根地址，也可以带 `/chat/completions`，服务会进行规范化。
 
-### 8.2 工具回合
+### 9.2 工具回合
 
 模型最多执行 `JLCIRCUIT_LLM_MAX_TOOL_ROUNDS` 轮工具调用，默认 3 轮。
 
@@ -291,7 +515,7 @@ Agent Service 使用 OpenAI-compatible `POST /chat/completions`，发送：
 - 没有写操作：允许模型直接回答或追问，任务进入 `awaiting_user`。
 - “强制生成执行计划”：使用更明确的内部指令再次请求，但仍不允许模型猜测缺失参数。
 
-## 9. 修改执行和验证
+## 10. 修改执行和验证
 
 ```mermaid
 sequenceDiagram
@@ -319,7 +543,7 @@ sequenceDiagram
     Agent-->>UI: 执行与验证详情
 ```
 
-### 9.1 写入前保护
+### 10.1 写入前保护
 
 - 任务必须处于 `waiting_confirmation`；
 - 确认令牌必须匹配；
@@ -328,7 +552,7 @@ sequenceDiagram
 - 当前项目或文档与计划生成时不一致时终止执行；
 - 执行器再次限制工具名，只允许当前已开放的写工具。
 
-### 9.2 移动元件的实际语义
+### 10.2 移动元件的实际语义
 
 `easyeda_schematic_move_component`：
 
@@ -341,7 +565,7 @@ sequenceDiagram
 
 这不是编辑器鼠标拖拽行为的完全等价实现。复杂分支、总线、网络标签和特殊连线仍可能无法自动保持。
 
-### 9.3 验证边界
+### 10.3 验证边界
 
 执行后调用 `easyeda_post_write_verify`：
 
@@ -352,7 +576,7 @@ sequenceDiagram
 
 截图用于视觉可读性检查，不替代网表、ERC/DRC 或人工复核。当前 EDA Adapter 只报告已经获得截图，未在扩展端自动计算文字碰撞、导线交叉或元件重叠。
 
-## 10. EDA Bridge
+## 11. EDA Bridge
 
 Agent Service 监听：
 
@@ -362,7 +586,7 @@ ws://127.0.0.1:49630/bridge
 
 EDA 扩展主动连接，并使用官方 `eda.sys_WebSocket.register/send/close`。扩展需要 `allowExternalInteraction: true`。
 
-### 10.1 握手
+### 11.1 握手
 
 ```json
 {
@@ -384,7 +608,7 @@ Server 返回：
 }
 ```
 
-### 10.2 工具消息
+### 11.2 工具消息
 
 ```json
 {
@@ -401,7 +625,7 @@ Server 返回：
 
 Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。请求默认超时 15 秒。扩展上报的 capability 当前只用于握手日志，Agent 还没有根据 capability 动态裁剪静态工具目录。
 
-## 11. 当前工具目录
+## 12. 当前工具目录
 
 | 工具 | 风险 | 状态 | 说明 |
 | --- | --- | --- | --- |
@@ -416,7 +640,7 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 | `easyeda_post_write_verify` | read | Beta | 上下文、DRC 和截图闭环 |
 | `easyeda_schematic_move_component` | high | Beta | 移动元件并补偿可识别导线端点 |
 
-## 12. HTTP API
+## 13. HTTP API
 
 默认地址：`http://127.0.0.1:49630`
 
@@ -424,6 +648,10 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 | --- | --- | --- |
 | GET | `/health` | 服务、Bridge 和 SQLite 状态 |
 | GET | `/v1/tools` | 静态工具目录和 Bridge 状态 |
+| GET | `/v1/skills` | 技能目录、启用状态和加载诊断 |
+| POST | `/v1/skills/reload` | 重新扫描技能根目录 |
+| POST | `/v1/skills/:skillId/enable` | 启用技能并持久化状态 |
+| POST | `/v1/skills/:skillId/disable` | 禁用技能并持久化状态 |
 | POST | `/v1/sessions` | 创建随机会话 |
 | GET | `/v1/sessions/:sessionId` | 恢复会话、最近 100 条消息和最近 20 个任务 |
 | GET | `/v1/sessions/:sessionId/audit` | 返回最近 200 条审计事件 |
@@ -438,9 +666,9 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 | POST | `/v1/tools/:toolName` | 直接调用静态工具 |
 | WS | `/bridge` | EDA 扩展 Bridge |
 
-## 13. 配置
+## 14. 配置
 
-### 13.1 Agent 与持久化
+### 14.1 Agent 与持久化
 
 | 配置 | 默认值 |
 | --- | --- |
@@ -449,7 +677,16 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 | `JLCIRCUIT_DB_PATH` | `.jlcircuit-data/jlcircuit-agent.sqlite` |
 | `JLCIRCUIT_BRIDGE_TIMEOUT_MS` | `15000` |
 
-### 13.2 语言模型
+### 14.2 Skill Registry
+
+| 配置 | 默认值/作用 |
+| --- | --- |
+| `JLCIRCUIT_SKILL_ROOTS` | 额外受信技能根目录；使用系统路径分隔符 |
+| `JLCIRCUIT_SKILL_AUTO_ACTIVATE` | `true`，允许关键字自动激活 |
+| `JLCIRCUIT_SKILL_MAX_ACTIVE` | `3`，单轮最多启用技能数 |
+| `JLCIRCUIT_SKILL_MAX_INSTRUCTION_CHARS` | `20000`，单技能说明字符上限 |
+
+### 14.3 语言模型
 
 | 配置 | 作用 |
 | --- | --- |
@@ -461,7 +698,7 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 | `JLCIRCUIT_LLM_MAX_TOKENS` | 最大输出 token |
 | `JLCIRCUIT_LLM_MAX_TOOL_ROUNDS` | 最大工具轮数 |
 
-### 13.3 视觉模型
+### 14.4 视觉模型
 
 | 配置 | 作用 |
 | --- | --- |
@@ -471,9 +708,9 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 | `JLCIRCUIT_VISION_LLM_MODEL` | 独立视觉模型名 |
 | `JLCIRCUIT_VISION_LLM_TIMEOUT_MS` | 视觉请求超时 |
 
-## 14. 安全边界
+## 15. 安全边界
 
-### 14.1 已实现
+### 15.1 已实现
 
 - 服务默认只监听 `127.0.0.1`；
 - 模型不直接访问 EDA API；
@@ -483,10 +720,12 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 - 写入前重新校验项目和文档；
 - 项目级会话隔离；
 - EDA 工具有风险等级和静态 allowlist；
+- 模型工具列表还会被本轮启用技能的 `tools.allowed` 并集裁剪；
+- 技能入口限制在技能自身目录，拒绝未知工具、重复 ID 和超限说明；
 - 截图 Base64 不写入审计数据库；
 - `.env`、数据库和密钥文件默认被 Git 忽略。
 
-### 14.2 当前缺口
+### 15.2 当前缺口
 
 - `JLCIRCUIT_BRIDGE_TOKEN` 虽然出现在配置示例中，但当前 HTTP 和 WebSocket 握手没有实际校验该 Token；
 - HTTP CORS 当前为 `*`，安全性依赖服务只绑定本机地址；
@@ -499,7 +738,7 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 
 如果把 `JLCIRCUIT_AGENT_HOST` 改为非回环地址，必须先实现鉴权、严格 CORS、TLS 或受控反向代理，并补 Bridge Token 校验。
 
-## 15. 当前已知限制
+## 16. 当前已知限制
 
 1. 真实写入只支持原理图元件移动。
 2. 元件移动不是鼠标拖拽的完全等价实现。
@@ -508,26 +747,77 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 5. Context Engine 只有会话工作记忆，没有项目语义长期记忆。
 6. 较早会话摘要是摘录压缩，不是语义摘要。
 7. 当前工具目录为静态代码，不支持动态安装插件。
-8. 尚无 Skill Registry。
+8. Skill Registry 目前只支持声明式提示与静态工具权限，不执行代码，也不支持依赖解析和热安装。
 9. 尚无外部目录、芯片手册、参考电路和 RAG 知识库。
 10. 任务执行没有通用事务或自动回滚点。
 11. Bridge 只支持单个活动 EDA 连接。
 12. Node.js 内置 SQLite 在当前 Node 24 运行时可能打印 `ExperimentalWarning`。
 
-## 16. 后续演进方向
+## 17. 完整目标架构的开发路线
 
-推荐按以下顺序继续：
+阶段状态以当前仓库为准；“完成”只表示该阶段定义的基础闭环完成，不代表相关 EDA API 已覆盖全部场景。
 
-1. **安全加固**：Bridge Token、HTTP 鉴权、严格 Origin、请求体限制和速率限制。
-2. **Skill Registry**：加载声明式工作流、提示模板、所需工具和风险权限。
-3. **Plugin/MCP Gateway**：从静态目录升级为内置工具加外部 MCP Server。
-4. **Local Knowledge Plugin**：授权目录、PDF 页面提取、全文检索和来源引用。
-5. **Datasheet / Reference Design Skills**：手册关键章节、引脚表、典型应用和参考网表分析。
-6. **项目长期记忆**：明确来源和置信度的约束、决策、器件和问题记录。
-7. **更完整的执行器**：更多 EDA 工具、预期旧值、事务、回滚点和差异预览。
-8. **评测体系**：固定原理图样本、工具调用回归、截图可读性和电气正确性评测。
+| 阶段 | 状态 | 主要交付 |
+| --- | --- | --- |
+| 阶段 0：EDA Bridge 与可视验证 | 部分实现 | WebSocket Bridge、上下文读取、DRC、截图、实验性元件移动；复杂连线和更多 EDA API 仍需验证 |
+| 阶段 1：多轮交互与安全计划 | 已实现 | Chat/Plan、允许正常回答或追问、ChangeSet、确认/取消、任务卡片 |
+| 阶段 2：上下文、会话与持久化 | 已实现 | 项目级会话、消息历史、滚动摘要、活动任务、EDA 快照、SQLite 和审计 |
+| 阶段 3：声明式 Skill Registry | 已实现 | 扫描、校验、自动/显式选择、提示注入、工具权限裁剪、状态持久化和 EDA 面板选择器；仍需扩大真实 EDA 多技能回归范围 |
+| 阶段 4：Plugin/MCP Gateway | 开发中 | 标准 MCP Client、外部 Server 生命周期、命名空间、权限审批、超时与隔离 |
+| 阶段 5：Local Knowledge | 开发中 | 授权外部目录、PDF/手册/参考电路解析、全文及向量检索、来源引用 |
+| 阶段 6：专业 Datasheet Skills | 开发中 | 芯片选型、引脚表、典型应用、参考网表与当前设计交叉校验 |
+| 阶段 7：项目长期记忆 | 开发中 | 带来源、置信度和生效范围的约束、决策、器件和问题记录 |
+| 阶段 8：通用执行与回滚 | 开发中 | 旧值前置条件、差异预览、事务、回滚点、更多原理图/PCB/BOM/规则工具 |
+| 阶段 9：安全、观测与评测 | 开发中 | Token/鉴权、严格 CORS、Trace、指标、固定电路集、视觉和电气正确性评测 |
 
-## 17. 验证和构建
+### 17.1 阶段 4：Plugin/MCP Gateway 目标边界（开发中）
+
+MCP Gateway 不直接获得无限制 EDA 写权限。外部 MCP Server 必须经过注册清单、传输类型、工具命名空间、风险级别、参数 schema、超时和允许访问的资源范围校验。模型只能看到本轮技能和策略共同允许的 MCP 工具。
+
+目标调用链：
+
+```text
+Skill / Orchestrator
+  -> MCP Gateway
+  -> Plugin Registry + Permission Policy
+  -> 内置或外部 MCP Server
+  -> tools / resources / prompts
+  -> 标准化结果与审计
+```
+
+### 17.2 阶段 5：外部目录与资料知识库（开发中）
+
+外部资料必须先由用户或管理员授权目录，随后按文件类型经过解析、分块、索引和来源记录。读取芯片手册或参考电路时，模型应返回文件、页码/章节或原始设计来源，不能把检索结果当成无来源事实。
+
+```mermaid
+flowchart LR
+    AUTHDIR[授权目录] --> INGEST[文件发现与类型校验]
+    INGEST --> PDF[PDF / Datasheet 解析]
+    INGEST --> DESIGN[参考原理图 / BOM / 网表解析]
+    PDF --> INDEX[全文与向量索引]
+    DESIGN --> INDEX
+    INDEX --> RETRIEVE[按任务检索]
+    RETRIEVE --> CITATION[来源、页码、版本与哈希]
+    CITATION --> CONTEXT[Context Engine]
+```
+
+### 17.3 阶段 7：项目长期记忆（开发中）
+
+长期记忆与普通聊天摘要分开保存，目标记录包括：
+
+- 明确的设计约束，例如电压、接口、尺寸、层数和成本；
+- 用户确认的器件选择及替代关系；
+- 已批准或否决的架构决策；
+- 已知问题、验证证据和未完成事项；
+- 来源消息、资料文件、设计版本、置信度和失效条件。
+
+模型推测不能自动升级为长期事实。写入长期记忆需要明确来源，并允许用户查看、修订和删除。
+
+### 17.4 阶段 8：通用执行器（开发中）
+
+目标执行器在每个操作中保存 `expectedBefore`、目标对象、可逆参数和验证规则。执行前比较旧值；执行中建立回滚点；执行后同时进行结构化、DRC/ERC 和视觉验证。任何一步失败都应停止剩余操作，并优先恢复到已知状态。
+
+## 18. 验证和构建
 
 ```powershell
 npm install
@@ -550,9 +840,12 @@ extensions/jlcircuit-eda/build/dist/jlcircuit-agent_v0.2.0.eext
 
 测试覆盖当前包括：
 
-- SQLite 关闭并重新打开后的会话、消息、任务和审计恢复；
+- SQLite 关闭并重新打开后的会话、消息、任务、技能状态和审计恢复；
+- SQLite v1 到 v2 技能字段迁移；
 - 较早消息滚动摘要；
 - Context Engine 合并历史、活动任务和最新 EDA 快照；
-- 跨项目会话污染阻止。
+- 跨项目会话污染阻止；
+- Skill Registry 的 always、关键字和显式选择；
+- 技能工具权限并集、启停持久化和非法清单诊断。
 
 真实 EDA API 行为、移动元件后的复杂连线、电气正确性和视觉可读性仍必须在嘉立创 EDA 中进行人工或设备环境验证。
