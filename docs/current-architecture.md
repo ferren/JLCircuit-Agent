@@ -25,7 +25,7 @@
 | **部分实现** | 主链路存在，但能力范围、兼容性或真实 EDA 验证仍不完整 |
 | **开发中** | 属于目标架构，当前没有可依赖的完整运行链路 |
 
-目前系统是一个带声明式 Skill Registry 的本地 EDA Agent MVP。完整 MCP Host、插件生命周期、外部资料知识库、项目语义长期记忆、通用回滚和多数 PCB 写入能力仍为**开发中**。
+目前系统是一个带声明式 Skill Registry 和 MCP Gateway MVP 的本地 EDA Agent。完整插件安装/隔离生命周期、外部资料知识库、项目语义长期记忆、通用回滚和多数 PCB 写入能力仍为**开发中**。
 
 ## 2. 架构原则与当前结论
 
@@ -90,8 +90,8 @@ flowchart TB
     subgraph EXTENSIBILITY[技能、插件与知识扩展层]
         SKILL[声明式 Skill Registry<br/>已实现]:::done
         SKILLPKG[技能依赖、版本与热安装<br/>开发中]:::developing
-        MCP[MCP Gateway / Server 生命周期<br/>开发中]:::developing
-        PLUGIN[插件注册、权限与隔离<br/>开发中]:::developing
+        MCP[MCP Gateway / Server 生命周期 MVP<br/>部分实现]:::partial
+        PLUGIN[配置注册、权限与隔离<br/>部分实现]:::partial
         FILES[授权外部目录与文件读取<br/>开发中]:::developing
         KNOWLEDGE[Datasheet / PDF / 参考电路知识库<br/>开发中]:::developing
         SEARCH[全文/向量检索与来源引用<br/>开发中]:::developing
@@ -190,6 +190,7 @@ flowchart LR
         SESSION[Session / Task Orchestrator]
         CONTEXT[Context Engine]
         SKILLS[Skill Registry]
+        MCPGW[MCP Registry / Gateway]
         LLM[LLM Router]
         CATALOG[静态工具目录]
         BRIDGE[WebSocket Bridge Gateway]
@@ -203,6 +204,8 @@ flowchart LR
         SKILLS --> LLM
         SKILLS --> CATALOG
         SKILLS --> STORE
+        LLM --> MCPGW
+        MCPGW --> STORE
         LLM --> CATALOG
         LLM --> BRIDGE
         SESSION --> STORE
@@ -212,6 +215,7 @@ flowchart LR
     UI -- HTTP 127.0.0.1:49630 --> HTTP
     EXT -- WebSocket /bridge --> BRIDGE
     BRIDGE -- ToolRequest --> ADAPTER
+    MCPGW -- stdio / Streamable HTTP --> MCPSERVER[外部 MCP Server]
     LLM -- OpenAI-compatible HTTPS --> PROVIDER[语言模型 / 视觉模型]
 ```
 
@@ -224,7 +228,7 @@ flowchart LR
 | Agent Orchestrator | 部分实现 | Chat/Plan、ChangeSet、确认、单类写操作 | 显式意图节点、通用状态图、事务与恢复 |
 | Skill Registry | 已实现 | 声明式清单、提示、启停、自动选择、工具裁剪 | 依赖、签名、版本、安装和热更新 |
 | LLM Router | 部分实现 | 单语言路由及独立视觉路由 | 多供应商策略、重试、降级、成本/延迟策略 |
-| MCP / Plugin Gateway | 开发中 | 仅有静态 MCP 风格工具目录 | 标准 MCP 客户端、外部 Server 生命周期和权限隔离 |
+| MCP / Plugin Gateway | 部分实现 | 官方客户端、stdio/HTTP、配置注册、发现、命名空间、allowlist、状态和审计 | OAuth、安装、自动重连、进程沙箱和外部写执行器 |
 | 外部资料与知识库 | 开发中 | 尚未读取外部目录或手册 | 授权目录、PDF/网页解析、检索、来源引用 |
 | EDA 工具 | 部分实现 | 读取、DRC、截图、实验性元件移动 | 完整原理图、PCB、BOM、规则和脚本工具 |
 | 执行与验证 | 部分实现 | 确认、项目校验、DRC、截图 | 通用前置条件、差异、事务、回滚和视觉评分 |
@@ -254,10 +258,13 @@ apps/agent-service/
   src/storage.ts            SQLite schema 和持久化访问
   src/llm.ts                OpenAI-compatible 模型调用和工具循环
   src/skill-registry.ts     技能扫描、校验、选择、启停与工具权限并集
+  src/mcp-registry.ts       MCP 配置、连接生命周期、能力发现、命名空间和调用网关
 
 packages/contracts/         DesignContext、ChangeSet、ToolRequest 等共享契约
 packages/bridge/            Bridge 消息和类型化传输封装
-packages/mcp/               当前静态 MCP 风格工具目录
+packages/mcp/               内置 EDA 静态工具目录（MCP 风格 schema）
+config/
+  mcp-servers.example.json  stdio 与 Streamable HTTP 安全配置示例
 skills/builtin/             内置声明式技能（skill.json + SKILL.md）
 
 extensions/jlcircuit-eda/
@@ -269,7 +276,7 @@ extensions/jlcircuit-eda/
 docs/current-architecture.md 本文档
 ```
 
-`packages/mcp` 当前只保存 `EdaToolDefinition[]` 静态目录。它不是完整的 MCP JSON-RPC Server，也没有动态 `tools/list`、`resources/list`、`prompts/list` 或外部 MCP Server 生命周期管理。
+`packages/mcp` 仍只保存内置 EDA 的 `EdaToolDefinition[]` 静态目录。外部 MCP Client、`tools/resources/prompts` 发现和 Server 生命周期由 `apps/agent-service/src/mcp-registry.ts` 管理；本项目本身尚未作为 MCP Server 对外暴露 EDA 工具。
 
 Skill Registry 只加载声明式清单和 Markdown 工作流，不执行技能目录中的脚本。它不等同于插件系统或 MCP Host。
 
@@ -437,6 +444,7 @@ skills/builtin/<skill-id>/SKILL.md
 | --- | --- | --- | --- |
 | `eda-core` | 已实现 | 当前设计、元件、导线、DRC 和画布的只读分析 | 只读 EDA 工具 |
 | `schematic-layout` | 已实现 | 布局可读性分析和元件移动计划 | 只读工具 + 高风险移动工具 |
+| `mcp-assistant` | 已实现 | 调用管理员配置、启用和允许的 MCP 只读工具 | `mcp__*`，并受运行时风险过滤 |
 
 ### 7.2 每轮技能解析
 
@@ -455,18 +463,34 @@ flowchart LR
 
 技能权限只会缩小模型可见工具，不会扩大系统权限。即使技能允许高风险工具，Chat 模式仍阻止写入；Plan 模式仍只记录 ChangeSet；真实执行仍需要确认令牌和执行器 allowlist。
 
-### 7.3 开发中的技能与插件能力
+### 7.3 MCP Gateway 当前已实现
+
+协议与传输实现基于 [MCP 官方 TypeScript Client SDK](https://ts.sdk.modelcontextprotocol.io/v2/get-started/first-client.html)；远程连接使用 Streamable HTTP，本地进程使用 `stdio`。
+
+- 使用官方 `@modelcontextprotocol/client` 2.0.0；
+- 本地 `stdio` 和远程 Streamable HTTP，支持协议版本协商；
+- 通过 `.jlcircuit-data/mcp-servers.json` 注册 Server，并持久化启停覆盖状态；
+- 发现 `tools`、`resources` 和 `prompts`，工具映射为 `mcp__<server>__<tool>`；
+- Server 级工具 allowlist、默认风险和单工具风险覆盖；
+- Skill Registry 通配权限与风险上限共同裁剪模型可见工具；
+- 当前只执行 `riskLevel=read` 的外部工具，MCP 写工具不会提供给模型；
+- Resources/Prompts 必须显式开放，并限制为连接后发现的条目；
+- 请求超时、Server/工具/结果大小上限、HTTPS/回环 HTTP 约束；
+- 连接、启停、失败和工具调用写入 SQLite 审计；
+- 管理 API 与 EDA 面板连接状态显示。
+
+### 7.4 仍在开发中的插件能力
 
 以下目标尚未实现：
 
 - 技能包安装、卸载、依赖解析、签名、来源信任和版本锁定；
 - 技能热更新、冲突解决、项目级启用范围和细粒度参数配置；
-- 标准 MCP Client，以及 stdio/HTTP/SSE 外部 MCP Server 生命周期管理；
-- MCP `tools`、`resources`、`prompts` 的发现、缓存、命名空间和权限审批；
-- 插件进程隔离、超时、资源限制、密钥注入和审计；
+- OAuth 交互授权、旧 SSE fallback、失败自动重连和动态 capability 更新；
+- 插件自动安装、签名验证、独立进程沙箱、CPU/内存限制和版本升级；
+- 外部 MCP 写工具的差异预览、确认、通用执行和回滚；
 - 从授权外部目录读取文件，解析 PDF/芯片手册/参考电路并建立可引用索引。
 
-声明式 Skill Registry 是 MCP/插件体系的上层工作流选择器，未来的 MCP Gateway 是工具、资源和提示的连接层，两者不会合并成同一个无边界执行入口。
+声明式 Skill Registry 是 MCP/插件体系的上层工作流选择器，MCP Gateway 是工具、资源和提示的连接层，两者不会合并成同一个无边界执行入口。
 
 ## 8. SQLite 持久化
 
@@ -488,6 +512,7 @@ flowchart LR
 | `context_snapshots` | `session_id` | 每个会话最新完整 EDA 快照及 SHA-256 | 新快照覆盖旧快照 |
 | `audit_events` | `sequence` | 回合、工具、任务状态和错误事件 | 清空对话时保留 |
 | `skill_states` | `skill_id` | 技能启用/禁用覆盖状态 | 长期保留 |
+| `mcp_server_states` | `server_id` | MCP Server 启用/禁用覆盖状态 | 长期保留 |
 
 审计记录不会保存截图 Base64，只记录 `mimeType` 和字节数。较大的工具输入或结果会保存截断预览。审计表目前不是防篡改日志，也没有签名或远端备份。
 
@@ -647,11 +672,21 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 | 方法 | 路径 | 作用 |
 | --- | --- | --- |
 | GET | `/health` | 服务、Bridge 和 SQLite 状态 |
-| GET | `/v1/tools` | 静态工具目录和 Bridge 状态 |
+| GET | `/v1/tools` | 内置 EDA 与当前已连接 MCP 工具目录 |
 | GET | `/v1/skills` | 技能目录、启用状态和加载诊断 |
 | POST | `/v1/skills/reload` | 重新扫描技能根目录 |
 | POST | `/v1/skills/:skillId/enable` | 启用技能并持久化状态 |
 | POST | `/v1/skills/:skillId/disable` | 禁用技能并持久化状态 |
+| GET | `/v1/mcp/servers` | MCP 配置路径、Server 状态和加载诊断 |
+| POST | `/v1/mcp/reload` | 重新读取配置并按启用状态连接 |
+| POST | `/v1/mcp/servers/:serverId/enable` | 持久化启用并按策略连接 |
+| POST | `/v1/mcp/servers/:serverId/disable` | 断开并持久化禁用 |
+| POST | `/v1/mcp/servers/:serverId/connect` | 连接已启用 Server 并刷新能力 |
+| POST | `/v1/mcp/servers/:serverId/disconnect` | 断开 Server |
+| GET | `/v1/mcp/servers/:serverId/resources` | 列出已允许的已发现资源 |
+| POST | `/v1/mcp/servers/:serverId/resources/read` | 读取已发现资源 |
+| GET | `/v1/mcp/servers/:serverId/prompts` | 列出已允许的已发现提示 |
+| POST | `/v1/mcp/servers/:serverId/prompts/get` | 获取已发现提示 |
 | POST | `/v1/sessions` | 创建随机会话 |
 | GET | `/v1/sessions/:sessionId` | 恢复会话、最近 100 条消息和最近 20 个任务 |
 | GET | `/v1/sessions/:sessionId/audit` | 返回最近 200 条审计事件 |
@@ -663,7 +698,7 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 | POST | `/v1/tasks/:taskId/cancel` | 取消等待确认的任务 |
 | POST | `/v1/context` | 读取并保存最新 EDA 快照 |
 | POST | `/v1/drc` | 直接运行 DRC/ERC |
-| POST | `/v1/tools/:toolName` | 直接调用静态工具 |
+| POST | `/v1/tools/:toolName` | 直接调用内置或只读 MCP 工具 |
 | WS | `/bridge` | EDA 扩展 Bridge |
 
 ## 14. 配置
@@ -686,7 +721,21 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 | `JLCIRCUIT_SKILL_MAX_ACTIVE` | `3`，单轮最多启用技能数 |
 | `JLCIRCUIT_SKILL_MAX_INSTRUCTION_CHARS` | `20000`，单技能说明字符上限 |
 
-### 14.3 语言模型
+### 14.3 MCP Gateway
+
+| 配置 | 默认值/作用 |
+| --- | --- |
+| `JLCIRCUIT_MCP_CONFIG` | `.jlcircuit-data/mcp-servers.json` |
+| `JLCIRCUIT_MCP_AUTO_CONNECT` | `true`，自动连接已启用 Server |
+| `JLCIRCUIT_MCP_REQUEST_TIMEOUT_MS` | `15000` |
+| `JLCIRCUIT_MCP_MAX_SERVERS` | `16` |
+| `JLCIRCUIT_MCP_MAX_TOOLS_PER_SERVER` | `100` |
+| `JLCIRCUIT_MCP_MAX_TOOL_SCHEMA_CHARS` | `20000` |
+| `JLCIRCUIT_MCP_MAX_RESULT_CHARS` | `1000000` |
+
+配置只保存环境变量名称，不保存密钥值。示例见 `config/mcp-servers.example.json`。
+
+### 14.4 语言模型
 
 | 配置 | 作用 |
 | --- | --- |
@@ -698,7 +747,7 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 | `JLCIRCUIT_LLM_MAX_TOKENS` | 最大输出 token |
 | `JLCIRCUIT_LLM_MAX_TOOL_ROUNDS` | 最大工具轮数 |
 
-### 14.4 视觉模型
+### 14.5 视觉模型
 
 | 配置 | 作用 |
 | --- | --- |
@@ -722,6 +771,10 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 - EDA 工具有风险等级和静态 allowlist；
 - 模型工具列表还会被本轮启用技能的 `tools.allowed` 并集裁剪；
 - 技能入口限制在技能自身目录，拒绝未知工具、重复 ID 和超限说明；
+- MCP Server 必须显式配置和启用，工具还要经过 Server allowlist、风险和 Skill 权限；
+- 外部工具默认 `high`，当前只向模型提供并执行显式标为 `read` 的 MCP 工具；
+- 远程 MCP 必须使用 HTTPS，只有回环地址允许 HTTP；
+- MCP 密钥通过环境变量引用，调用受超时和结果预算限制；
 - 截图 Base64 不写入审计数据库；
 - `.env`、数据库和密钥文件默认被 Git 忽略。
 
@@ -735,6 +788,7 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 - SQLite 中包含项目上下文和对话，不应放到公共同步目录；
 - 审计日志可被本机用户修改，不是合规级防篡改日志；
 - 直接 `/v1/tools/:toolName` 调用仍依赖工具自身的 `confirmWrite` 校验，不应暴露到非本机网络。
+- 尚无 MCP OAuth 交互授权、自动重连、签名安装和强进程沙箱；stdio Server 是本机子进程，必须只配置可信命令。
 
 如果把 `JLCIRCUIT_AGENT_HOST` 改为非回环地址，必须先实现鉴权、严格 CORS、TLS 或受控反向代理，并补 Bridge Token 校验。
 
@@ -746,12 +800,13 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 4. PCB 写入、自动布线、铺铜和规则修改尚未开放。
 5. Context Engine 只有会话工作记忆，没有项目语义长期记忆。
 6. 较早会话摘要是摘录压缩，不是语义摘要。
-7. 当前工具目录为静态代码，不支持动态安装插件。
+7. 已能动态连接配置文件中的 MCP Server，但不支持插件自动安装、签名和版本升级。
 8. Skill Registry 目前只支持声明式提示与静态工具权限，不执行代码，也不支持依赖解析和热安装。
 9. 尚无外部目录、芯片手册、参考电路和 RAG 知识库。
 10. 任务执行没有通用事务或自动回滚点。
 11. Bridge 只支持单个活动 EDA 连接。
-12. Node.js 内置 SQLite 在当前 Node 24 运行时可能打印 `ExperimentalWarning`。
+12. MCP 外部写工具不会提供给模型，也没有确认执行链。
+13. Node.js 内置 SQLite 在当前 Node 24 运行时可能打印 `ExperimentalWarning`。
 
 ## 17. 完整目标架构的开发路线
 
@@ -763,14 +818,14 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 | 阶段 1：多轮交互与安全计划 | 已实现 | Chat/Plan、允许正常回答或追问、ChangeSet、确认/取消、任务卡片 |
 | 阶段 2：上下文、会话与持久化 | 已实现 | 项目级会话、消息历史、滚动摘要、活动任务、EDA 快照、SQLite 和审计 |
 | 阶段 3：声明式 Skill Registry | 已实现 | 扫描、校验、自动/显式选择、提示注入、工具权限裁剪、状态持久化和 EDA 面板选择器；仍需扩大真实 EDA 多技能回归范围 |
-| 阶段 4：Plugin/MCP Gateway | 开发中 | 标准 MCP Client、外部 Server 生命周期、命名空间、权限审批、超时与隔离 |
+| 阶段 4：Plugin/MCP Gateway | 部分实现 | 官方 MCP Client、stdio/Streamable HTTP、配置生命周期、发现、命名空间、allowlist、风险、超时、审计和状态界面；OAuth、重连、安装沙箱及外部写执行仍在开发 |
 | 阶段 5：Local Knowledge | 开发中 | 授权外部目录、PDF/手册/参考电路解析、全文及向量检索、来源引用 |
 | 阶段 6：专业 Datasheet Skills | 开发中 | 芯片选型、引脚表、典型应用、参考网表与当前设计交叉校验 |
 | 阶段 7：项目长期记忆 | 开发中 | 带来源、置信度和生效范围的约束、决策、器件和问题记录 |
 | 阶段 8：通用执行与回滚 | 开发中 | 旧值前置条件、差异预览、事务、回滚点、更多原理图/PCB/BOM/规则工具 |
 | 阶段 9：安全、观测与评测 | 开发中 | Token/鉴权、严格 CORS、Trace、指标、固定电路集、视觉和电气正确性评测 |
 
-### 17.1 阶段 4：Plugin/MCP Gateway 目标边界（开发中）
+### 17.1 阶段 4：Plugin/MCP Gateway 边界（MVP 已实现，增强能力开发中）
 
 MCP Gateway 不直接获得无限制 EDA 写权限。外部 MCP Server 必须经过注册清单、传输类型、工具命名空间、风险级别、参数 schema、超时和允许访问的资源范围校验。模型只能看到本轮技能和策略共同允许的 MCP 工具。
 
@@ -841,11 +896,13 @@ extensions/jlcircuit-eda/build/dist/jlcircuit-agent_v0.2.0.eext
 测试覆盖当前包括：
 
 - SQLite 关闭并重新打开后的会话、消息、任务、技能状态和审计恢复；
-- SQLite v1 到 v2 技能字段迁移；
+- SQLite v1 到 v3 的技能和 MCP 状态迁移；
 - 较早消息滚动摘要；
 - Context Engine 合并历史、活动任务和最新 EDA 快照；
 - 跨项目会话污染阻止；
 - Skill Registry 的 always、关键字和显式选择；
-- 技能工具权限并集、启停持久化和非法清单诊断。
+- 技能工具权限并集、启停持久化和非法清单诊断；
+- MCP stdio 与 Streamable HTTP 真实握手、能力发现和工具调用；
+- MCP allowlist、默认风险、启停持久化、Resources/Prompts 和不安全 HTTP 拒绝。
 
 真实 EDA API 行为、移动元件后的复杂连线、电气正确性和视觉可读性仍必须在嘉立创 EDA 中进行人工或设备环境验证。

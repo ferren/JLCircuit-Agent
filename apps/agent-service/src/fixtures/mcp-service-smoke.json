@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "servers": [
+    {
+      "id": "fixture",
+      "name": "Service smoke fixture",
+      "enabledByDefault": true,
+      "transport": {
+        "type": "stdio",
+        "command": "node",
+        "args": ["apps/agent-service/src/fixtures/mcp-stdio-fixture.mjs"],
+        "cwd": "../../../..",
+        "env": []
+      },
+      "allowedTools": ["echo"],
+      "defaultRiskLevel": "read",
+      "toolRiskLevels": {},
+      "allowResources": true,
+      "allowPrompts": true
+    }
+  ]
+}

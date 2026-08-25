@@ -31,6 +31,7 @@
       .header-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
       h1 { margin: 0; font-size: 18px; }
       .subtitle { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
+      .runtime-status { margin-top: 4px; color: var(--muted); font-size: 11px; }
       .connection { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; white-space: nowrap; }
       .dot { width: 8px; height: 8px; border-radius: 50%; background: #9aa7b8; }
       .dot.connected { background: var(--green); }
@@ -78,6 +79,7 @@
           <div>
             <h1>JLCircuit Agent</h1>
             <p class="subtitle">先分析，再生成计划；写入操作必须确认。</p>
+            <div id="mcpStatus" class="runtime-status">MCP：读取中</div>
           </div>
           <div class="connection"><span id="connectionDot" class="dot"></span><span id="connectionText">检查连接中</span></div>
         </div>
@@ -94,6 +96,7 @@
           </div>
           <div class="actions">
             <button id="clear" class="small" type="button">清空对话</button>
+            <button id="plugins" class="small" type="button">插件状态</button>
             <button id="refresh" class="secondary" type="button">刷新摘要</button>
             <button id="analyze" class="primary" type="button">发送分析</button>
             <button id="plan" class="success" type="button">生成修改计划</button>
@@ -111,6 +114,7 @@
       const connectionText = document.querySelector('#connectionText');
       const sessionLabel = document.querySelector('#sessionLabel');
       const skillSelect = document.querySelector('#skill');
+      const mcpStatus = document.querySelector('#mcpStatus');
       let sessionId = (() => {
         try {
           const existing = globalThis.sessionStorage?.getItem('jlcircuit-agent-last-session');
@@ -121,6 +125,7 @@
         }
       })();
       let busy = false;
+      let mcpServers = [];
       sessionLabel.textContent = sessionId;
 
       const selectedSkillIds = () => skillSelect.value ? [skillSelect.value] : undefined;
@@ -143,6 +148,29 @@
           if ([...skillSelect.options].some((option) => option.value === previous)) skillSelect.value = previous;
         } catch (error) {
           addMessage('assistant', `技能列表读取失败：${String(error)}`, '', 'error');
+        }
+      };
+
+      const loadMcpServers = async (showDetails = false) => {
+        try {
+          const result = await request('/v1/mcp/servers', 'GET');
+          mcpServers = result.servers || [];
+          const connected = mcpServers.filter((server) => server.status === 'connected').length;
+          const errors = mcpServers.filter((server) => server.status === 'error').length;
+          mcpStatus.textContent = `MCP：${connected}/${mcpServers.length} 已连接${errors ? ` · ${errors} 异常` : ''}`;
+          if (showDetails) {
+            const lines = mcpServers.length
+              ? mcpServers.map((server) => [
+                  `${server.name} (${server.id})`,
+                  `状态：${server.status} · 工具 ${server.toolCount} · 资源 ${server.resourceCount} · 提示 ${server.promptCount}`,
+                  server.error ? `错误：${server.error}` : '',
+                ].filter(Boolean).join('\n')).join('\n\n')
+              : `尚未配置 MCP Server。\n配置文件：${result.configPath}`;
+            addDetails(`MCP 插件状态：\n${lines}`);
+          }
+        } catch (error) {
+          mcpStatus.textContent = 'MCP：状态读取失败';
+          if (showDetails) addMessage('assistant', `插件状态读取失败：${String(error)}`, '', 'error');
         }
       };
 
@@ -433,6 +461,7 @@
           // Bridge may still be starting. Restore the last known project session first.
         }
         await loadSkills();
+        await loadMcpServers(false);
         await restoreSession();
       };
 
@@ -455,6 +484,7 @@
       document.querySelector('#plan').addEventListener('click', createPlan);
       document.querySelector('#refresh').addEventListener('click', () => refresh(false));
       document.querySelector('#clear').addEventListener('click', clearConversation);
+      document.querySelector('#plugins').addEventListener('click', () => loadMcpServers(true));
       instructionInput.addEventListener('keydown', (event) => {
         if (event.key === 'Enter' && !event.shiftKey) {
           event.preventDefault();

@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "servers": [
+    {
+      "id": "local-example",
+      "name": "本地 MCP 示例",
+      "enabledByDefault": false,
+      "transport": {
+        "type": "stdio",
+        "command": "node",
+        "args": ["C:\\absolute\\path\\to\\server.mjs"],
+        "cwd": "C:\\absolute\\path\\to",
+        "env": ["EXAMPLE_API_KEY"]
+      },
+      "allowedTools": ["read_component_data"],
+      "defaultRiskLevel": "high",
+      "toolRiskLevels": {
+        "read_component_data": "read"
+      },
+      "allowResources": false,
+      "allowPrompts": false
+    },
+    {
+      "id": "remote-example",
+      "name": "远程 MCP 示例",
+      "enabledByDefault": false,
+      "transport": {
+        "type": "http",
+        "url": "https://mcp.example.com/mcp",
+        "bearerTokenEnv": "REMOTE_MCP_TOKEN"
+      },
+      "allowedTools": [],
+      "defaultRiskLevel": "high",
+      "toolRiskLevels": {},
+      "allowResources": false,
+      "allowPrompts": false
+    }
+  ]
+}

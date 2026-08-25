@@ -62,6 +62,7 @@ export type ResolvedSkill = {
   instructions: string;
   reason: "always" | "keyword" | "requested";
   matchedKeywords: string[];
+  riskLevel: RiskLevel;
   allowedTools: string[];
 };
 
@@ -168,6 +169,16 @@ const pathIsInside = (parent: string, child: string): boolean => {
   return path.length === 0 || (!path.startsWith("..") && !isAbsolute(path));
 };
 
+const riskRank: Record<RiskLevel, number> = { read: 0, low: 1, medium: 2, high: 3 };
+
+const isMcpToolPattern = (value: string): boolean =>
+  value === "mcp__*" || /^mcp__[a-z0-9_]+__\*$/.test(value);
+
+const toolPermissionMatches = (permission: string, toolName: string): boolean =>
+  permission === toolName ||
+  (permission === "mcp__*" && toolName.startsWith("mcp__")) ||
+  (permission.endsWith("__*") && toolName.startsWith(permission.slice(0, -1)));
+
 export class SkillRegistry {
   private readonly store: AgentStore;
   private readonly availableTools: Map<string, EdaToolDefinition>;
@@ -234,9 +245,9 @@ export class SkillRegistry {
         if (instructions.length > this.maxInstructionChars) {
           throw new Error(`Skill instructions exceed ${this.maxInstructionChars} characters.`);
         }
-        const unknownTools = manifest.tools.allowed.filter((tool) => !this.availableTools.has(tool));
+        const unknownTools = manifest.tools.allowed.filter((tool) =>
+          !this.availableTools.has(tool) && !isMcpToolPattern(tool));
         if (unknownTools.length > 0) throw new Error(`Unknown tools: ${unknownTools.join(", ")}`);
-        const riskRank: Record<RiskLevel, number> = { read: 0, low: 1, medium: 2, high: 3 };
         const excessiveRiskTools = manifest.tools.allowed.filter((tool) => {
           const definition = this.availableTools.get(tool);
           return definition && riskRank[definition.riskLevel] > riskRank[manifest.riskLevel];
@@ -320,6 +331,7 @@ export class SkillRegistry {
         instructions: skill.instructions,
         reason,
         matchedKeywords,
+        riskLevel: skill.manifest.riskLevel,
         allowedTools: skill.manifest.tools.allowed,
       });
     };
@@ -353,7 +365,18 @@ export class SkillRegistry {
     const skills = [...selected.values()]
       .sort((left, right) => (scores.get(right.id) ?? 0) - (scores.get(left.id) ?? 0) || left.id.localeCompare(right.id))
       .slice(0, this.maxActiveSkills);
-    const allowedToolNames = new Set(skills.flatMap((skill) => skill.allowedTools));
+    const allowedToolNames = new Set(
+      this.filterToolDefinitions(skills, [...this.availableTools.values()]).map((tool) => tool.name),
+    );
     return { skills, allowedToolNames };
+  }
+
+  public filterToolDefinitions(
+    skills: ResolvedSkill[],
+    definitions: EdaToolDefinition[],
+  ): EdaToolDefinition[] {
+    return definitions.filter((definition) => skills.some((skill) =>
+      riskRank[definition.riskLevel] <= riskRank[skill.riskLevel] &&
+      skill.allowedTools.some((permission) => toolPermissionMatches(permission, definition.name))));
   }
 }

@@ -248,7 +248,13 @@ export class AgentStore {
         updated_at TEXT NOT NULL
       );
 
-      PRAGMA user_version = 2;
+      CREATE TABLE IF NOT EXISTS mcp_server_states (
+        server_id TEXT PRIMARY KEY,
+        enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+        updated_at TEXT NOT NULL
+      );
+
+      PRAGMA user_version = 3;
     `);
     const taskColumns = this.database.prepare("PRAGMA table_info(tasks)").all() as SqlRow[];
     if (!taskColumns.some((column) => column.name === "skills_json")) {
@@ -449,6 +455,21 @@ export class AgentStore {
         enabled = excluded.enabled,
         updated_at = excluded.updated_at
     `).run(skillId, enabled ? 1 : 0, new Date().toISOString());
+  }
+
+  public listMcpServerStates(): Map<string, boolean> {
+    const rows = this.database.prepare("SELECT server_id, enabled FROM mcp_server_states").all() as SqlRow[];
+    return new Map(rows.map((row) => [String(row.server_id), Number(row.enabled) === 1]));
+  }
+
+  public setMcpServerEnabled(serverId: string, enabled: boolean): void {
+    this.database.prepare(`
+      INSERT INTO mcp_server_states (server_id, enabled, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(server_id) DO UPDATE SET
+        enabled = excluded.enabled,
+        updated_at = excluded.updated_at
+    `).run(serverId, enabled ? 1 : 0, new Date().toISOString());
   }
 
   public upsertContextSnapshot(input: {

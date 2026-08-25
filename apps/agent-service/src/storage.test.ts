@@ -51,6 +51,7 @@ test("SQLite store restores sessions, messages, tasks and audit events after reo
     first.saveTask(task);
     first.appendAuditEvent({ sessionId: "session-1", taskId: "task-1", eventType: "task.created" });
     first.setSkillEnabled("eda-core", false);
+    first.setMcpServerEnabled("fixture", true);
     first.close();
 
     const reopened = new AgentStore(databasePath);
@@ -62,6 +63,7 @@ test("SQLite store restores sessions, messages, tasks and audit events after reo
     assert.equal(reopened.getTask("task-1")?.confirmationToken, "confirm-1");
     assert.equal(reopened.getTask("task-1")?.skills?.[0]?.id, "eda-core");
     assert.equal(reopened.listSkillStates().get("eda-core"), false);
+    assert.equal(reopened.listMcpServerStates().get("fixture"), true);
     assert.equal(reopened.countAuditEvents("session-1"), 1);
     reopened.close();
   } finally {
@@ -91,7 +93,7 @@ test("older messages are rolled into the persisted session summary", () => {
   }
 });
 
-test("version 1 task databases are upgraded with skill persistence", () => {
+test("version 1 task databases are upgraded with skill and MCP persistence", () => {
   const tempDirectory = mkdtempSync(join(tmpdir(), "jlcircuit-agent-migration-"));
   const databasePath = join(tempDirectory, "state.sqlite");
   try {
@@ -113,6 +115,8 @@ test("version 1 task databases are upgraded with skill persistence", () => {
     assert.equal(columns.some((column) => column.name === "skills_json"), true);
     upgraded.setSkillEnabled("eda-core", true);
     assert.equal(upgraded.listSkillStates().get("eda-core"), true);
+    upgraded.setMcpServerEnabled("fixture", true);
+    assert.equal(upgraded.listMcpServerStates().get("fixture"), true);
     upgraded.close();
   } finally {
     rmSync(tempDirectory, { recursive: true, force: true });

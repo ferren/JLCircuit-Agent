@@ -60,6 +60,16 @@ GET  /v1/skills
 POST /v1/skills/reload
 POST /v1/skills/:skillId/enable
 POST /v1/skills/:skillId/disable
+GET  /v1/mcp/servers
+POST /v1/mcp/reload
+POST /v1/mcp/servers/:serverId/enable
+POST /v1/mcp/servers/:serverId/disable
+POST /v1/mcp/servers/:serverId/connect
+POST /v1/mcp/servers/:serverId/disconnect
+GET  /v1/mcp/servers/:serverId/resources
+POST /v1/mcp/servers/:serverId/resources/read
+GET  /v1/mcp/servers/:serverId/prompts
+POST /v1/mcp/servers/:serverId/prompts/get
 POST /v1/tools/:toolName
 POST /v1/sessions
 GET  /v1/sessions/:sessionId
@@ -154,13 +164,89 @@ JLCIRCUIT_SKILL_MAX_ACTIVE=3
 JLCIRCUIT_SKILL_MAX_INSTRUCTION_CHARS=20000
 ```
 
-自动模式会启用 always 技能，并按用户指令关键字选择专用技能。模型只会看到这些技能联合允许的工具；Chat 模式仍禁止写入，Plan 模式仍只产生待确认 ChangeSet。技能启停状态保存在 SQLite。技能入口必须留在自身目录内，未知工具、重复 ID、越界入口和过大的说明文件会被拒绝。当前技能是声明和提示词，不会执行技能目录中的任意脚本；外部 MCP 插件仍属于后续阶段。
+自动模式会启用 always 技能，并按用户指令关键字选择专用技能。模型只会看到这些技能联合允许的工具；Chat 模式仍禁止写入，Plan 模式仍只产生待确认 ChangeSet。技能启停状态保存在 SQLite。技能入口必须留在自身目录内，未知工具、重复 ID、越界入口和过大的说明文件会被拒绝。当前技能是声明和提示词，不会执行技能目录中的任意脚本；外部 MCP 工具由下述 MCP 插件网关独立加载和约束。
 
 `POST /v1/chat` 和 `POST /v1/plan` 可传 `skillIds` 数组明确选择技能；省略时自动选择：
 
 ```json
 {"sessionId":"demo","instruction":"检查并改善原理图布局","skillIds":["schematic-layout"]}
 ```
+
+### MCP 插件网关
+
+阶段 4 的 MCP Gateway 使用官方 `@modelcontextprotocol/client`，支持本地 `stdio` 和远程 Streamable HTTP。默认配置文件为 `.jlcircuit-data/mcp-servers.json`，该目录被 Git 忽略。先复制示例：
+
+```powershell
+New-Item -ItemType Directory -Force .jlcircuit-data | Out-Null
+Copy-Item config/mcp-servers.example.json .jlcircuit-data/mcp-servers.json
+```
+
+完整配置示例（仓库中也提供了 `config/mcp-servers.example.json`）：
+
+```json
+{
+  "schemaVersion": 1,
+  "servers": [
+    {
+      "id": "local-example",
+      "name": "本地 MCP 示例",
+      "enabledByDefault": false,
+      "transport": {
+        "type": "stdio",
+        "command": "node",
+        "args": ["C:\\absolute\\path\\to\\server.mjs"],
+        "cwd": "C:\\absolute\\path\\to",
+        "env": ["EXAMPLE_API_KEY"]
+      },
+      "allowedTools": ["read_component_data"],
+      "defaultRiskLevel": "high",
+      "toolRiskLevels": {
+        "read_component_data": "read"
+      },
+      "allowResources": false,
+      "allowPrompts": false
+    },
+    {
+      "id": "remote-example",
+      "name": "远程 MCP 示例",
+      "enabledByDefault": false,
+      "transport": {
+        "type": "http",
+        "url": "https://mcp.example.com/mcp",
+        "bearerTokenEnv": "REMOTE_MCP_TOKEN"
+      },
+      "allowedTools": [],
+      "defaultRiskLevel": "high",
+      "toolRiskLevels": {},
+      "allowResources": false,
+      "allowPrompts": false
+    }
+  ]
+}
+```
+
+本地 `stdio` Server 通过 `command`、`args` 和可选 `cwd` 启动；`env` 只填写允许转交给子进程的环境变量名称。远程 Server 使用 `url`，认证令牌由 `bearerTokenEnv` 指向 Agent 服务进程中的环境变量。不要把 API Key 或 Token 的实际值写入 JSON。
+
+配置中的服务器默认关闭。修改命令、URL 和 allowlist 后，可通过 API 启用并连接：
+
+```powershell
+Invoke-RestMethod -Method Post http://127.0.0.1:49630/v1/mcp/reload
+Invoke-RestMethod -Method Post http://127.0.0.1:49630/v1/mcp/servers/local-example/enable
+Invoke-RestMethod http://127.0.0.1:49630/v1/mcp/servers
+```
+
+MCP 工具会转换成 `mcp__<server>__<tool>` 命名空间，并通过 `mcp-assistant` 技能进入模型工具列表。安全默认值如下：
+
+- 服务器必须显式启用；
+- 工具必须出现在 `allowedTools`，`"*"` 表示明确允许该服务器的全部工具；
+- 未覆盖风险级别的外部工具默认为 `high`；
+- 当前只执行风险为 `read` 的 MCP 工具，外部写工具不提供给模型；
+- `http://` 只允许回环地址，远程地址必须使用 HTTPS；
+- 密钥只通过 `env` 或 `bearerTokenEnv` 引用环境变量，不能写入配置文件；
+- Resources 和 Prompts 分别需要 `allowResources`、`allowPrompts`，读取范围限制为已发现条目；
+- 调用有超时、结果大小限制和 SQLite 审计。
+
+EDA 面板顶部显示 MCP 已连接数量，“插件状态”按钮可查看每个 Server 的状态及能力计数。当前没有插件商店、OAuth 交互授权、自动安装、失败重连或外部写操作执行器。
 
 ### 多步修改流程
 

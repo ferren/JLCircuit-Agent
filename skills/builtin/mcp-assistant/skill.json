@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "mcp-assistant",
+  "name": "MCP 插件工具",
+  "version": "1.0.0",
+  "description": "使用管理员已配置并启用的 MCP Server 工具、资源或提示能力。",
+  "entry": "SKILL.md",
+  "enabledByDefault": true,
+  "riskLevel": "high",
+  "priority": 50,
+  "activation": {
+    "always": false,
+    "keywords": ["MCP", "插件", "外部工具", "plugin"],
+    "modes": ["chat", "plan"]
+  },
+  "tools": {
+    "allowed": ["mcp__*"],
+    "required": []
+  }
+}

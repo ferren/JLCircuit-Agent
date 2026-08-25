@@ -11,6 +11,7 @@ import type { ChangeOperation, ChangeSet } from "../../../packages/contracts/src
 import { JLCIRCUIT_TOOLS, getTool } from "../../../packages/mcp/src/index.ts";
 import { ContextEngine } from "./context-engine.ts";
 import { runAgentTurn } from "./llm.ts";
+import { McpRegistry, McpRegistryError } from "./mcp-registry.ts";
 import { SkillRegistry, SkillRegistryError } from "./skill-registry.ts";
 import {
   AgentStore,
@@ -30,6 +31,7 @@ const log = (message: string, details?: unknown): void => {
 const store = new AgentStore();
 const contextEngine = new ContextEngine(store, log);
 const skillRegistry = new SkillRegistry(store, JLCIRCUIT_TOOLS);
+const mcpRegistry = new McpRegistry(store, log);
 
 class LocalBridgeGateway {
   private socket?: WebSocket;
@@ -151,6 +153,21 @@ const callTool = async (
 ): Promise<ToolResponse> => {
   log("[agent] tool call", { tool: toolName, sessionId });
   store.ensureSession(sessionId);
+  const mcpTool = mcpRegistry.getTool(toolName);
+  if (mcpTool) {
+    if (mcpTool.riskLevel !== "read") {
+      return {
+        requestId: crypto.randomUUID(),
+        ok: false,
+        error: {
+          code: "MCP_WRITE_NOT_EXECUTABLE",
+          message: "当前阶段只允许执行只读 MCP 工具；外部写工具只能形成计划，尚不能确认执行。",
+          retryable: false,
+        },
+      };
+    }
+    return mcpRegistry.callTool(toolName, sessionId, payload);
+  }
   const definition = getTool(toolName);
   if (!definition || !definition.enabled) {
     return {
@@ -216,7 +233,10 @@ const runModelTurn = async (
   });
   const skillRefs = resolvedSkills.skills.map(({ id, name, version, reason }) => ({ id, name, version, reason }));
   const userMessage = contextEngine.beginTurn(sessionId, userInstruction, mode, { skills: skillRefs });
-  const toolDefinitions = JLCIRCUIT_TOOLS.filter((tool) => resolvedSkills.allowedToolNames.has(tool.name));
+  const allToolDefinitions = [...JLCIRCUIT_TOOLS, ...mcpRegistry.listToolDefinitions()];
+  const toolDefinitions = skillRegistry
+    .filterToolDefinitions(resolvedSkills.skills, allToolDefinitions)
+    .filter((tool) => !tool.name.startsWith("mcp__") || tool.riskLevel === "read");
   store.appendAuditEvent({
     sessionId,
     eventType: "skills.resolved",
@@ -412,14 +432,86 @@ const server = createServer(async (request, response) => {
         bridge: bridge.connected ? "connected" : "not-connected",
         bridgeProtocolVersion: 1,
         persistence: { type: "sqlite", status: "ready" },
+        mcp: {
+          configured: mcpRegistry.list().length,
+          connected: mcpRegistry.list().filter((server) => server.status === "connected").length,
+        },
         timestamp: new Date().toISOString(),
       });
       return;
     }
 
     if (request.method === "GET" && url.pathname === "/v1/tools") {
-      json(response, 200, { tools: JLCIRCUIT_TOOLS, bridgeConnected: bridge.connected });
+      json(response, 200, {
+        tools: [...JLCIRCUIT_TOOLS, ...mcpRegistry.listToolDefinitions()],
+        bridgeConnected: bridge.connected,
+      });
       return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/v1/mcp/servers") {
+      json(response, 200, {
+        configPath: mcpRegistry.path,
+        servers: mcpRegistry.list(),
+        diagnostics: mcpRegistry.getDiagnostics(),
+      });
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/mcp/reload") {
+      json(response, 200, await mcpRegistry.reload());
+      return;
+    }
+
+    const mcpActionMatch = /^\/v1\/mcp\/servers\/([^/]+)\/(enable|disable|connect|disconnect)$/.exec(url.pathname);
+    if (request.method === "POST" && mcpActionMatch) {
+      const serverId = decodeURIComponent(mcpActionMatch[1] as string);
+      const action = mcpActionMatch[2];
+      const server = action === "enable"
+        ? await mcpRegistry.setEnabled(serverId, true)
+        : action === "disable"
+          ? await mcpRegistry.setEnabled(serverId, false)
+          : action === "connect"
+            ? await mcpRegistry.connect(serverId)
+            : await mcpRegistry.disconnect(serverId);
+      json(response, 200, { server });
+      return;
+    }
+
+    const mcpResourceMatch = /^\/v1\/mcp\/servers\/([^/]+)\/resources(?:\/read)?$/.exec(url.pathname);
+    if (mcpResourceMatch) {
+      const serverId = decodeURIComponent(mcpResourceMatch[1] as string);
+      if (request.method === "GET" && url.pathname.endsWith("/resources")) {
+        json(response, 200, { serverId, resources: mcpRegistry.listResources(serverId) });
+        return;
+      }
+      if (request.method === "POST" && url.pathname.endsWith("/resources/read")) {
+        const body = (await readBody(request)) as { uri?: string };
+        if (!body.uri) {
+          json(response, 400, { error: "invalid_request", message: "uri is required." });
+          return;
+        }
+        json(response, 200, await mcpRegistry.readResource(serverId, body.uri));
+        return;
+      }
+    }
+
+    const mcpPromptMatch = /^\/v1\/mcp\/servers\/([^/]+)\/prompts(?:\/get)?$/.exec(url.pathname);
+    if (mcpPromptMatch) {
+      const serverId = decodeURIComponent(mcpPromptMatch[1] as string);
+      if (request.method === "GET" && url.pathname.endsWith("/prompts")) {
+        json(response, 200, { serverId, prompts: mcpRegistry.listPrompts(serverId) });
+        return;
+      }
+      if (request.method === "POST" && url.pathname.endsWith("/prompts/get")) {
+        const body = (await readBody(request)) as { name?: string; arguments?: Record<string, string> };
+        if (!body.name) {
+          json(response, 400, { error: "invalid_request", message: "name is required." });
+          return;
+        }
+        json(response, 200, await mcpRegistry.getPrompt(serverId, body.name, body.arguments));
+        return;
+      }
     }
 
     if (request.method === "GET" && url.pathname === "/v1/skills") {
@@ -655,6 +747,13 @@ const server = createServer(async (request, response) => {
       });
       return;
     }
+    if (error instanceof McpRegistryError) {
+      json(response, error.code.endsWith("NOT_FOUND") ? 404 : error.code === "MCP_CONNECTION_FAILED" ? 502 : 400, {
+        error: error.code.toLowerCase(),
+        message: error.message,
+      });
+      return;
+    }
     json(response, 400, errorResponse(error));
   }
 });
@@ -673,6 +772,10 @@ server.listen(port, host, () => {
   console.log(`JLCircuit Agent listening on http://${host}:${port}`);
   console.log(`EDA bridge waiting on ws://${host}:${port}/bridge`);
   console.log(`Session database: ${store.path}`);
+  console.log(`MCP config: ${mcpRegistry.path}`);
+  void mcpRegistry.start().catch((error) => log("[mcp] startup failed", {
+    error: error instanceof Error ? error.message : String(error),
+  }));
 });
 
 let shuttingDown = false;
@@ -681,8 +784,9 @@ const shutdown = (signal: string): void => {
   shuttingDown = true;
   log("[service] shutting down", { signal });
   bridge.close();
-  server.close(() => {
+  server.close(async () => {
     bridgeServer.close();
+    await mcpRegistry.close();
     store.close();
     process.exit(0);
   });

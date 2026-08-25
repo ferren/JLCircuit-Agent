@@ -48,12 +48,25 @@ test("Skill Registry activates always, keyword and explicitly requested skills w
       riskLevel: "high",
       tools: { allowed: ["read_context", "move_component"], required: ["read_context"] },
     });
+    writeSkill(root, "plugins", {
+      riskLevel: "read",
+      activation: { always: false, keywords: ["插件"], modes: ["chat", "plan"] },
+      tools: { allowed: ["mcp__*"], required: [] },
+    });
     const registry = new SkillRegistry(store, tools, { roots: [root] });
     const automatic = registry.resolve({ instruction: "检查布局", mode: "plan" });
     assert.deepEqual(automatic.skills.map((skill) => skill.id), ["core", "layout"]);
     assert.equal(automatic.allowedToolNames.has("move_component"), true);
     const explicit = registry.resolve({ instruction: "普通问题", mode: "chat", requestedSkillIds: ["layout"] });
     assert.equal(explicit.skills.find((skill) => skill.id === "layout")?.reason, "requested");
+    const pluginSkills = registry.resolve({ instruction: "使用插件", mode: "chat" }).skills;
+    const filtered = registry.filterToolDefinitions(pluginSkills, [
+      ...tools,
+      { name: "mcp__fixture__read", description: "external", riskLevel: "read", inputSchema: {}, enabled: true },
+      { name: "mcp__fixture__write", description: "external write", riskLevel: "high", inputSchema: {}, enabled: true },
+    ]);
+    assert.equal(filtered.some((tool) => tool.name === "mcp__fixture__read"), true);
+    assert.equal(filtered.some((tool) => tool.name === "mcp__fixture__write"), false);
   } finally {
     store.close();
     rmSync(root, { recursive: true, force: true });
