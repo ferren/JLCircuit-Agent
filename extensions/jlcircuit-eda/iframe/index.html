@@ -105,11 +105,10 @@
       const connectionDot = document.querySelector('#connectionDot');
       const connectionText = document.querySelector('#connectionText');
       const sessionLabel = document.querySelector('#sessionLabel');
-      const sessionId = (() => {
+      let sessionId = (() => {
         try {
-          const existing = globalThis.sessionStorage?.getItem('jlcircuit-agent-session');
+          const existing = globalThis.sessionStorage?.getItem('jlcircuit-agent-last-session');
           const value = existing || 'jlcircuit-agent-ui';
-          globalThis.sessionStorage?.setItem('jlcircuit-agent-session', value);
           return value;
         } catch {
           return 'jlcircuit-agent-ui';
@@ -117,6 +116,14 @@
       })();
       let busy = false;
       sessionLabel.textContent = sessionId;
+
+      const useProjectSession = (context) => {
+        const scopeId = context?.project?.id || context?.activeDocument?.id;
+        if (!scopeId) return;
+        sessionId = `jlcircuit-agent-ui:${scopeId}`;
+        sessionLabel.textContent = context?.project?.name || sessionId;
+        try { globalThis.sessionStorage?.setItem('jlcircuit-agent-last-session', sessionId); } catch { /* ignore */ }
+      };
 
       const setConnection = (state, text) => {
         connectionDot.className = `dot ${state || ''}`;
@@ -183,7 +190,7 @@
         return `${operation.tool}: ${JSON.stringify(operation.args || {})}`;
       };
 
-      const statusLabel = (status) => ({ waiting_confirmation: '等待确认', executing: '执行中', completed: '已完成', failed: '执行失败', cancelled: '已取消', planning: '规划中' }[status] || status || '未知状态');
+      const statusLabel = (status) => ({ awaiting_user: '等待你的回复', waiting_confirmation: '等待确认', executing: '执行中', completed: '已完成', failed: '执行失败', cancelled: '已取消', planning: '规划中' }[status] || status || '未知状态');
 
       const renderTask = (task) => {
         const card = document.createElement('article');
@@ -213,7 +220,7 @@
         });
         if (!operations.children.length) {
           const item = document.createElement('li');
-          item.textContent = '本次没有生成可执行的写操作。';
+          item.textContent = '本次没有写操作：模型可能已经回答了问题，或者需要你补充信息。';
           operations.appendChild(item);
         }
         card.appendChild(operations);
@@ -230,6 +237,13 @@
           cancel.textContent = '取消计划';
           cancel.addEventListener('click', () => cancelTask(task, cancel));
           actions.append(confirm, cancel);
+        }
+        if (task.status === 'awaiting_user') {
+          const retry = document.createElement('button');
+          retry.className = 'primary';
+          retry.textContent = '强制生成执行计划';
+          retry.addEventListener('click', () => replanTask(task, retry));
+          actions.appendChild(retry);
         }
         if (task.execution) {
           const verification = task.execution.verification;
@@ -281,7 +295,11 @@
         try {
           const task = await request('/v1/plan', 'POST', { sessionId, instruction });
           pending.remove();
-          addMessage('assistant', task.status === 'waiting_confirmation' ? '计划已生成，请确认后执行。' : (task.message || '计划处理完成。'), `任务：${task.taskId}`);
+          addMessage('assistant', task.status === 'waiting_confirmation'
+            ? '计划已生成，请确认后执行。'
+            : task.status === 'awaiting_user'
+              ? '模型已回复或需要你补充信息，可以继续输入。'
+              : (task.message || '计划处理完成。'), `任务：${task.taskId}`);
           renderTask(task);
           setConnection('connected', 'Agent 已连接');
         } catch (error) {
@@ -289,6 +307,28 @@
           addMessage('assistant', `生成计划失败：${String(error)}`, '', 'error');
           setConnection('error', '请求失败');
         } finally { busy = false; }
+      };
+
+      const replanTask = async (task, button) => {
+        if (busy) return;
+        busy = true;
+        button.disabled = true;
+        addMessage('assistant', '正在根据原始需求重新生成结构化修改计划…', `任务：${task.taskId}`, 'pending');
+        try {
+          const result = await request('/v1/plan', 'POST', {
+            sessionId,
+            instruction: task.instruction,
+            forceExecutionPlan: true,
+          });
+          renderTask(result);
+          addMessage('assistant', result.status === 'waiting_confirmation'
+            ? '新的计划已生成，请确认后执行。'
+            : result.status === 'awaiting_user'
+              ? '仍需要你补充信息，可以继续在输入框中说明。'
+              : (result.message || '计划处理完成。'), `任务：${result.taskId}`);
+        } catch (error) {
+          addMessage('assistant', `重新生成失败：${String(error)}`, '', 'error');
+        } finally { busy = false; button.disabled = false; }
       };
 
       const confirmTask = async (task, button) => {
@@ -328,21 +368,62 @@
         }
       };
 
+      const restoreSession = async () => {
+        try {
+          const state = await request(`/v1/sessions/${encodeURIComponent(sessionId)}`, 'GET');
+          (state.messages || []).forEach((message) => {
+            const meta = [
+              message.model ? `模型：${message.model}` : '',
+              message.createdAt ? new Date(message.createdAt).toLocaleString() : '',
+            ].filter(Boolean).join(' · ');
+            addMessage(message.role === 'user' ? 'user' : 'assistant', message.content, meta, message.metadata?.failed ? 'error' : '');
+          });
+          (state.tasks || [])
+            .filter((task) => ['planning', 'awaiting_user', 'waiting_confirmation', 'executing'].includes(task.status))
+            .reverse()
+            .forEach(renderTask);
+        } catch (error) {
+          addMessage('assistant', `会话历史读取失败：${String(error)}`, '', 'error');
+        }
+        await refresh(true);
+      };
+
+      const initializeSession = async () => {
+        try {
+          const current = await request('/v1/context', 'POST', { sessionId: 'jlcircuit-agent-project-probe' });
+          useProjectSession(current.data);
+        } catch {
+          // Bridge may still be starting. Restore the last known project session first.
+        }
+        await restoreSession();
+      };
+
+      const clearConversation = async () => {
+        if (busy) return;
+        busy = true;
+        try {
+          await request(`/v1/sessions/${encodeURIComponent(sessionId)}/clear`, 'POST', {});
+          conversation.innerHTML = '';
+          conversation.appendChild(welcome);
+          welcome.style.display = '';
+        } catch (error) {
+          addMessage('assistant', `清空会话失败：${String(error)}`, '', 'error');
+        } finally {
+          busy = false;
+        }
+      };
+
       document.querySelector('#analyze').addEventListener('click', sendAnalysis);
       document.querySelector('#plan').addEventListener('click', createPlan);
       document.querySelector('#refresh').addEventListener('click', () => refresh(false));
-      document.querySelector('#clear').addEventListener('click', () => {
-        conversation.innerHTML = '';
-        conversation.appendChild(welcome);
-        welcome.style.display = '';
-      });
+      document.querySelector('#clear').addEventListener('click', clearConversation);
       instructionInput.addEventListener('keydown', (event) => {
         if (event.key === 'Enter' && !event.shiftKey) {
           event.preventDefault();
           sendAnalysis();
         }
       });
-      refresh(true);
+      initializeSession();
     </script>
   </body>
 </html>

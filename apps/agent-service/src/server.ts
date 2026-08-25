@@ -9,7 +9,13 @@ import {
 } from "../../../packages/bridge/src/index.ts";
 import type { ChangeOperation, ChangeSet } from "../../../packages/contracts/src/index.ts";
 import { JLCIRCUIT_TOOLS, getTool } from "../../../packages/mcp/src/index.ts";
+import { ContextEngine } from "./context-engine.ts";
 import { runAgentTurn } from "./llm.ts";
+import {
+  AgentStore,
+  type PersistedTask as AgentTask,
+  type TaskExecution,
+} from "./storage.ts";
 
 const host = process.env.JLCIRCUIT_AGENT_HOST ?? "127.0.0.1";
 const port = Number(process.env.JLCIRCUIT_AGENT_PORT ?? 49630);
@@ -19,6 +25,9 @@ const log = (message: string, details?: unknown): void => {
   const suffix = details === undefined ? "" : ` ${JSON.stringify(details)}`;
   console.log(`[${new Date().toISOString()}] ${message}${suffix}`);
 };
+
+const store = new AgentStore();
+const contextEngine = new ContextEngine(store, log);
 
 class LocalBridgeGateway {
   private socket?: WebSocket;
@@ -45,6 +54,16 @@ class LocalBridgeGateway {
 
   public get connected(): boolean {
     return this.socket?.readyState === WebSocket.OPEN;
+  }
+
+  public close(): void {
+    this.socket?.close(1001, "agent service shutting down");
+    this.socket = undefined;
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("Agent service is shutting down."));
+    }
+    this.pending.clear();
   }
 
   public send(request: ToolRequest): Promise<ToolResponse> {
@@ -129,6 +148,7 @@ const callTool = async (
   payload: Record<string, unknown>,
 ): Promise<ToolResponse> => {
   log("[agent] tool call", { tool: toolName, sessionId });
+  store.ensureSession(sessionId);
   const definition = getTool(toolName);
   if (!definition || !definition.enabled) {
     return {
@@ -137,49 +157,88 @@ const callTool = async (
       error: { code: "TOOL_UNAVAILABLE", message: `Tool is unavailable: ${toolName}`, retryable: false },
     };
   }
-  return bridge.send(createToolRequest(sessionId, toolName, payload));
-};
-
-type TaskStatus = "planning" | "waiting_confirmation" | "executing" | "completed" | "failed" | "cancelled";
-
-type TaskExecution = {
-  operations: Array<{ operationId: string; tool: string; ok: boolean; data?: unknown; error?: string }>;
-  verification?: { ok: boolean; data?: unknown; error?: string };
-};
-
-type AgentTask = {
-  taskId: string;
-  sessionId: string;
-  instruction: string;
-  status: TaskStatus;
-  model: string;
-  message: string;
-  context: unknown;
-  toolTrace: unknown[];
-  changeSet: ChangeSet;
-  confirmationToken?: string;
-  execution?: TaskExecution;
-  createdAt: string;
-  updatedAt: string;
-};
-
-const tasks = new Map<string, AgentTask>();
-
-const runModelTurn = async (sessionId: string, instruction: string, mode: "chat" | "plan" = "chat") => {
-  log("[llm] turn started", { sessionId, mode, provider: process.env.JLCIRCUIT_MODEL_PROVIDER ?? "stub" });
-  const result = await runAgentTurn({
-    instruction,
+  const payloadText = JSON.stringify(payload);
+  store.appendAuditEvent({
     sessionId,
-    toolDefinitions: JLCIRCUIT_TOOLS,
-    executeTool: callTool,
-    mode,
+    eventType: "tool.requested",
+    payload: {
+      tool: toolName,
+      riskLevel: definition.riskLevel,
+      arguments: payloadText.length <= 8_000
+        ? payload
+        : { truncated: true, charLength: payloadText.length, preview: payloadText.slice(0, 2_000) },
+    },
   });
-  log("[llm] turn completed", {
-    model: result.model,
-    toolCount: result.toolTrace.length,
-    plannedOperationCount: result.plannedOperations.length,
-  });
-  return result;
+  try {
+    const result = await bridge.send(createToolRequest(sessionId, toolName, payload));
+    const dataText = JSON.stringify(result.data ?? null);
+    store.appendAuditEvent({
+      sessionId,
+      eventType: result.ok ? "tool.completed" : "tool.failed",
+      payload: {
+        tool: toolName,
+        requestId: result.requestId,
+        ok: result.ok,
+        error: result.error,
+        data: dataText.length <= 8_000
+          ? result.data
+          : { truncated: true, charLength: dataText.length, preview: dataText.slice(0, 2_000) },
+        content: result.content?.map((item) => item.type === "image"
+          ? { type: "image", mimeType: item.mimeType, byteLength: item.data.length }
+          : item),
+      },
+    });
+    return result;
+  } catch (error) {
+    store.appendAuditEvent({
+      sessionId,
+      eventType: "tool.failed",
+      payload: { tool: toolName, error: error instanceof Error ? error.message : String(error) },
+    });
+    throw error;
+  }
+};
+
+const runModelTurn = async (
+  sessionId: string,
+  instruction: string,
+  mode: "chat" | "plan" = "chat",
+  userInstruction = instruction,
+) => {
+  log("[llm] turn started", { sessionId, mode, provider: process.env.JLCIRCUIT_MODEL_PROVIDER ?? "stub" });
+  const userMessage = contextEngine.beginTurn(sessionId, userInstruction, mode);
+  try {
+    const preparedContext = await contextEngine.prepareTurn({
+      sessionId,
+      beforeSequence: userMessage.sequence,
+      readDesignContext: () => callTool("easyeda_get_context", sessionId, {}),
+    });
+    const result = await runAgentTurn({
+      instruction,
+      sessionId,
+      preparedContext,
+      toolDefinitions: JLCIRCUIT_TOOLS,
+      executeTool: callTool,
+      mode,
+    });
+    contextEngine.completeTurn({
+      sessionId,
+      mode,
+      content: result.message,
+      model: result.model,
+      toolCount: result.toolTrace.length,
+      plannedOperationCount: result.plannedOperations.length,
+    });
+    log("[llm] turn completed", {
+      model: result.model,
+      toolCount: result.toolTrace.length,
+      plannedOperationCount: result.plannedOperations.length,
+    });
+    return result;
+  } catch (error) {
+    contextEngine.failTurn(sessionId, mode, error);
+    throw error;
+  }
 };
 
 const createChangeSet = (result: Awaited<ReturnType<typeof runModelTurn>>): ChangeSet => ({
@@ -187,11 +246,29 @@ const createChangeSet = (result: Awaited<ReturnType<typeof runModelTurn>>): Chan
   projectId: (result.context as { project?: { id?: string } } | undefined)?.project?.id,
   documentId: (result.context as { activeDocument?: { id?: string } } | undefined)?.activeDocument?.id,
   summary: result.message || "待确认的设计修改",
-  operations: result.plannedOperations,
-  requiresConfirmation: result.plannedOperations.length > 0,
+  operations: result.plannedOperations.filter(isExecutableOperation),
+  requiresConfirmation: result.plannedOperations.some(isExecutableOperation),
   createdAt: new Date().toISOString(),
   createdBy: "agent",
 });
+
+const isExecutableOperation = (operation: ChangeOperation): boolean =>
+  operation.tool === "easyeda_schematic_move_component" &&
+  typeof operation.args.primitiveId === "string" &&
+  typeof operation.args.x === "number" && Number.isFinite(operation.args.x) &&
+  typeof operation.args.y === "number" && Number.isFinite(operation.args.y);
+
+const buildPlanInstruction = (instruction: string, forceExecutionPlan: boolean): string => {
+  if (!forceExecutionPlan) return instruction;
+  return [
+    "这是用户明确要求生成可执行修改计划的请求。",
+    "请优先生成结构化写操作，不要只返回说明。",
+    "如果缺少 primitiveId，先调用 easyeda_schematic_components 查找匹配的元件。",
+    "信息足够时必须调用 easyeda_schematic_move_component；参数必须包含 primitiveId、x、y，并设置 preserveConnections=true。",
+    "如果即使读取元件列表后仍然缺少关键信息，请明确指出需要用户补充什么，不要猜测参数。",
+    `原始用户需求：${instruction}`,
+  ].join("\n");
+};
 
 const taskView = (task: AgentTask) => ({ ...task });
 
@@ -205,6 +282,8 @@ const getTaskIdFromPath = (pathname: string, suffix: string): string | undefined
 const executeTask = async (task: AgentTask): Promise<boolean> => {
   task.status = "executing";
   task.updatedAt = new Date().toISOString();
+  store.saveTask(task);
+  store.appendAuditEvent({ sessionId: task.sessionId, taskId: task.taskId, eventType: "task.executing" });
   const currentContext = await callTool("easyeda_get_context", task.sessionId, {});
   if (!currentContext.ok) {
     task.status = "failed";
@@ -213,6 +292,13 @@ const executeTask = async (task: AgentTask): Promise<boolean> => {
       verification: { ok: false, error: currentContext.error?.message ?? "无法在写入前读取当前设计。" },
     };
     task.updatedAt = new Date().toISOString();
+    store.saveTask(task);
+    store.appendAuditEvent({
+      sessionId: task.sessionId,
+      taskId: task.taskId,
+      eventType: "task.failed",
+      payload: task.execution,
+    });
     return false;
   }
   const plannedProjectId = (task.context as { project?: { id?: string } } | undefined)?.project?.id;
@@ -227,6 +313,13 @@ const executeTask = async (task: AgentTask): Promise<boolean> => {
       verification: { ok: false, error: "计划生成后当前项目或文档已发生变化，已阻止写入。请重新生成计划。" },
     };
     task.updatedAt = new Date().toISOString();
+    store.saveTask(task);
+    store.appendAuditEvent({
+      sessionId: task.sessionId,
+      taskId: task.taskId,
+      eventType: "task.failed",
+      payload: task.execution,
+    });
     return false;
   }
   const operations: TaskExecution["operations"] = [];
@@ -269,6 +362,13 @@ const executeTask = async (task: AgentTask): Promise<boolean> => {
   const operationsOk = operations.length > 0 && operations.every((operation) => operation.ok);
   task.status = operationsOk && verification.ok ? "completed" : "failed";
   task.updatedAt = new Date().toISOString();
+  store.saveTask(task);
+  store.appendAuditEvent({
+    sessionId: task.sessionId,
+    taskId: task.taskId,
+    eventType: task.status === "completed" ? "task.completed" : "task.failed",
+    payload: task.execution,
+  });
   return task.status === "completed";
 };
 
@@ -293,6 +393,7 @@ const server = createServer(async (request, response) => {
         status: "ok",
         bridge: bridge.connected ? "connected" : "not-connected",
         bridgeProtocolVersion: 1,
+        persistence: { type: "sqlite", status: "ready" },
         timestamp: new Date().toISOString(),
       });
       return;
@@ -305,11 +406,37 @@ const server = createServer(async (request, response) => {
 
     if (request.method === "POST" && url.pathname === "/v1/sessions") {
       const body = (await readBody(request)) as { projectId?: string };
-      json(response, 201, {
-        sessionId: crypto.randomUUID(),
-        projectId: body.projectId ?? null,
-        status: "created",
+      const session = store.createSession(body.projectId);
+      store.appendAuditEvent({ sessionId: session.id, eventType: "session.created", payload: { projectId: session.projectId } });
+      json(response, 201, { sessionId: session.id, projectId: session.projectId ?? null, status: "created" });
+      return;
+    }
+
+    const sessionPath = url.pathname.startsWith("/v1/sessions/")
+      ? url.pathname.slice("/v1/sessions/".length)
+      : undefined;
+    if (request.method === "GET" && sessionPath && !sessionPath.includes("/")) {
+      const sessionId = decodeURIComponent(sessionPath);
+      const session = store.getSession(sessionId) ?? store.ensureSession(sessionId);
+      json(response, 200, {
+        session,
+        messages: store.listMessages(sessionId, 100),
+        tasks: store.listTasksForSession(sessionId, 20),
       });
+      return;
+    }
+    if (request.method === "GET" && sessionPath?.endsWith("/audit")) {
+      const sessionId = decodeURIComponent(sessionPath.slice(0, -"/audit".length));
+      store.ensureSession(sessionId);
+      json(response, 200, { sessionId, events: store.listAuditEvents(sessionId, 200) });
+      return;
+    }
+    if (request.method === "POST" && sessionPath?.endsWith("/clear")) {
+      const sessionId = decodeURIComponent(sessionPath.slice(0, -"/clear".length));
+      store.ensureSession(sessionId);
+      store.clearConversation(sessionId);
+      store.appendAuditEvent({ sessionId, eventType: "session.conversation_cleared" });
+      json(response, 200, { sessionId, status: "cleared" });
       return;
     }
 
@@ -328,22 +455,28 @@ const server = createServer(async (request, response) => {
     }
 
     if (request.method === "POST" && url.pathname === "/v1/plan") {
-      const body = (await readBody(request)) as { sessionId?: string; instruction?: string };
+      const body = (await readBody(request)) as { sessionId?: string; instruction?: string; forceExecutionPlan?: boolean };
       const sessionId = body.sessionId ?? "default";
       const instruction = body.instruction?.trim();
-      log(`[http] POST ${url.pathname}`, { sessionId, instructionLength: instruction?.length ?? 0 });
+      const forceExecutionPlan = body.forceExecutionPlan === true;
+      log(`[http] POST ${url.pathname}`, { sessionId, instructionLength: instruction?.length ?? 0, forceExecutionPlan });
       if (!instruction) {
         json(response, 400, { error: "invalid_request", message: "instruction is required." });
         return;
       }
-      const result = await runModelTurn(sessionId, instruction, "plan");
+      const result = await runModelTurn(
+        sessionId,
+        buildPlanInstruction(instruction, forceExecutionPlan),
+        "plan",
+        instruction,
+      );
       const changeSet = createChangeSet(result);
       const now = new Date().toISOString();
       const task: AgentTask = {
         taskId: crypto.randomUUID(),
         sessionId,
         instruction,
-        status: changeSet.operations.length > 0 ? "waiting_confirmation" : "completed",
+        status: changeSet.operations.length > 0 ? "waiting_confirmation" : "awaiting_user",
         model: result.model,
         message: result.message,
         context: result.context,
@@ -353,7 +486,13 @@ const server = createServer(async (request, response) => {
         createdAt: now,
         updatedAt: now,
       };
-      tasks.set(task.taskId, task);
+      store.saveTask(task);
+      store.appendAuditEvent({
+        sessionId,
+        taskId: task.taskId,
+        eventType: "task.created",
+        payload: { status: task.status, operationCount: task.changeSet.operations.length },
+      });
       json(response, 200, taskView(task));
       return;
     }
@@ -362,7 +501,7 @@ const server = createServer(async (request, response) => {
       ? url.pathname.slice("/v1/tasks/".length)
       : undefined;
     if (taskIdForGet) {
-      const task = tasks.get(taskIdForGet);
+      const task = store.getTask(taskIdForGet);
       if (!task) {
         json(response, 404, { error: "not_found", message: "task not found" });
         return;
@@ -375,7 +514,7 @@ const server = createServer(async (request, response) => {
       ? getTaskIdFromPath(url.pathname, "/confirm")
       : undefined;
     if (taskIdForConfirm) {
-      const task = tasks.get(taskIdForConfirm);
+      const task = store.getTask(taskIdForConfirm);
       if (!task) {
         json(response, 404, { error: "not_found", message: "task not found" });
         return;
@@ -390,6 +529,9 @@ const server = createServer(async (request, response) => {
         return;
       }
       task.confirmationToken = undefined;
+      task.updatedAt = new Date().toISOString();
+      store.saveTask(task);
+      store.appendAuditEvent({ sessionId: task.sessionId, taskId: task.taskId, eventType: "task.confirmed" });
       let succeeded = false;
       try {
         succeeded = await executeTask(task);
@@ -400,6 +542,13 @@ const server = createServer(async (request, response) => {
           verification: { ok: false, error: error instanceof Error ? error.message : String(error) },
         };
         task.updatedAt = new Date().toISOString();
+        store.saveTask(task);
+        store.appendAuditEvent({
+          sessionId: task.sessionId,
+          taskId: task.taskId,
+          eventType: "task.failed",
+          payload: task.execution,
+        });
       }
       json(response, succeeded ? 200 : 502, taskView(task));
       return;
@@ -409,7 +558,7 @@ const server = createServer(async (request, response) => {
       ? getTaskIdFromPath(url.pathname, "/cancel")
       : undefined;
     if (taskIdForCancel) {
-      const task = tasks.get(taskIdForCancel);
+      const task = store.getTask(taskIdForCancel);
       if (!task) {
         json(response, 404, { error: "not_found", message: "task not found" });
         return;
@@ -418,6 +567,8 @@ const server = createServer(async (request, response) => {
         task.confirmationToken = undefined;
         task.status = "cancelled";
         task.updatedAt = new Date().toISOString();
+        store.saveTask(task);
+        store.appendAuditEvent({ sessionId: task.sessionId, taskId: task.taskId, eventType: "task.cancelled" });
       }
       json(response, 200, taskView(task));
       return;
@@ -426,7 +577,11 @@ const server = createServer(async (request, response) => {
     if (request.method === "POST" && url.pathname === "/v1/context") {
       const body = (await readBody(request)) as { sessionId?: string };
       log("[http] POST /v1/context", { sessionId: body.sessionId ?? "default" });
-      const result = await callTool("easyeda_get_context", body.sessionId ?? "default", {});
+      const sessionId = body.sessionId ?? "default";
+      const result = await contextEngine.captureDesignContext(
+        sessionId,
+        () => callTool("easyeda_get_context", sessionId, {}),
+      );
       json(response, result.ok ? 200 : 502, result);
       return;
     }
@@ -468,4 +623,22 @@ server.on("upgrade", (request, socket, head) => {
 server.listen(port, host, () => {
   console.log(`JLCircuit Agent listening on http://${host}:${port}`);
   console.log(`EDA bridge waiting on ws://${host}:${port}/bridge`);
+  console.log(`Session database: ${store.path}`);
 });
+
+let shuttingDown = false;
+const shutdown = (signal: string): void => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  log("[service] shutting down", { signal });
+  bridge.close();
+  server.close(() => {
+    bridgeServer.close();
+    store.close();
+    process.exit(0);
+  });
+  setTimeout(() => process.exit(1), 5_000).unref();
+};
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));

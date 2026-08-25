@@ -20,7 +20,7 @@ Local EDA Bridge
 - `packages/contracts`：前后端共享的 Design IR、ChangeSet 和消息协议。
 - `packages/bridge`：面向 EDA 执行端的类型化能力边界。
 - `extensions/jlcircuit-eda`：嘉立创EDA扩展入口、助手面板和 API 适配器。
-- `docs/architecture.md`：当前架构决策和 MVP 边界。
+- `docs/current-architecture.md`：与当前代码一致的完整架构、流程、接口、安全边界和已知限制。
 
 ## 本地运行
 
@@ -56,6 +56,10 @@ GET /health
 ```text
 GET  /v1/tools
 POST /v1/tools/:toolName
+POST /v1/sessions
+GET  /v1/sessions/:sessionId
+GET  /v1/sessions/:sessionId/audit
+POST /v1/sessions/:sessionId/clear
 POST /v1/context
 POST /v1/drc
 POST /v1/chat
@@ -116,9 +120,27 @@ JLCIRCUIT_LLM_CONTEXT_MAX_ITEMS=200
 
 `JLCIRCUIT_LLM_MAX_TOKENS` 限制单次模型输出（包括 reasoning）长度；`JLCIRCUIT_LLM_CONTEXT_MAX_CHARS` 限制发送给模型的设计上下文字符数；`JLCIRCUIT_LLM_CONTEXT_MAX_ITEMS` 限制元件和导线样例数量。服务会保留总数和截断标记，Agent 返回的原始上下文不受影响。
 
+### 会话持久化与上下文引擎
+
+Agent Service 使用 Node.js 内置 SQLite 保存会话、消息、任务、最新 EDA 快照和审计事件，默认数据库为 `.jlcircuit-data/jlcircuit-agent.sqlite`。该目录已被 Git 忽略；可通过 `JLCIRCUIT_DB_PATH` 修改位置。Node.js 版本要求为 24 或更高。
+
+每轮请求会先写入用户消息，再读取最新 EDA 快照，并由 Context Engine 组合较早会话的滚动摘要、最近多轮对话、仍在等待补充或确认的任务以及当前原理图/PCB 上下文。EDA 快照和对话历史分别控制预算，避免历史消息挤占设计数据：
+
+```env
+JLCIRCUIT_CONTEXT_RECENT_MESSAGES=12
+JLCIRCUIT_CONTEXT_HISTORY_MAX_CHARS=12000
+JLCIRCUIT_CONTEXT_SUMMARY_MAX_CHARS=6000
+JLCIRCUIT_CONTEXT_ACTIVE_TASKS=5
+JLCIRCUIT_CONTEXT_TASK_MAX_CHARS=6000
+```
+
+`GET /v1/sessions/:sessionId` 可恢复最近消息和任务；EDA 助手面板启动时会自动调用该接口。界面的“清空对话”会删除该会话的消息和滚动摘要，但不会删除任务及审计记录。服务重启后，待确认任务和确认令牌仍可恢复。
+
+EDA 面板会按当前项目 ID 生成独立的 `sessionId`，不同工程不会共享对话历史。后端也会校验会话绑定的项目；如果 API 客户端错误地把同一会话用于另一个项目，请求会被阻止并要求创建新的会话。
+
 ### 多步修改流程
 
-当前版本的“生成修改计划”会调用 `/v1/plan`，只生成待确认的 `ChangeSet`，不会直接写入 EDA。用户确认后调用 `/v1/tasks/:taskId/confirm`，服务会在写入前重新读取项目和文档 ID，防止计划针对的设计已经变化；当前第一条真实执行链只支持 `easyeda_schematic_move_component`，执行后自动调用 `easyeda_post_write_verify`。取消计划调用 `/v1/tasks/:taskId/cancel`。
+当前版本的“生成修改计划”会调用 `/v1/plan`，只生成待确认的 `ChangeSet`，不会直接写入 EDA。计划模式允许模型直接回答或追问；如果没有写操作，任务会进入 `awaiting_user` 状态，不会被当成失败，也不会自动重试。用户可以继续输入补充信息，或点击界面上的“强制生成执行计划”要求模型再次尝试生成结构化写操作。生成写操作后，用户确认时调用 `/v1/tasks/:taskId/confirm`，服务会在写入前重新读取项目和文档 ID，防止计划针对的设计已经变化；当前第一条真实执行链只支持 `easyeda_schematic_move_component`，执行后自动调用 `easyeda_post_write_verify`。取消计划调用 `/v1/tasks/:taskId/cancel`。
 
 测试接口：
 

@@ -1,4 +1,5 @@
 import type { ChangeOperation, EdaToolDefinition, ToolContent, ToolResponse } from "../../../packages/contracts/src/index.ts";
+import type { PreparedAgentContext } from "./context-engine.ts";
 
 type LlmMessage = Record<string, unknown>;
 
@@ -20,6 +21,7 @@ type LlmToolCall = {
 type LlmAssistantMessage = {
   role: "assistant";
   content?: string | null;
+  reasoning?: string | null;
   tool_calls?: LlmToolCall[];
 };
 
@@ -103,12 +105,6 @@ const positiveInteger = (value: string | undefined, fallback: number): number =>
 
 const maxTokens = (): number => positiveInteger(process.env.JLCIRCUIT_LLM_MAX_TOKENS, 1_024);
 
-const maxContextChars = (): number =>
-  positiveInteger(process.env.JLCIRCUIT_LLM_CONTEXT_MAX_CHARS, 40_000);
-
-const maxContextItems = (): number =>
-  positiveInteger(process.env.JLCIRCUIT_LLM_CONTEXT_MAX_ITEMS, 200);
-
 const llmLog = (message: string, details?: unknown): void => {
   const suffix = details === undefined ? "" : ` ${JSON.stringify(details)}`;
   console.log(`[${new Date().toISOString()}] [llm] ${message}${suffix}`);
@@ -140,68 +136,6 @@ const stringifyForModel = (value: unknown): string => {
   } catch (error) {
     return JSON.stringify({ serializationError: String(error) });
   }
-};
-
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  Boolean(value) && typeof value === "object" && !Array.isArray(value);
-
-const compactArray = (value: unknown, limit: number): unknown => {
-  if (!Array.isArray(value)) return value;
-  return {
-    total: value.length,
-    included: Math.min(value.length, limit),
-    truncated: value.length > limit,
-    items: value.slice(0, limit),
-  };
-};
-
-const compactContextCandidate = (context: Record<string, unknown>, itemLimit: number): Record<string, unknown> => {
-  const summary = isRecord(context.summary) ? context.summary : {};
-  const drc = Array.isArray(context.drc) ? compactArray(context.drc, Math.min(itemLimit, 50)) : context.drc;
-  return {
-    project: context.project,
-    activeDocument: context.activeDocument,
-    selected: compactArray(context.selected, Math.min(itemLimit, 50)),
-    summary: {
-      api: summary.api,
-      primitiveReadModel: summary.primitiveReadModel,
-      components: compactArray(summary.components, itemLimit),
-      wires: compactArray(summary.wires, itemLimit),
-    },
-    drc,
-    capturedAt: context.capturedAt,
-    source: context.source,
-  };
-};
-
-const contextForModel = (context: unknown): string => {
-  const original = stringifyForModel(context);
-  if (!isRecord(context) || original.length <= maxContextChars()) {
-    llmLog("context prepared", {
-      originalChars: original.length,
-      modelChars: original.length,
-      compacted: false,
-    });
-    return original;
-  }
-
-  let itemLimit = maxContextItems();
-  let compacted = compactContextCandidate(context, itemLimit);
-  let serialized = stringifyForModel(compacted);
-  while (serialized.length > maxContextChars() && itemLimit > 1) {
-    itemLimit = Math.max(1, Math.floor(itemLimit / 2));
-    compacted = compactContextCandidate(context, itemLimit);
-    serialized = stringifyForModel(compacted);
-  }
-
-  llmLog("context prepared", {
-    originalChars: original.length,
-    modelChars: serialized.length,
-    compacted: true,
-    itemLimit,
-    maxChars: maxContextChars(),
-  });
-  return serialized;
 };
 
 const resultForModel = (result: ToolResponse): Record<string, unknown> => ({
@@ -326,7 +260,7 @@ const complete = async (
       error?: { message?: string };
       model?: string;
       usage?: unknown;
-      choices?: Array<{ message?: LlmAssistantMessage }>;
+      choices?: Array<{ finish_reason?: string; message?: LlmAssistantMessage }>;
     };
     try {
       body = JSON.parse(rawBody) as typeof body;
@@ -345,6 +279,9 @@ const complete = async (
       model: body.model ?? selectedModel ?? model(),
       hasToolCalls: Boolean(message.tool_calls?.length),
       toolCallCount: message.tool_calls?.length ?? 0,
+      finishReason: body.choices?.[0]?.finish_reason,
+      contentLength: typeof message.content === "string" ? message.content.length : 0,
+      reasoningLength: typeof message.reasoning === "string" ? message.reasoning.length : 0,
     });
     return { message, model: body.model, usage: body.usage };
   } finally {
@@ -355,40 +292,56 @@ const complete = async (
 export const runAgentTurn = async (args: {
   instruction: string;
   sessionId: string;
+  preparedContext: PreparedAgentContext;
   toolDefinitions: EdaToolDefinition[];
   executeTool: AgentToolExecutor;
   mode?: "chat" | "plan";
 }): Promise<AgentTurnResult> => {
-  const contextResponse = await args.executeTool("easyeda_get_context", args.sessionId, {});
-  if (!contextResponse.ok) {
-    throw new Error(contextResponse.error?.message ?? "Unable to read EDA context.");
-  }
-
-  const context = contextResponse.data;
+  const context = args.preparedContext.designContext;
   const toolDefinitions = new Map(args.toolDefinitions.map((definition) => [definition.name, definition]));
   const tools = toLlmTools(args.toolDefinitions);
+  const mode = args.mode ?? "chat";
   const messages: LlmMessage[] = [
     {
       role: "system",
       content: [
         "你是 JLCircuit Agent，负责协助分析嘉立创EDA原理图和PCB。",
         "先基于当前设计上下文回答，不要臆测不存在的元件或网络。",
+        "对话历史、会话摘要和未完成任务由上下文引擎提供；它们与当前 EDA 快照冲突时，以当前 EDA 快照为准。",
         "可以调用只读工具补充信息；当前回合禁止自动执行任何写操作。",
         "如果需要判断布局、连线或整体可读性，必须先调用画布截图工具；不要仅凭结构化摘要断言视觉问题。",
         "如果用户要求修改设计，先解释修改计划和风险，并明确需要用户确认。",
+        ...(mode === "plan"
+          ? [
+              "你现在处于结构化修改计划模式。只有当用户明确要求修改设计、并且信息足够时，才调用写工具生成待确认操作。",
+              "如果用户是在询问、分析、解释风险，或缺少元件 ID/目标位置等必要信息，应直接回答或提出澄清问题，不要虚构参数，也不要强行生成写操作。",
+              "写工具调用只会被记录到 ChangeSet，不会立即执行；因此可以安全地调用写工具来表达计划。",
+              "当前支持的第一条写入计划是 easyeda_schematic_move_component，参数需要包含 primitiveId、x、y 和 preserveConnections。",
+            ]
+          : []),
         "回答使用中文，必要时保留元件标号、网络名和 API 错误信息。",
       ].join("\n"),
     },
+    ...args.preparedContext.recentMessages.map((message) => ({
+      role: message.role,
+      content: message.content,
+    })),
     {
       role: "user",
-      content: `当前设计上下文：\n${contextForModel(context)}\n\n用户指令：${args.instruction}`,
+      content: [
+        args.preparedContext.sessionSummary
+          ? `较早会话摘要：\n${args.preparedContext.sessionSummary}`
+          : "较早会话摘要：无",
+        `当前未完成任务：\n${args.preparedContext.activeTasksText}`,
+        `当前设计上下文：\n${args.preparedContext.designContextText}`,
+        `本轮用户指令：${args.instruction}`,
+      ].join("\n\n"),
     },
   ];
   const toolTrace: AgentTurnResult["toolTrace"] = [];
   const plannedOperations: ChangeOperation[] = [];
   const plannedOperationKeys = new Set<string>();
   let route: CompletionRoute = "language";
-  const mode = args.mode ?? "chat";
 
   for (let round = 0; round < maxToolRounds(); round += 1) {
     const completion = await complete(messages, tools, route);
@@ -397,7 +350,11 @@ export const runAgentTurn = async (args: {
     const calls = assistant.tool_calls ?? [];
     if (calls.length === 0) {
       return {
-        message: assistant.content ?? "模型没有返回文本结果。",
+        message:
+          assistant.content?.trim() ||
+          (mode === "plan"
+            ? "当前没有生成写操作。模型可能已经给出说明，或需要你补充元件标号、目标位置等信息。"
+            : "模型没有返回文本结果。"),
         model: completion.model ?? model(),
         context,
         plannedOperations,
