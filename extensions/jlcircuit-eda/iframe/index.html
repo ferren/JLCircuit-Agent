@@ -107,6 +107,13 @@
       .check-row { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 10px; color: var(--ink); font-size: 11px; }
       .check-row label { display: flex; align-items: center; gap: 5px; }
       .mcp-editor-actions { display: flex; gap: 8px; margin-top: 12px; }
+      .knowledge-search { display: flex; gap: 8px; margin: 0 0 12px; }
+      .knowledge-search input { flex: 1; min-width: 0; padding: 8px 9px; border: 1px solid #c7d2e2; border-radius: 8px; outline: none; }
+      .knowledge-results { display: grid; gap: 8px; margin-bottom: 14px; }
+      .knowledge-result { padding: 10px; border-left: 3px solid var(--blue); border-radius: 7px; background: #f5f8fe; }
+      .knowledge-result-title { font-size: 12px; font-weight: 650; }
+      .knowledge-result-citation { margin-top: 3px; color: var(--muted); font-size: 10px; word-break: break-all; }
+      .knowledge-result-text { margin-top: 6px; color: var(--ink); white-space: pre-wrap; font-size: 11px; line-height: 1.45; }
       @media (max-width: 640px) { .form-grid { grid-template-columns: 1fr; } .form-field.full { grid-column: auto; } }
     </style>
   </head>
@@ -118,6 +125,7 @@
             <h1>JLCircuit Agent</h1>
             <p class="subtitle">先分析，再生成计划；写入操作必须确认。</p>
             <div id="mcpStatus" class="runtime-status">MCP：读取中</div>
+            <div id="knowledgeStatus" class="runtime-status">资料库：读取中</div>
           </div>
           <div class="connection"><span id="connectionDot" class="dot"></span><span id="connectionText">检查连接中</span></div>
         </div>
@@ -135,6 +143,7 @@
           <div class="actions">
             <button id="clear" class="small" type="button">清空对话</button>
             <button id="plugins" class="small" type="button">MCP 管理</button>
+            <button id="knowledge" class="small" type="button">资料库</button>
             <button id="refresh" class="secondary" type="button">刷新摘要</button>
             <button id="analyze" class="primary" type="button">发送分析</button>
             <button id="plan" class="success" type="button">生成修改计划</button>
@@ -200,6 +209,49 @@
         </div>
       </section>
     </div>
+    <div id="knowledgeManager" class="modal" hidden>
+      <section class="mcp-dialog" role="dialog" aria-modal="true" aria-labelledby="knowledgeManagerTitle">
+        <header class="mcp-dialog-head">
+          <div>
+            <h2 id="knowledgeManagerTitle">本地资料库</h2>
+            <p>只索引明确授权的目录；模型不能按任意文件路径读取本机文件。</p>
+          </div>
+          <button id="knowledgeClose" class="secondary" type="button">关闭</button>
+        </header>
+        <div class="mcp-body">
+          <div class="mcp-toolbar">
+            <button id="knowledgeAdd" class="primary" type="button">授权目录</button>
+            <button id="knowledgeScanAll" class="secondary" type="button">扫描全部</button>
+            <span class="spacer"></span>
+            <div id="knowledgeTokenRow" class="mcp-token" hidden>
+              <input id="knowledgeAdminToken" type="password" autocomplete="off" placeholder="本机管理令牌" />
+              <button id="knowledgeApplyToken" class="secondary" type="button">应用令牌</button>
+            </div>
+          </div>
+          <div id="knowledgeNotice" class="notice">正在读取资料源…</div>
+          <form id="knowledgeEditor" class="mcp-editor" hidden>
+            <h3 id="knowledgeEditorTitle">授权资料目录</h3>
+            <div class="form-grid">
+              <label class="form-field">资料源 ID<input id="knowledgeId" required placeholder="例如 board-docs" /></label>
+              <label class="form-field">显示名称<input id="knowledgeName" placeholder="例如 主板芯片手册" /></label>
+              <label class="form-field full">绝对目录路径<input id="knowledgeRootPath" required placeholder="C:\Datasheets\Grow-G1" /></label>
+              <label class="form-field full">文件扩展名（逗号或换行分隔）<textarea id="knowledgeExtensions">pdf,txt,md,markdown,json,csv,tsv,yaml,yml,html,htm,xml,net,netlist,bom</textarea></label>
+            </div>
+            <div class="check-row"><label><input id="knowledgeEnabled" type="checkbox" checked /> 启用此资料源</label></div>
+            <div class="mcp-editor-actions">
+              <button class="success" type="submit">保存授权</button>
+              <button id="knowledgeCancelEdit" class="secondary" type="button">取消</button>
+            </div>
+          </form>
+          <div class="knowledge-search">
+            <input id="knowledgeQuery" placeholder="测试检索，例如：STM32 VDD 供电电压" />
+            <button id="knowledgeSearch" class="primary" type="button">检索</button>
+          </div>
+          <div id="knowledgeResults" class="knowledge-results"></div>
+          <div id="knowledgeSourceList" class="mcp-list"></div>
+        </div>
+      </section>
+    </div>
     <script>
       const API_ORIGIN = 'http://127.0.0.1:49630';
       const runtime = globalThis.eda;
@@ -217,6 +269,14 @@
       const mcpEditor = document.querySelector('#mcpEditor');
       const mcpTokenRow = document.querySelector('#mcpTokenRow');
       const mcpAdminTokenInput = document.querySelector('#mcpAdminToken');
+      const knowledgeStatus = document.querySelector('#knowledgeStatus');
+      const knowledgeManager = document.querySelector('#knowledgeManager');
+      const knowledgeNotice = document.querySelector('#knowledgeNotice');
+      const knowledgeEditor = document.querySelector('#knowledgeEditor');
+      const knowledgeSourceList = document.querySelector('#knowledgeSourceList');
+      const knowledgeResults = document.querySelector('#knowledgeResults');
+      const knowledgeTokenRow = document.querySelector('#knowledgeTokenRow');
+      const knowledgeAdminTokenInput = document.querySelector('#knowledgeAdminToken');
       let sessionId = (() => {
         try {
           const existing = globalThis.sessionStorage?.getItem('jlcircuit-agent-last-session');
@@ -235,7 +295,11 @@
         try { return globalThis.sessionStorage?.getItem('jlcircuit-mcp-admin-token') || ''; } catch { return ''; }
       })();
       const mcpCapabilityCache = new Map();
+      let knowledgeSources = [];
+      let editingKnowledgeId = '';
+      const knowledgeDocumentCache = new Map();
       mcpAdminTokenInput.value = mcpAdminToken;
+      knowledgeAdminTokenInput.value = mcpAdminToken;
       sessionLabel.textContent = sessionId;
 
       const selectedSkillIds = () => skillSelect.value ? [skillSelect.value] : undefined;
@@ -564,6 +628,246 @@
         }
       };
 
+      const setKnowledgeNotice = (text, state = '') => {
+        knowledgeNotice.className = `notice ${state}`;
+        knowledgeNotice.textContent = text;
+      };
+
+      const updateKnowledgeStatus = () => {
+        const documents = knowledgeSources.reduce((total, source) => total + Number(source.documentCount || 0), 0);
+        const errors = knowledgeSources.reduce((total, source) => total + Number(source.errorCount || 0), 0);
+        knowledgeStatus.textContent = `资料库：${knowledgeSources.length} 个目录 · ${documents} 份文档${errors ? ` · ${errors} 异常` : ''}`;
+      };
+
+      const citationText = (result) => {
+        const citation = result.citation || {};
+        const locator = citation.page
+          ? `第 ${citation.page} 页`
+          : citation.lineStart
+            ? `第 ${citation.lineStart}${citation.lineEnd && citation.lineEnd !== citation.lineStart ? `-${citation.lineEnd}` : ''} 行`
+            : '文档片段';
+        return `${citation.path || result.path || '-'} · ${locator} · SHA256 ${(citation.sha256 || '').slice(0, 12) || '-'}`;
+      };
+
+      const renderKnowledgeResults = (results) => {
+        knowledgeResults.innerHTML = '';
+        (results || []).forEach((result) => {
+          const card = createNode('article', 'knowledge-result');
+          card.append(
+            createNode('div', 'knowledge-result-title', result.title || result.path || '未命名资料'),
+            createNode('div', 'knowledge-result-citation', citationText(result)),
+            createNode('div', 'knowledge-result-text', result.excerpt || ''),
+          );
+          knowledgeResults.appendChild(card);
+        });
+      };
+
+      const renderKnowledgeSources = () => {
+        knowledgeSourceList.innerHTML = '';
+        if (!knowledgeSources.length) {
+          knowledgeSourceList.appendChild(createNode('div', 'mcp-empty', '尚未授权资料目录。点击“授权目录”后添加芯片手册或参考电路所在文件夹。'));
+          return;
+        }
+        knowledgeSources.forEach((source) => {
+          const card = createNode('article', 'mcp-card');
+          const head = createNode('div', 'mcp-card-head');
+          const title = createNode('div');
+          title.append(
+            createNode('div', 'mcp-card-title', `${source.name} (${source.id})`),
+            createNode('div', 'mcp-card-subtitle', source.rootPath),
+          );
+          head.append(title, createNode('span', `status-pill ${source.enabled ? 'connected' : ''}`, source.enabled ? '已启用' : '已禁用'));
+          card.appendChild(head);
+          const meta = createNode('div', 'mcp-card-meta');
+          [
+            `文档：${source.documentCount || 0}`,
+            `片段：${source.chunkCount || 0}`,
+            `异常：${source.errorCount || 0}`,
+            `最近索引：${source.lastIndexedAt ? new Date(source.lastIndexedAt).toLocaleString() : '尚未扫描'}`,
+            `类型：${(source.extensions || []).join(', ')}`,
+          ].forEach((item) => meta.appendChild(createNode('span', '', item)));
+          card.appendChild(meta);
+          const actions = createNode('div', 'mcp-card-actions');
+          actions.append(
+            managerButton('扫描/更新索引', 'success', (button) => scanKnowledgeSource(source.id, button)),
+            managerButton('查看文档', 'secondary', (button) => loadKnowledgeDocuments(source.id, button)),
+            managerButton('编辑', 'secondary', () => openKnowledgeEditor(source)),
+            managerButton('删除', 'danger', (button) => deleteKnowledgeSource(source, button)),
+          );
+          card.appendChild(actions);
+          const documents = knowledgeDocumentCache.get(source.id);
+          if (documents) {
+            const lines = documents.length ? documents.map((document) => [
+              `${document.status === 'indexed' ? '✓' : '×'} ${document.relativePath}`,
+              `${document.fileType.toUpperCase()} · ${document.sizeBytes} bytes${document.pageCount ? ` · ${document.pageCount} 页` : ''}`,
+              document.error ? `错误：${document.error}` : '',
+            ].filter(Boolean).join(' · ')).join('\n') : '暂无已发现文档。';
+            card.appendChild(createNode('pre', 'capabilities', lines));
+          }
+          knowledgeSourceList.appendChild(card);
+        });
+      };
+
+      const loadKnowledgeSources = async () => {
+        knowledgeTokenRow.hidden = !mcpAdminTokenRequired;
+        if (mcpAdminTokenRequired && !mcpAdminToken) {
+          knowledgeSources = [];
+          renderKnowledgeSources();
+          knowledgeStatus.textContent = '资料库：需要管理令牌';
+          setKnowledgeNotice('Agent 服务启用了本机管理令牌，请先输入令牌。', 'error');
+          return;
+        }
+        setKnowledgeNotice('正在读取资料源…');
+        try {
+          const result = await request('/v1/knowledge/sources', 'GET');
+          knowledgeSources = result.sources || [];
+          updateKnowledgeStatus();
+          renderKnowledgeSources();
+          setKnowledgeNotice(`已加载 ${knowledgeSources.length} 个授权目录。索引内容只在本机 SQLite 中保存。`, 'success');
+        } catch (error) {
+          knowledgeStatus.textContent = '资料库：读取失败';
+          setKnowledgeNotice(`资料源读取失败：${String(error)}`, 'error');
+        }
+      };
+
+      const openKnowledgeManager = async () => {
+        knowledgeManager.hidden = false;
+        await loadMcpServers(false);
+        await loadKnowledgeSources();
+      };
+
+      const openKnowledgeEditor = (source) => {
+        editingKnowledgeId = source?.id || '';
+        knowledgeEditor.reset();
+        document.querySelector('#knowledgeEditorTitle').textContent = editingKnowledgeId ? `编辑 ${editingKnowledgeId}` : '授权资料目录';
+        document.querySelector('#knowledgeId').value = source?.id || '';
+        document.querySelector('#knowledgeId').disabled = Boolean(editingKnowledgeId);
+        document.querySelector('#knowledgeName').value = source?.name || '';
+        document.querySelector('#knowledgeRootPath').value = source?.rootPath || '';
+        document.querySelector('#knowledgeExtensions').value = (source?.extensions || ['pdf','txt','md','markdown','json','csv','tsv','yaml','yml','html','htm','xml','net','netlist','bom']).map((item) => item.replace(/^\./, '')).join(',');
+        document.querySelector('#knowledgeEnabled').checked = source?.enabled !== false;
+        knowledgeEditor.hidden = false;
+        knowledgeEditor.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      };
+
+      const closeKnowledgeEditor = () => {
+        editingKnowledgeId = '';
+        knowledgeEditor.hidden = true;
+      };
+
+      const saveKnowledgeSource = async (event) => {
+        event.preventDefault();
+        const id = editingKnowledgeId || document.querySelector('#knowledgeId').value.trim();
+        const source = {
+          id,
+          name: document.querySelector('#knowledgeName').value.trim() || id,
+          rootPath: document.querySelector('#knowledgeRootPath').value.trim(),
+          enabled: document.querySelector('#knowledgeEnabled').checked,
+          extensions: splitList(document.querySelector('#knowledgeExtensions').value),
+        };
+        const submit = knowledgeEditor.querySelector('button[type="submit"]');
+        submit.disabled = true;
+        try {
+          const path = editingKnowledgeId
+            ? `/v1/knowledge/sources/${encodeURIComponent(editingKnowledgeId)}/update`
+            : '/v1/knowledge/sources';
+          await request(path, 'POST', source);
+          closeKnowledgeEditor();
+          await loadKnowledgeSources();
+          setKnowledgeNotice(`${id} 已授权。点击“扫描/更新索引”开始读取资料。`, 'success');
+        } catch (error) {
+          setKnowledgeNotice(`保存失败：${String(error)}`, 'error');
+        } finally {
+          submit.disabled = false;
+        }
+      };
+
+      const scanKnowledgeSource = async (sourceId, button) => {
+        button.disabled = true;
+        setKnowledgeNotice(`正在扫描 ${sourceId}。大型 PDF 可能需要一些时间…`);
+        try {
+          const result = await request(`/v1/knowledge/sources/${encodeURIComponent(sourceId)}/scan`, 'POST', {});
+          knowledgeDocumentCache.delete(sourceId);
+          await loadKnowledgeSources();
+          setKnowledgeNotice(`扫描完成：发现 ${result.discovered}，新增/更新 ${result.indexed}，未变化 ${result.unchanged}，移除 ${result.removed}，错误 ${result.errors}。`, result.errors ? 'error' : 'success');
+        } catch (error) {
+          setKnowledgeNotice(`扫描失败：${String(error)}`, 'error');
+          button.disabled = false;
+        }
+      };
+
+      const scanAllKnowledge = async (button) => {
+        button.disabled = true;
+        setKnowledgeNotice('正在扫描全部已启用资料源…');
+        try {
+          const response = await request('/v1/knowledge/reindex', 'POST', {});
+          knowledgeDocumentCache.clear();
+          await loadKnowledgeSources();
+          const results = response.results || [];
+          setKnowledgeNotice(`全部扫描完成：${results.length} 个资料源，更新 ${results.reduce((sum, item) => sum + item.indexed, 0)} 份文档，错误 ${results.reduce((sum, item) => sum + item.errors, 0)}。`, 'success');
+        } catch (error) {
+          setKnowledgeNotice(`全部扫描失败：${String(error)}`, 'error');
+        } finally {
+          button.disabled = false;
+        }
+      };
+
+      const loadKnowledgeDocuments = async (sourceId, button) => {
+        button.disabled = true;
+        try {
+          const result = await request(`/v1/knowledge/sources/${encodeURIComponent(sourceId)}/documents`, 'GET');
+          knowledgeDocumentCache.set(sourceId, result.documents || []);
+          renderKnowledgeSources();
+          setKnowledgeNotice(`已读取 ${sourceId} 的文档清单。`, 'success');
+        } catch (error) {
+          setKnowledgeNotice(`文档读取失败：${String(error)}`, 'error');
+          button.disabled = false;
+        }
+      };
+
+      const deleteKnowledgeSource = async (source, button) => {
+        if (!globalThis.confirm(`确定删除资料源“${source.name}”吗？\n这会删除它的本地索引，但不会删除原始文件。`)) return;
+        button.disabled = true;
+        try {
+          await request(`/v1/knowledge/sources/${encodeURIComponent(source.id)}/delete`, 'POST', {});
+          knowledgeDocumentCache.delete(source.id);
+          await loadKnowledgeSources();
+          setKnowledgeNotice(`${source.id} 的授权和本地索引已删除；原始文件未改动。`, 'success');
+        } catch (error) {
+          setKnowledgeNotice(`删除失败：${String(error)}`, 'error');
+          button.disabled = false;
+        }
+      };
+
+      const searchKnowledge = async () => {
+        const query = document.querySelector('#knowledgeQuery').value.trim();
+        if (!query) return;
+        const button = document.querySelector('#knowledgeSearch');
+        button.disabled = true;
+        setKnowledgeNotice(`正在检索：${query}`);
+        try {
+          const result = await request('/v1/knowledge/search', 'POST', { query, limit: 10 });
+          const results = result.data?.results || [];
+          renderKnowledgeResults(results);
+          setKnowledgeNotice(`检索完成，找到 ${results.length} 个可引用片段。`, results.length ? 'success' : '');
+        } catch (error) {
+          setKnowledgeNotice(`检索失败：${String(error)}`, 'error');
+        } finally {
+          button.disabled = false;
+        }
+      };
+
+      const applyLocalAdminToken = async (value, reload) => {
+        mcpAdminToken = value.trim();
+        mcpAdminTokenInput.value = mcpAdminToken;
+        knowledgeAdminTokenInput.value = mcpAdminToken;
+        try {
+          if (mcpAdminToken) globalThis.sessionStorage?.setItem('jlcircuit-mcp-admin-token', mcpAdminToken);
+          else globalThis.sessionStorage?.removeItem('jlcircuit-mcp-admin-token');
+        } catch { /* ignore */ }
+        await reload();
+      };
+
       const useProjectSession = (context) => {
         const scopeId = context?.project?.id || context?.activeDocument?.id;
         if (!scopeId) return;
@@ -854,6 +1158,7 @@
         }
         await loadSkills();
         await loadMcpServers(false);
+        await loadKnowledgeSources();
         await restoreSession();
       };
 
@@ -877,6 +1182,7 @@
       document.querySelector('#refresh').addEventListener('click', () => refresh(false));
       document.querySelector('#clear').addEventListener('click', clearConversation);
       document.querySelector('#plugins').addEventListener('click', openMcpManager);
+      document.querySelector('#knowledge').addEventListener('click', openKnowledgeManager);
       document.querySelector('#mcpClose').addEventListener('click', () => { mcpManager.hidden = true; closeMcpEditor(); });
       document.querySelector('#mcpAdd').addEventListener('click', () => openMcpEditor());
       document.querySelector('#mcpReload').addEventListener('click', (event) => runMcpAction('registry', 'reload', event.currentTarget));
@@ -884,15 +1190,25 @@
       document.querySelector('#mcpTransport').addEventListener('change', updateMcpTransportFields);
       mcpEditor.addEventListener('submit', saveMcpConfig);
       document.querySelector('#mcpApplyToken').addEventListener('click', async () => {
-        mcpAdminToken = mcpAdminTokenInput.value.trim();
-        try {
-          if (mcpAdminToken) globalThis.sessionStorage?.setItem('jlcircuit-mcp-admin-token', mcpAdminToken);
-          else globalThis.sessionStorage?.removeItem('jlcircuit-mcp-admin-token');
-        } catch { /* ignore */ }
-        await loadMcpManager();
+        await applyLocalAdminToken(mcpAdminTokenInput.value, loadMcpManager);
       });
       mcpManager.addEventListener('click', (event) => {
         if (event.target === mcpManager) { mcpManager.hidden = true; closeMcpEditor(); }
+      });
+      document.querySelector('#knowledgeClose').addEventListener('click', () => { knowledgeManager.hidden = true; closeKnowledgeEditor(); });
+      document.querySelector('#knowledgeAdd').addEventListener('click', () => openKnowledgeEditor());
+      document.querySelector('#knowledgeScanAll').addEventListener('click', (event) => scanAllKnowledge(event.currentTarget));
+      document.querySelector('#knowledgeCancelEdit').addEventListener('click', closeKnowledgeEditor);
+      document.querySelector('#knowledgeSearch').addEventListener('click', searchKnowledge);
+      knowledgeEditor.addEventListener('submit', saveKnowledgeSource);
+      document.querySelector('#knowledgeApplyToken').addEventListener('click', async () => {
+        await applyLocalAdminToken(knowledgeAdminTokenInput.value, loadKnowledgeSources);
+      });
+      document.querySelector('#knowledgeQuery').addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') { event.preventDefault(); searchKnowledge(); }
+      });
+      knowledgeManager.addEventListener('click', (event) => {
+        if (event.target === knowledgeManager) { knowledgeManager.hidden = true; closeKnowledgeEditor(); }
       });
       instructionInput.addEventListener('keydown', (event) => {
         if (event.key === 'Enter' && !event.shiftKey) {

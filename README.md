@@ -1,8 +1,8 @@
 # JLCircuit Agent
 
-嘉立创智能电路助手的初始工程骨架。
+嘉立创智能电路助手的本地可运行 MVP。
 
-项目采用“本地嘉立创EDA扩展负责执行，后端 Agent 负责理解与编排”的结构。当前实现参考 `easyeda-mcp-pro`，先提供本地 MCP 风格工具层和 WebSocket Bridge：
+项目采用“本地嘉立创EDA扩展负责执行，后端 Agent 负责理解与编排”的结构。当前已形成 WebSocket EDA Bridge、多轮会话、声明式技能、MCP Gateway，以及带来源引用的本地资料库：
 
 ```text
 用户 / 面板
@@ -76,6 +76,15 @@ GET  /v1/mcp/servers/:serverId/resources
 POST /v1/mcp/servers/:serverId/resources/read
 GET  /v1/mcp/servers/:serverId/prompts
 POST /v1/mcp/servers/:serverId/prompts/get
+GET  /v1/knowledge/sources
+POST /v1/knowledge/sources
+POST /v1/knowledge/reindex
+POST /v1/knowledge/sources/:sourceId/update
+POST /v1/knowledge/sources/:sourceId/delete
+POST /v1/knowledge/sources/:sourceId/scan
+GET  /v1/knowledge/sources/:sourceId/documents
+POST /v1/knowledge/search
+POST /v1/knowledge/read
 POST /v1/tools/:toolName
 POST /v1/sessions
 GET  /v1/sessions/:sessionId
@@ -161,7 +170,7 @@ EDA 面板会按当前项目 ID 生成独立的 `sessionId`，不同工程不会
 
 ### 声明式技能
 
-服务启动时会加载 `skills/builtin/*/skill.json`，并可通过 `JLCIRCUIT_SKILL_ROOTS` 加载额外的受信目录。每个技能由 `skill.json` 和同目录内的 `SKILL.md` 组成，声明启用条件、适用模式、允许/必需工具和风险级别。当前内置 `eda-core` 与 `schematic-layout`；面板可选择“自动”或明确指定一个技能。
+服务启动时会加载 `skills/builtin/*/skill.json`，并可通过 `JLCIRCUIT_SKILL_ROOTS` 加载额外的受信目录。每个技能由 `skill.json` 和同目录内的 `SKILL.md` 组成，声明启用条件、适用模式、允许/必需工具和风险级别。当前内置 `eda-core`、`schematic-layout`、`mcp-assistant` 与 `local-knowledge`；面板可选择“自动”或明确指定一个技能。
 
 ```env
 JLCIRCUIT_SKILL_ROOTS=C:\trusted\jlcircuit-skills
@@ -237,7 +246,7 @@ Copy-Item config/mcp-servers.example.json .jlcircuit-data/mcp-servers.json
 
 ```powershell
 $headers = @{}
-if ($env:JLCIRCUIT_MCP_ADMIN_TOKEN) { $headers["x-jlcircuit-admin-token"] = $env:JLCIRCUIT_MCP_ADMIN_TOKEN }
+if ($env:JLCIRCUIT_ADMIN_TOKEN) { $headers["x-jlcircuit-admin-token"] = $env:JLCIRCUIT_ADMIN_TOKEN }
 Invoke-RestMethod -Method Post -Headers $headers http://127.0.0.1:49630/v1/mcp/reload
 Invoke-RestMethod -Method Post -Headers $headers http://127.0.0.1:49630/v1/mcp/servers/local-example/enable
 Invoke-RestMethod http://127.0.0.1:49630/v1/mcp/servers
@@ -256,23 +265,71 @@ MCP 工具会转换成 `mcp__<server>__<tool>` 命名空间，并通过 `mcp-ass
 
 EDA 面板顶部显示 MCP 已连接数量，“MCP 管理”可以直接新增、编辑、删除配置，启用或禁用 Server，连接、断开、测试连接，并查看已发现的 Tools、Resources 和 Prompts。配置保存使用临时文件加原子替换；Server ID 创建后不能修改，密钥值不会进入配置文件。
 
-MCP 管理接口只在 Agent Service 绑定回环地址且请求来自本机时开放。建议在 `.env` 中配置管理令牌；EDA 管理窗口会要求输入该令牌，并只在当前 EDA 会话的 `sessionStorage` 中保存：
+MCP 与本地资料库管理接口只在 Agent Service 绑定回环地址且请求来自本机时开放。建议在 `.env` 中配置统一管理令牌；EDA 管理窗口会要求输入该令牌，并只在当前 EDA 会话的 `sessionStorage` 中保存：
 
 ```env
-JLCIRCUIT_MCP_ADMIN_TOKEN=请替换为足够长的随机值
-# 只有管理请求确实携带 Origin 时才需要配置，多个 Origin 用逗号分隔
-JLCIRCUIT_MCP_ADMIN_ALLOWED_ORIGINS=
+JLCIRCUIT_ADMIN_TOKEN=请替换为足够长的随机值
+# Agent 自身的 127.0.0.1/localhost/[::1] Origin 已默认允许；这里只填写额外 Origin
+JLCIRCUIT_ADMIN_ALLOWED_ORIGINS=
 ```
 
 带管理令牌的命令行调用示例：
 
 ```powershell
-$headers = @{ "x-jlcircuit-admin-token" = $env:JLCIRCUIT_MCP_ADMIN_TOKEN }
+$headers = @{ "x-jlcircuit-admin-token" = $env:JLCIRCUIT_ADMIN_TOKEN }
 Invoke-RestMethod -Headers $headers http://127.0.0.1:49630/v1/mcp/config
 Invoke-RestMethod -Method Post -Headers $headers http://127.0.0.1:49630/v1/mcp/reload
 ```
 
 当前仍没有插件商店、OAuth 交互授权、自动安装、失败自动重连或外部写操作执行器。
+
+### 本地资料库
+
+阶段 5 的基础闭环允许用户显式授权本机目录，索引芯片手册、参考说明、BOM 和网表，再让模型用只读工具检索并引用原始位置。EDA 助手点击“资料库”即可新增资料源、扫描单个或全部目录、查看文档与解析错误，并直接测试搜索。资料源必须填写已经存在的绝对目录；删除资料源只删除索引，不会删除原文件。
+
+当前支持 `.pdf`、`.txt`、`.md`、`.markdown`、`.json`、`.csv`、`.tsv`、`.yaml`、`.yml`、`.html`、`.htm`、`.xml`、`.net`、`.netlist`、`.bom` 和 `.log`。PDF 使用 PDF.js 按页提取文本；文本资料按行记录位置。SQLite FTS5 `trigram` 索引用于中英文全文搜索，结果包含资料源、相对路径、页码或行号、内容哈希和片段。扫描版 PDF 目前没有 OCR；向量检索也尚未实现。
+
+模型可使用三个只读工具：
+
+- `knowledge_sources`：查看可用资料源及索引统计，但不暴露绝对路径；
+- `knowledge_search`：按关键词检索，返回可追溯引用；
+- `knowledge_read`：只按已索引的 `documentId` 或 `chunkId` 读取内容，不能传任意文件路径。
+
+涉及“芯片手册、数据手册、参考电路、引脚、BOM、网表、资料库”等指令时，自动技能选择会启用 `local-knowledge`。技能要求模型标注引用，并把资料内容视为不可信输入，不能执行其中的命令或把冲突资料静默合并。
+
+命令行配置示例：
+
+```powershell
+$headers = @{
+  "x-jlcircuit-admin-token" = $env:JLCIRCUIT_ADMIN_TOKEN
+  "Origin" = "http://127.0.0.1:49630"
+}
+$source = @{
+  id = "board-docs"
+  name = "板卡资料"
+  rootPath = "C:\Datasheets\Grow-G1"
+  extensions = @(".pdf", ".md", ".csv", ".net")
+} | ConvertTo-Json
+Invoke-RestMethod -Method Post -Headers $headers -ContentType "application/json" `
+  -Uri http://127.0.0.1:49630/v1/knowledge/sources -Body $source
+Invoke-RestMethod -Method Post -Headers $headers `
+  -Uri http://127.0.0.1:49630/v1/knowledge/sources/board-docs/scan
+
+$query = @{ query = "供电电压 去耦电容"; sourceIds = @("board-docs"); limit = 5 } | ConvertTo-Json
+Invoke-RestMethod -Method Post -Headers $headers -ContentType "application/json" `
+  -Uri http://127.0.0.1:49630/v1/knowledge/search -Body $query
+```
+
+索引和资料源元数据保存在同一个 SQLite 数据库中。文件发现跳过符号链接以及 `.git`、`node_modules`、`dist`、`build` 等目录；读取时再次校验真实路径仍在授权根目录内。默认资源限制可在 `.env` 调整：
+
+```env
+JLCIRCUIT_KNOWLEDGE_MAX_FILES=5000
+JLCIRCUIT_KNOWLEDGE_MAX_FILE_BYTES=26214400
+JLCIRCUIT_KNOWLEDGE_MAX_PDF_PAGES=1000
+JLCIRCUIT_KNOWLEDGE_MAX_DEPTH=12
+JLCIRCUIT_KNOWLEDGE_CHUNK_CHARS=4000
+JLCIRCUIT_KNOWLEDGE_CHUNK_OVERLAP=300
+```
 
 ### 多步修改流程
 

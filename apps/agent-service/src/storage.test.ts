@@ -95,7 +95,7 @@ test("older messages are rolled into the persisted session summary", () => {
   }
 });
 
-test("version 1 task databases are upgraded with skill and MCP persistence", () => {
+test("version 1 task databases are upgraded with skill, MCP and knowledge persistence", () => {
   const tempDirectory = mkdtempSync(join(tmpdir(), "jlcircuit-agent-migration-"));
   const databasePath = join(tempDirectory, "state.sqlite");
   try {
@@ -113,8 +113,14 @@ test("version 1 task databases are upgraded with skill and MCP persistence", () 
     const upgraded = new AgentStore(databasePath);
     const inspector = new DatabaseSync(databasePath);
     const columns = inspector.prepare("PRAGMA table_info(tasks)").all();
+    const schemaVersion = Number((inspector.prepare("PRAGMA user_version").get() as { user_version: number }).user_version);
+    const knowledgeTable = inspector.prepare(`
+      SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'knowledge_sources'
+    `).get();
     inspector.close();
     assert.equal(columns.some((column) => column.name === "skills_json"), true);
+    assert.equal(schemaVersion, 4);
+    assert.ok(knowledgeTable);
     upgraded.setSkillEnabled("eda-core", true);
     assert.equal(upgraded.listSkillStates().get("eda-core"), true);
     upgraded.setMcpServerEnabled("fixture", true);

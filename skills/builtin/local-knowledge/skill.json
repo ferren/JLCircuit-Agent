@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "local-knowledge",
+  "name": "本地资料检索",
+  "version": "1.0.0",
+  "description": "检索已授权的芯片手册、PDF、BOM、网表和参考电路，并给出可追溯引用。",
+  "entry": "SKILL.md",
+  "enabledByDefault": true,
+  "riskLevel": "read",
+  "priority": 850,
+  "activation": {
+    "always": false,
+    "keywords": ["datasheet", "data sheet", "芯片手册", "数据手册", "参考电路", "reference circuit", "pdf", "引脚", "pinout", "bom", "网表", "资料库", "知识库"],
+    "modes": ["chat", "plan"]
+  },
+  "tools": {
+    "allowed": ["knowledge_sources", "knowledge_search", "knowledge_read"],
+    "required": ["knowledge_search"]
+  }
+}

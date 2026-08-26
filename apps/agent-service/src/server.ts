@@ -11,6 +11,11 @@ import {
 import type { ChangeOperation, ChangeSet } from "../../../packages/contracts/src/index.ts";
 import { JLCIRCUIT_TOOLS, getTool } from "../../../packages/mcp/src/index.ts";
 import { ContextEngine } from "./context-engine.ts";
+import {
+  KNOWLEDGE_TOOL_DEFINITIONS,
+  KnowledgeService,
+  KnowledgeServiceError,
+} from "./knowledge-service.ts";
 import { runAgentTurn } from "./llm.ts";
 import { McpRegistry, McpRegistryError } from "./mcp-registry.ts";
 import { SkillRegistry, SkillRegistryError } from "./skill-registry.ts";
@@ -23,13 +28,18 @@ import {
 const host = process.env.JLCIRCUIT_AGENT_HOST ?? "127.0.0.1";
 const port = Number(process.env.JLCIRCUIT_AGENT_PORT ?? 49630);
 const bridgeTimeoutMs = Number(process.env.JLCIRCUIT_BRIDGE_TIMEOUT_MS ?? 15_000);
-const mcpAdminToken = process.env.JLCIRCUIT_MCP_ADMIN_TOKEN?.trim() || undefined;
-const mcpAdminAllowedOrigins = new Set(
-  (process.env.JLCIRCUIT_MCP_ADMIN_ALLOWED_ORIGINS ?? "")
+const localAdminToken = process.env.JLCIRCUIT_ADMIN_TOKEN?.trim()
+  || process.env.JLCIRCUIT_MCP_ADMIN_TOKEN?.trim()
+  || undefined;
+const localAdminAllowedOrigins = new Set([
+  `http://127.0.0.1:${port}`,
+  `http://localhost:${port}`,
+  `http://[::1]:${port}`,
+  ...`${process.env.JLCIRCUIT_ADMIN_ALLOWED_ORIGINS ?? ""},${process.env.JLCIRCUIT_MCP_ADMIN_ALLOWED_ORIGINS ?? ""}`
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean),
-);
+]);
 
 const log = (message: string, details?: unknown): void => {
   const suffix = details === undefined ? "" : ` ${JSON.stringify(details)}`;
@@ -38,7 +48,9 @@ const log = (message: string, details?: unknown): void => {
 
 const store = new AgentStore();
 const contextEngine = new ContextEngine(store, log);
-const skillRegistry = new SkillRegistry(store, JLCIRCUIT_TOOLS);
+const knowledgeService = new KnowledgeService(store, log);
+const builtinToolDefinitions = [...JLCIRCUIT_TOOLS, ...KNOWLEDGE_TOOL_DEFINITIONS];
+const skillRegistry = new SkillRegistry(store, builtinToolDefinitions);
 const mcpRegistry = new McpRegistry(store, log);
 
 class LocalBridgeGateway {
@@ -180,18 +192,18 @@ const tokenMatches = (provided: string | undefined, expected: string): boolean =
   return providedBytes.length === expectedBytes.length && timingSafeEqual(providedBytes, expectedBytes);
 };
 
-const requireMcpAdmin = (request: IncomingMessage): void => {
+const requireLocalAdmin = (request: IncomingMessage): void => {
   if (!isLoopbackHost(host) || !isLoopbackAddress(request.socket.remoteAddress)) {
-    throw new HttpRequestError(403, "MCP management is only available through the local loopback Agent service.");
+    throw new HttpRequestError(403, "Local management is only available through the loopback Agent service.");
   }
   const origin = typeof request.headers.origin === "string" ? request.headers.origin : undefined;
-  if (origin && !mcpAdminAllowedOrigins.has(origin)) {
-    throw new HttpRequestError(403, `MCP management origin is not allowed: ${origin}`);
+  if (origin && !localAdminAllowedOrigins.has(origin)) {
+    throw new HttpRequestError(403, `Local management origin is not allowed: ${origin}`);
   }
   const provided = request.headers["x-jlcircuit-admin-token"];
   const token = Array.isArray(provided) ? provided[0] : provided;
-  if (mcpAdminToken && !tokenMatches(token, mcpAdminToken)) {
-    throw new HttpRequestError(403, "MCP management token is missing or invalid.");
+  if (localAdminToken && !tokenMatches(token, localAdminToken)) {
+    throw new HttpRequestError(403, "Local management token is missing or invalid.");
   }
 };
 
@@ -202,6 +214,9 @@ const callTool = async (
 ): Promise<ToolResponse> => {
   log("[agent] tool call", { tool: toolName, sessionId });
   store.ensureSession(sessionId);
+  if (KNOWLEDGE_TOOL_DEFINITIONS.some((definition) => definition.name === toolName)) {
+    return knowledgeService.callTool(toolName, sessionId, payload);
+  }
   const mcpTool = mcpRegistry.getTool(toolName);
   if (mcpTool) {
     if (mcpTool.riskLevel !== "read") {
@@ -282,7 +297,7 @@ const runModelTurn = async (
   });
   const skillRefs = resolvedSkills.skills.map(({ id, name, version, reason }) => ({ id, name, version, reason }));
   const userMessage = contextEngine.beginTurn(sessionId, userInstruction, mode, { skills: skillRefs });
-  const allToolDefinitions = [...JLCIRCUIT_TOOLS, ...mcpRegistry.listToolDefinitions()];
+  const allToolDefinitions = [...builtinToolDefinitions, ...mcpRegistry.listToolDefinitions()];
   const toolDefinitions = skillRegistry
     .filterToolDefinitions(resolvedSkills.skills, allToolDefinitions)
     .filter((tool) => !tool.name.startsWith("mcp__") || tool.riskLevel === "read");
@@ -465,12 +480,12 @@ const server = createServer(async (request, response) => {
 
     if (request.method === "OPTIONS") {
       const origin = typeof request.headers.origin === "string" ? request.headers.origin : undefined;
-      const isMcpManagement = url.pathname.startsWith("/v1/mcp/");
-      if (isMcpManagement && origin && !mcpAdminAllowedOrigins.has(origin)) {
-        throw new HttpRequestError(403, `MCP management origin is not allowed: ${origin}`);
+      const isLocalManagement = url.pathname.startsWith("/v1/mcp/") || url.pathname.startsWith("/v1/knowledge/");
+      if (isLocalManagement && origin && !localAdminAllowedOrigins.has(origin)) {
+        throw new HttpRequestError(403, `Local management origin is not allowed: ${origin}`);
       }
       response.writeHead(204, {
-        "access-control-allow-origin": isMcpManagement && origin ? origin : "*",
+        "access-control-allow-origin": isLocalManagement && origin ? origin : "*",
         "access-control-allow-methods": "GET,POST,OPTIONS",
         "access-control-allow-headers": "content-type,x-jlcircuit-admin-token",
       });
@@ -490,6 +505,10 @@ const server = createServer(async (request, response) => {
           configured: mcpRegistry.list().length,
           connected: mcpRegistry.list().filter((server) => server.status === "connected").length,
         },
+        knowledge: {
+          sources: knowledgeService.listSources().length,
+          documents: knowledgeService.listSources().reduce((total, source) => total + source.documentCount, 0),
+        },
         timestamp: new Date().toISOString(),
       });
       return;
@@ -497,7 +516,7 @@ const server = createServer(async (request, response) => {
 
     if (request.method === "GET" && url.pathname === "/v1/tools") {
       json(response, 200, {
-        tools: [...JLCIRCUIT_TOOLS, ...mcpRegistry.listToolDefinitions()],
+        tools: [...builtinToolDefinitions, ...mcpRegistry.listToolDefinitions()],
         bridgeConnected: bridge.connected,
       });
       return;
@@ -510,14 +529,14 @@ const server = createServer(async (request, response) => {
         diagnostics: mcpRegistry.getDiagnostics(),
         management: {
           localOnly: true,
-          tokenRequired: Boolean(mcpAdminToken),
+          tokenRequired: Boolean(localAdminToken),
         },
       });
       return;
     }
 
     if (request.method === "GET" && url.pathname === "/v1/mcp/config") {
-      requireMcpAdmin(request);
+      requireLocalAdmin(request);
       json(response, 200, {
         configPath: mcpRegistry.path,
         configs: mcpRegistry.listConfigs(),
@@ -528,20 +547,20 @@ const server = createServer(async (request, response) => {
     }
 
     if (request.method === "POST" && url.pathname === "/v1/mcp/reload") {
-      requireMcpAdmin(request);
+      requireLocalAdmin(request);
       json(response, 200, await mcpRegistry.reload());
       return;
     }
 
     if (request.method === "POST" && url.pathname === "/v1/mcp/servers") {
-      requireMcpAdmin(request);
+      requireLocalAdmin(request);
       json(response, 201, await mcpRegistry.createServer(await readBody(request)));
       return;
     }
 
     const mcpConfigActionMatch = /^\/v1\/mcp\/servers\/([^/]+)\/(update|delete)$/.exec(url.pathname);
     if (request.method === "POST" && mcpConfigActionMatch) {
-      requireMcpAdmin(request);
+      requireLocalAdmin(request);
       const serverId = decodeURIComponent(mcpConfigActionMatch[1] as string);
       const result = mcpConfigActionMatch[2] === "update"
         ? await mcpRegistry.updateServer(serverId, await readBody(request))
@@ -552,7 +571,7 @@ const server = createServer(async (request, response) => {
 
     const mcpActionMatch = /^\/v1\/mcp\/servers\/([^/]+)\/(enable|disable|connect|disconnect|test)$/.exec(url.pathname);
     if (request.method === "POST" && mcpActionMatch) {
-      requireMcpAdmin(request);
+      requireLocalAdmin(request);
       const serverId = decodeURIComponent(mcpActionMatch[1] as string);
       const action = mcpActionMatch[2];
       const server = action === "enable"
@@ -570,7 +589,7 @@ const server = createServer(async (request, response) => {
 
     const mcpCapabilitiesMatch = /^\/v1\/mcp\/servers\/([^/]+)\/capabilities$/.exec(url.pathname);
     if (request.method === "GET" && mcpCapabilitiesMatch) {
-      requireMcpAdmin(request);
+      requireLocalAdmin(request);
       const serverId = decodeURIComponent(mcpCapabilitiesMatch[1] as string);
       json(response, 200, mcpRegistry.getCapabilities(serverId));
       return;
@@ -610,6 +629,61 @@ const server = createServer(async (request, response) => {
         json(response, 200, await mcpRegistry.getPrompt(serverId, body.name, body.arguments));
         return;
       }
+    }
+
+    if (request.method === "GET" && url.pathname === "/v1/knowledge/sources") {
+      requireLocalAdmin(request);
+      json(response, 200, {
+        sources: knowledgeService.listSources(),
+        management: { localOnly: true, tokenRequired: Boolean(localAdminToken) },
+      });
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/knowledge/sources") {
+      requireLocalAdmin(request);
+      json(response, 201, { source: knowledgeService.createSource(await readBody(request)) });
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/knowledge/reindex") {
+      requireLocalAdmin(request);
+      json(response, 200, { results: await knowledgeService.scanAll() });
+      return;
+    }
+
+    const knowledgeSourceActionMatch = /^\/v1\/knowledge\/sources\/([^/]+)\/(update|delete|scan)$/.exec(url.pathname);
+    if (request.method === "POST" && knowledgeSourceActionMatch) {
+      requireLocalAdmin(request);
+      const sourceIdValue = decodeURIComponent(knowledgeSourceActionMatch[1] as string);
+      const action = knowledgeSourceActionMatch[2];
+      const result = action === "update"
+        ? { source: knowledgeService.updateSource(sourceIdValue, await readBody(request)) }
+        : action === "delete"
+          ? knowledgeService.deleteSource(sourceIdValue)
+          : await knowledgeService.scanSource(sourceIdValue);
+      json(response, 200, result);
+      return;
+    }
+
+    const knowledgeDocumentsMatch = /^\/v1\/knowledge\/sources\/([^/]+)\/documents$/.exec(url.pathname);
+    if (request.method === "GET" && knowledgeDocumentsMatch) {
+      requireLocalAdmin(request);
+      const sourceIdValue = decodeURIComponent(knowledgeDocumentsMatch[1] as string);
+      json(response, 200, { sourceId: sourceIdValue, documents: knowledgeService.listDocuments(sourceIdValue) });
+      return;
+    }
+
+    if (request.method === "POST" && (url.pathname === "/v1/knowledge/search" || url.pathname === "/v1/knowledge/read")) {
+      requireLocalAdmin(request);
+      const body = await readBody(request);
+      const result = await knowledgeService.callTool(
+        url.pathname.endsWith("/search") ? "knowledge_search" : "knowledge_read",
+        "knowledge-manager-ui",
+        isRecord(body) ? body : {},
+      );
+      json(response, result.ok ? 200 : 400, result);
+      return;
     }
 
     if (request.method === "GET" && url.pathname === "/v1/skills") {
@@ -862,6 +936,17 @@ const server = createServer(async (request, response) => {
       });
       return;
     }
+    if (error instanceof KnowledgeServiceError) {
+      json(response, error.code.endsWith("NOT_FOUND")
+        ? 404
+        : error.code === "KNOWLEDGE_SOURCE_EXISTS"
+          ? 409
+          : 400, {
+        error: error.code.toLowerCase(),
+        message: error.message,
+      });
+      return;
+    }
     json(response, 400, errorResponse(error));
   }
 });
@@ -881,7 +966,7 @@ server.listen(port, host, () => {
   console.log(`EDA bridge waiting on ws://${host}:${port}/bridge`);
   console.log(`Session database: ${store.path}`);
   console.log(`MCP config: ${mcpRegistry.path}`);
-  console.log(`MCP management: loopback only, admin token ${mcpAdminToken ? "required" : "not configured"}`);
+  console.log(`Local management: loopback only, admin token ${localAdminToken ? "required" : "not configured"}`);
   void mcpRegistry.start().catch((error) => log("[mcp] startup failed", {
     error: error instanceof Error ? error.message : String(error),
   }));

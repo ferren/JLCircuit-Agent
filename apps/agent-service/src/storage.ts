@@ -83,6 +83,55 @@ export type AuditEvent = {
   createdAt: string;
 };
 
+export type KnowledgeSourceRecord = {
+  id: string;
+  name: string;
+  rootPath: string;
+  enabled: boolean;
+  extensions: string[];
+  createdAt: string;
+  updatedAt: string;
+  lastIndexedAt?: string;
+  documentCount: number;
+  chunkCount: number;
+  errorCount: number;
+};
+
+export type KnowledgeDocumentRecord = {
+  id: string;
+  sourceId: string;
+  relativePath: string;
+  absolutePath: string;
+  fileType: string;
+  title: string;
+  sizeBytes: number;
+  mtimeMs: number;
+  sha256: string;
+  pageCount?: number;
+  status: "indexed" | "error";
+  error?: string;
+  indexedAt: string;
+};
+
+export type KnowledgeChunkRecord = {
+  id: string;
+  documentId: string;
+  sourceId: string;
+  ordinal: number;
+  content: string;
+  locator: Record<string, unknown>;
+  contentHash: string;
+};
+
+export type KnowledgeSearchRow = KnowledgeChunkRecord & {
+  sourceName: string;
+  relativePath: string;
+  fileType: string;
+  title: string;
+  documentSha256: string;
+  score: number;
+};
+
 type SqlRow = Record<string, string | number | bigint | null>;
 
 const jsonStringify = (value: unknown): string => {
@@ -150,6 +199,46 @@ const rowToTask = (row: SqlRow): PersistedTask => ({
   skills: jsonParse<PersistedSkillRef[]>(row.skills_json, []),
   createdAt: String(row.created_at),
   updatedAt: String(row.updated_at),
+});
+
+const rowToKnowledgeSource = (row: SqlRow): KnowledgeSourceRecord => ({
+  id: String(row.id),
+  name: String(row.name),
+  rootPath: String(row.root_path),
+  enabled: Number(row.enabled) === 1,
+  extensions: jsonParse<string[]>(row.extensions_json, []),
+  createdAt: String(row.created_at),
+  updatedAt: String(row.updated_at),
+  lastIndexedAt: optionalString(row.last_indexed_at),
+  documentCount: Number(row.document_count ?? 0),
+  chunkCount: Number(row.chunk_count ?? 0),
+  errorCount: Number(row.error_count ?? 0),
+});
+
+const rowToKnowledgeDocument = (row: SqlRow): KnowledgeDocumentRecord => ({
+  id: String(row.id),
+  sourceId: String(row.source_id),
+  relativePath: String(row.relative_path),
+  absolutePath: String(row.absolute_path),
+  fileType: String(row.file_type),
+  title: String(row.title),
+  sizeBytes: Number(row.size_bytes),
+  mtimeMs: Number(row.mtime_ms),
+  sha256: String(row.sha256),
+  pageCount: row.page_count === null ? undefined : Number(row.page_count),
+  status: row.status === "error" ? "error" : "indexed",
+  error: optionalString(row.error),
+  indexedAt: String(row.indexed_at),
+});
+
+const rowToKnowledgeChunk = (row: SqlRow): KnowledgeChunkRecord => ({
+  id: String(row.id),
+  documentId: String(row.document_id),
+  sourceId: String(row.source_id),
+  ordinal: Number(row.ordinal),
+  content: String(row.content),
+  locator: jsonParse<Record<string, unknown>>(row.locator_json, {}),
+  contentHash: String(row.content_hash),
 });
 
 export const defaultDatabasePath = (): string =>
@@ -254,7 +343,58 @@ export class AgentStore {
         updated_at TEXT NOT NULL
       );
 
-      PRAGMA user_version = 3;
+      CREATE TABLE IF NOT EXISTS knowledge_sources (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        root_path TEXT NOT NULL UNIQUE,
+        enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+        extensions_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        last_indexed_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS knowledge_documents (
+        id TEXT PRIMARY KEY,
+        source_id TEXT NOT NULL REFERENCES knowledge_sources(id) ON DELETE CASCADE,
+        relative_path TEXT NOT NULL,
+        absolute_path TEXT NOT NULL,
+        file_type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL,
+        mtime_ms REAL NOT NULL,
+        sha256 TEXT NOT NULL,
+        page_count INTEGER,
+        status TEXT NOT NULL CHECK (status IN ('indexed', 'error')),
+        error TEXT,
+        indexed_at TEXT NOT NULL,
+        UNIQUE(source_id, relative_path)
+      );
+      CREATE INDEX IF NOT EXISTS idx_knowledge_documents_source
+        ON knowledge_documents(source_id, relative_path);
+
+      CREATE TABLE IF NOT EXISTS knowledge_chunks (
+        id TEXT PRIMARY KEY,
+        document_id TEXT NOT NULL REFERENCES knowledge_documents(id) ON DELETE CASCADE,
+        source_id TEXT NOT NULL REFERENCES knowledge_sources(id) ON DELETE CASCADE,
+        ordinal INTEGER NOT NULL,
+        content TEXT NOT NULL,
+        locator_json TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        UNIQUE(document_id, ordinal)
+      );
+      CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_document
+        ON knowledge_chunks(document_id, ordinal);
+
+      CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_chunks_fts USING fts5(
+        chunk_id UNINDEXED,
+        source_id UNINDEXED,
+        document_id UNINDEXED,
+        content,
+        tokenize='trigram'
+      );
+
+      PRAGMA user_version = 4;
     `);
     const taskColumns = this.database.prepare("PRAGMA table_info(tasks)").all() as SqlRow[];
     if (!taskColumns.some((column) => column.name === "skills_json")) {
@@ -474,6 +614,218 @@ export class AgentStore {
 
   public deleteMcpServerState(serverId: string): void {
     this.database.prepare("DELETE FROM mcp_server_states WHERE server_id = ?").run(serverId);
+  }
+
+  public listKnowledgeSources(): KnowledgeSourceRecord[] {
+    const rows = this.database.prepare(`
+      SELECT sources.*,
+        COUNT(DISTINCT documents.id) AS document_count,
+        COUNT(DISTINCT chunks.id) AS chunk_count,
+        COUNT(DISTINCT CASE WHEN documents.status = 'error' THEN documents.id END) AS error_count
+      FROM knowledge_sources sources
+      LEFT JOIN knowledge_documents documents ON documents.source_id = sources.id
+      LEFT JOIN knowledge_chunks chunks ON chunks.document_id = documents.id
+      GROUP BY sources.id
+      ORDER BY sources.name, sources.id
+    `).all() as SqlRow[];
+    return rows.map(rowToKnowledgeSource);
+  }
+
+  public getKnowledgeSource(sourceId: string): KnowledgeSourceRecord | undefined {
+    return this.listKnowledgeSources().find((source) => source.id === sourceId);
+  }
+
+  public upsertKnowledgeSource(input: {
+    id: string;
+    name: string;
+    rootPath: string;
+    enabled: boolean;
+    extensions: string[];
+  }): KnowledgeSourceRecord {
+    const now = new Date().toISOString();
+    this.database.prepare(`
+      INSERT INTO knowledge_sources (id, name, root_path, enabled, extensions_json, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        name = excluded.name,
+        root_path = excluded.root_path,
+        enabled = excluded.enabled,
+        extensions_json = excluded.extensions_json,
+        updated_at = excluded.updated_at
+    `).run(input.id, input.name, input.rootPath, input.enabled ? 1 : 0, jsonStringify(input.extensions), now, now);
+    return this.getKnowledgeSource(input.id) as KnowledgeSourceRecord;
+  }
+
+  public setKnowledgeSourceIndexed(sourceId: string, indexedAt: string): void {
+    this.database.prepare(`
+      UPDATE knowledge_sources SET last_indexed_at = ?, updated_at = ? WHERE id = ?
+    `).run(indexedAt, indexedAt, sourceId);
+  }
+
+  public deleteKnowledgeSource(sourceId: string): void {
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      this.database.prepare("DELETE FROM knowledge_chunks_fts WHERE source_id = ?").run(sourceId);
+      this.database.prepare("DELETE FROM knowledge_sources WHERE id = ?").run(sourceId);
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  public listKnowledgeDocuments(sourceId?: string): KnowledgeDocumentRecord[] {
+    const rows = sourceId
+      ? this.database.prepare(`
+          SELECT * FROM knowledge_documents WHERE source_id = ? ORDER BY relative_path
+        `).all(sourceId) as SqlRow[]
+      : this.database.prepare("SELECT * FROM knowledge_documents ORDER BY source_id, relative_path").all() as SqlRow[];
+    return rows.map(rowToKnowledgeDocument);
+  }
+
+  public getKnowledgeDocument(documentId: string): KnowledgeDocumentRecord | undefined {
+    const row = this.database.prepare("SELECT * FROM knowledge_documents WHERE id = ?").get(documentId) as SqlRow | undefined;
+    return row ? rowToKnowledgeDocument(row) : undefined;
+  }
+
+  public replaceKnowledgeDocument(
+    document: KnowledgeDocumentRecord,
+    chunks: KnowledgeChunkRecord[],
+  ): void {
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      this.database.prepare(`
+        INSERT INTO knowledge_documents (
+          id, source_id, relative_path, absolute_path, file_type, title, size_bytes, mtime_ms,
+          sha256, page_count, status, error, indexed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          source_id = excluded.source_id,
+          relative_path = excluded.relative_path,
+          absolute_path = excluded.absolute_path,
+          file_type = excluded.file_type,
+          title = excluded.title,
+          size_bytes = excluded.size_bytes,
+          mtime_ms = excluded.mtime_ms,
+          sha256 = excluded.sha256,
+          page_count = excluded.page_count,
+          status = excluded.status,
+          error = excluded.error,
+          indexed_at = excluded.indexed_at
+      `).run(
+        document.id,
+        document.sourceId,
+        document.relativePath,
+        document.absolutePath,
+        document.fileType,
+        document.title,
+        document.sizeBytes,
+        document.mtimeMs,
+        document.sha256,
+        document.pageCount ?? null,
+        document.status,
+        document.error ?? null,
+        document.indexedAt,
+      );
+      this.database.prepare("DELETE FROM knowledge_chunks_fts WHERE document_id = ?").run(document.id);
+      this.database.prepare("DELETE FROM knowledge_chunks WHERE document_id = ?").run(document.id);
+      const insertChunk = this.database.prepare(`
+        INSERT INTO knowledge_chunks (id, document_id, source_id, ordinal, content, locator_json, content_hash)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `);
+      const insertFts = this.database.prepare(`
+        INSERT INTO knowledge_chunks_fts (chunk_id, source_id, document_id, content) VALUES (?, ?, ?, ?)
+      `);
+      for (const chunk of chunks) {
+        insertChunk.run(
+          chunk.id,
+          chunk.documentId,
+          chunk.sourceId,
+          chunk.ordinal,
+          chunk.content,
+          jsonStringify(chunk.locator),
+          chunk.contentHash,
+        );
+        insertFts.run(chunk.id, chunk.sourceId, chunk.documentId, chunk.content);
+      }
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  public deleteKnowledgeDocument(documentId: string): void {
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      this.database.prepare("DELETE FROM knowledge_chunks_fts WHERE document_id = ?").run(documentId);
+      this.database.prepare("DELETE FROM knowledge_documents WHERE id = ?").run(documentId);
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  public listKnowledgeChunks(documentId: string, limit = 200): KnowledgeChunkRecord[] {
+    const safeLimit = Math.max(1, Math.min(limit, 1_000));
+    const rows = this.database.prepare(`
+      SELECT * FROM knowledge_chunks WHERE document_id = ? ORDER BY ordinal LIMIT ?
+    `).all(documentId, safeLimit) as SqlRow[];
+    return rows.map(rowToKnowledgeChunk);
+  }
+
+  public getKnowledgeChunk(chunkId: string): KnowledgeChunkRecord | undefined {
+    const row = this.database.prepare("SELECT * FROM knowledge_chunks WHERE id = ?").get(chunkId) as SqlRow | undefined;
+    return row ? rowToKnowledgeChunk(row) : undefined;
+  }
+
+  public searchKnowledge(query: string, sourceIds: string[], limit: number): KnowledgeSearchRow[] {
+    const safeLimit = Math.max(1, Math.min(limit, 50));
+    const sourceFilter = sourceIds.length > 0
+      ? ` AND chunks.source_id IN (${sourceIds.map(() => "?").join(",")})`
+      : "";
+    const trimmed = query.trim();
+    let rows: SqlRow[];
+    if (trimmed.length < 3) {
+      rows = this.database.prepare(`
+        SELECT chunks.*, sources.name AS source_name, documents.relative_path, documents.file_type,
+          documents.title, documents.sha256 AS document_sha256, 0 AS score
+        FROM knowledge_chunks chunks
+        JOIN knowledge_documents documents ON documents.id = chunks.document_id
+        JOIN knowledge_sources sources ON sources.id = chunks.source_id
+        WHERE chunks.content LIKE ?${sourceFilter} AND sources.enabled = 1
+        ORDER BY documents.relative_path, chunks.ordinal
+        LIMIT ?
+      `).all(`%${trimmed}%`, ...sourceIds, safeLimit) as SqlRow[];
+    } else {
+      const expression = trimmed
+        .split(/\s+/)
+        .filter(Boolean)
+        .map((token) => `"${token.replaceAll('"', '""')}"`)
+        .join(" AND ");
+      rows = this.database.prepare(`
+        SELECT chunks.*, sources.name AS source_name, documents.relative_path, documents.file_type,
+          documents.title, documents.sha256 AS document_sha256,
+          bm25(knowledge_chunks_fts) AS score
+        FROM knowledge_chunks_fts
+        JOIN knowledge_chunks chunks ON chunks.id = knowledge_chunks_fts.chunk_id
+        JOIN knowledge_documents documents ON documents.id = chunks.document_id
+        JOIN knowledge_sources sources ON sources.id = chunks.source_id
+        WHERE knowledge_chunks_fts MATCH ?${sourceFilter} AND sources.enabled = 1
+        ORDER BY score, documents.relative_path, chunks.ordinal
+        LIMIT ?
+      `).all(expression, ...sourceIds, safeLimit) as SqlRow[];
+    }
+    return rows.map((row) => ({
+      ...rowToKnowledgeChunk(row),
+      sourceName: String(row.source_name),
+      relativePath: String(row.relative_path),
+      fileType: String(row.file_type),
+      title: String(row.title),
+      documentSha256: String(row.document_sha256),
+      score: Number(row.score ?? 0),
+    }));
   }
 
   public upsertContextSnapshot(input: {
