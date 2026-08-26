@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -34,6 +34,9 @@ test("MCP Registry connects to stdio, discovers capabilities and invokes allowli
     requestTimeoutMs: 5_000,
   });
   try {
+    const connectionTest = await registry.testConnection("fixture");
+    assert.equal(connectionTest.ok, true);
+    assert.equal(connectionTest.toolCount, 1);
     const connected = await registry.connect("fixture");
     assert.equal(connected.status, "connected");
     assert.equal(connected.toolCount, 1);
@@ -73,6 +76,65 @@ test("MCP Registry connects to stdio, discovers capabilities and invokes allowli
   await reopened.close();
   reopenedStore.close();
   rmSync(temporary, { recursive: true, force: true });
+});
+
+test("MCP Registry creates, updates and deletes a validated config atomically", async () => {
+  const temporary = mkdtempSync(join(tmpdir(), "jlcircuit-mcp-config-"));
+  const configPath = join(temporary, "nested", "mcp.json");
+  const store = new AgentStore(":memory:");
+  const registry = new McpRegistry(store, () => undefined, { configPath, autoConnect: false });
+  try {
+    const created = await registry.createServer({
+      id: "managed-fixture",
+      name: "Managed Fixture",
+      enabledByDefault: false,
+      transport: {
+        type: "stdio",
+        command: process.execPath,
+        args: [fixturePath],
+        env: ["MCP_TEST_TOKEN"],
+      },
+      allowedTools: ["echo"],
+      defaultRiskLevel: "high",
+      toolRiskLevels: { echo: "read" },
+      allowResources: true,
+      allowPrompts: true,
+    });
+    assert.equal(created.server.status, "disabled");
+    assert.equal(registry.listConfigs()[0]?.transport.type, "stdio");
+    assert.match(readFileSync(configPath, "utf8"), /MCP_TEST_TOKEN/);
+    assert.doesNotMatch(readFileSync(configPath, "utf8"), /secret-value/);
+
+    await assert.rejects(
+      registry.createServer({
+        id: "managed-fixture",
+        transport: { type: "http", url: "https://example.com/mcp" },
+      }),
+      (error: unknown) => error instanceof McpRegistryError && error.code === "MCP_SERVER_EXISTS",
+    );
+
+    const updated = await registry.updateServer("managed-fixture", {
+      ...created.config,
+      name: "Updated Fixture",
+      allowedTools: ["*"],
+    });
+    assert.equal(updated.config.name, "Updated Fixture");
+    assert.deepEqual(updated.config.allowedTools, ["*"]);
+
+    await registry.setEnabled("managed-fixture", true);
+    assert.equal(store.listMcpServerStates().get("managed-fixture"), true);
+    assert.deepEqual(await registry.deleteServer("managed-fixture"), {
+      deleted: true,
+      serverId: "managed-fixture",
+    });
+    assert.equal(registry.list().length, 0);
+    assert.equal(store.listMcpServerStates().has("managed-fixture"), false);
+    assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")).servers, []);
+  } finally {
+    await registry.close();
+    store.close();
+    rmSync(temporary, { recursive: true, force: true });
+  }
 });
 
 test("MCP Registry rejects non-loopback insecure HTTP and defaults external tools to high risk", async () => {

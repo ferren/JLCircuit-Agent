@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import {
   Client,
@@ -71,6 +71,31 @@ export type McpToolRecord = {
   definition: EdaToolDefinition;
 };
 
+export type McpConnectionTestResult = {
+  serverId: string;
+  ok: true;
+  serverInfo?: { name: string; version: string };
+  protocolEra?: string;
+  toolCount: number;
+  resourceCount: number;
+  promptCount: number;
+  testedAt: string;
+};
+
+export type McpServerCapabilities = {
+  serverId: string;
+  connected: boolean;
+  tools: Array<{
+    name: string;
+    description?: string;
+    allowed: boolean;
+    riskLevel: RiskLevel;
+    publicName: string;
+  }>;
+  resources: Resource[];
+  prompts: Prompt[];
+};
+
 type McpRuntime = {
   config: McpServerConfig;
   status: McpServerStatus;
@@ -101,10 +126,11 @@ export class McpRegistryError extends Error {
     | "MCP_SERVER_DISABLED"
     | "MCP_SERVER_NOT_CONNECTED"
     | "MCP_CONNECTION_FAILED"
-    | "MCP_TOOL_NOT_FOUND"
-    | "MCP_RESOURCE_FORBIDDEN"
-    | "MCP_PROMPT_FORBIDDEN"
-    | "MCP_CONFIG_INVALID";
+      | "MCP_TOOL_NOT_FOUND"
+      | "MCP_RESOURCE_FORBIDDEN"
+      | "MCP_PROMPT_FORBIDDEN"
+      | "MCP_SERVER_EXISTS"
+      | "MCP_CONFIG_INVALID";
 
   public constructor(code: McpRegistryError["code"], message: string) {
     super(message);
@@ -235,6 +261,15 @@ const transportView = (config: McpServerConfig): McpServerView["transport"] =>
     ? { type: "stdio", command: config.transport.command }
     : { type: "http", url: config.transport.url };
 
+const cloneServerConfig = (config: McpServerConfig): McpServerConfig => ({
+  ...config,
+  transport: config.transport.type === "stdio"
+    ? { ...config.transport, args: [...config.transport.args], env: [...config.transport.env] }
+    : { ...config.transport },
+  allowedTools: [...config.allowedTools],
+  toolRiskLevels: { ...config.toolRiskLevels },
+});
+
 const normalizeToolSchema = (schema: unknown): Record<string, unknown> =>
   isRecord(schema) ? schema : { type: "object", additionalProperties: true };
 
@@ -363,6 +398,49 @@ export class McpRegistry {
     return { configs, diagnostics };
   }
 
+  private readWritableConfigs(): McpServerConfig[] {
+    const loaded = this.readConfig();
+    if (loaded.diagnostics.length > 0) {
+      throw new McpRegistryError(
+        "MCP_CONFIG_INVALID",
+        `MCP config contains invalid server entries: ${loaded.diagnostics.map((item) => item.message).join("; ")}`,
+      );
+    }
+    return loaded.configs;
+  }
+
+  private writeConfig(configs: McpServerConfig[]): void {
+    if (configs.length > this.maxServers) {
+      throw new McpRegistryError("MCP_CONFIG_INVALID", `MCP config exceeds ${this.maxServers} servers.`);
+    }
+    const ids = new Set<string>();
+    const normalized = configs.map((config) => {
+      const parsed = parseServerConfig(config, dirname(this.configPath));
+      if (ids.has(parsed.id)) {
+        throw new McpRegistryError("MCP_CONFIG_INVALID", `Duplicate MCP server id: ${parsed.id}`);
+      }
+      ids.add(parsed.id);
+      return parsed;
+    });
+    const directory = dirname(this.configPath);
+    mkdirSync(directory, { recursive: true });
+    const temporaryPath = `${this.configPath}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(
+        temporaryPath,
+        `${JSON.stringify({ schemaVersion: 1, servers: normalized }, null, 2)}\n`,
+        { encoding: "utf8", mode: 0o600 },
+      );
+      renameSync(temporaryPath, this.configPath);
+    } catch (error) {
+      if (existsSync(temporaryPath)) unlinkSync(temporaryPath);
+      throw new McpRegistryError(
+        "MCP_CONFIG_INVALID",
+        `Cannot save MCP config: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
   private loadInitialConfig(): void {
     try {
       const loaded = this.readConfig();
@@ -436,6 +514,71 @@ export class McpRegistry {
     return this.diagnostics.map((item) => ({ ...item }));
   }
 
+  public listConfigs(): McpServerConfig[] {
+    return [...this.runtimes.values()]
+      .map((runtime) => cloneServerConfig(runtime.config))
+      .sort((left, right) => left.id.localeCompare(right.id));
+  }
+
+  public async createServer(input: unknown): Promise<{ server: McpServerView; config: McpServerConfig }> {
+    let config: McpServerConfig;
+    try {
+      config = parseServerConfig(input, dirname(this.configPath));
+    } catch (error) {
+      throw new McpRegistryError("MCP_CONFIG_INVALID", error instanceof Error ? error.message : String(error));
+    }
+    const configs = this.readWritableConfigs();
+    if (configs.some((item) => item.id === config.id)) {
+      throw new McpRegistryError("MCP_SERVER_EXISTS", `MCP server already exists: ${config.id}`);
+    }
+    this.writeConfig([...configs, config]);
+    this.store.deleteMcpServerState(config.id);
+    this.store.appendAuditEvent({
+      eventType: "mcp.server_created",
+      payload: { serverId: config.id, transport: config.transport.type },
+    });
+    await this.reload();
+    return { server: this.view(config.id), config: cloneServerConfig(config) };
+  }
+
+  public async updateServer(
+    serverId: string,
+    input: unknown,
+  ): Promise<{ server: McpServerView; config: McpServerConfig }> {
+    let config: McpServerConfig;
+    try {
+      config = parseServerConfig(input, dirname(this.configPath));
+    } catch (error) {
+      throw new McpRegistryError("MCP_CONFIG_INVALID", error instanceof Error ? error.message : String(error));
+    }
+    if (config.id !== serverId) {
+      throw new McpRegistryError("MCP_CONFIG_INVALID", "MCP server id cannot be changed after creation.");
+    }
+    const configs = this.readWritableConfigs();
+    const index = configs.findIndex((item) => item.id === serverId);
+    if (index < 0) throw new McpRegistryError("MCP_SERVER_NOT_FOUND", `MCP server not found: ${serverId}`);
+    configs[index] = config;
+    this.writeConfig(configs);
+    this.store.appendAuditEvent({
+      eventType: "mcp.server_updated",
+      payload: { serverId, transport: config.transport.type },
+    });
+    await this.reload();
+    return { server: this.view(serverId), config: cloneServerConfig(config) };
+  }
+
+  public async deleteServer(serverId: string): Promise<{ deleted: true; serverId: string }> {
+    const configs = this.readWritableConfigs();
+    if (!configs.some((item) => item.id === serverId)) {
+      throw new McpRegistryError("MCP_SERVER_NOT_FOUND", `MCP server not found: ${serverId}`);
+    }
+    this.writeConfig(configs.filter((item) => item.id !== serverId));
+    this.store.deleteMcpServerState(serverId);
+    this.store.appendAuditEvent({ eventType: "mcp.server_deleted", payload: { serverId } });
+    await this.reload();
+    return { deleted: true, serverId };
+  }
+
   public async setEnabled(serverId: string, enabled: boolean): Promise<McpServerView> {
     const runtime = this.getRuntime(serverId);
     this.store.setMcpServerEnabled(serverId, enabled);
@@ -469,55 +612,17 @@ export class McpRegistry {
     runtime.status = "connecting";
     runtime.error = undefined;
     this.log("[mcp] connection started", { serverId, transport: runtime.config.transport.type });
-    const client = new Client(
-      { name: "jlcircuit-agent", version: "0.1.0" },
-      { versionNegotiation: { mode: "auto", probe: { timeoutMs: Math.min(this.requestTimeoutMs, 5_000) } } },
-    );
-    let transport: Transport;
-    if (runtime.config.transport.type === "stdio") {
-      const inherited = getDefaultEnvironment();
-      const requested = Object.fromEntries(runtime.config.transport.env.flatMap((name) => {
-        const value = process.env[name];
-        return value === undefined ? [] : [[name, value]];
-      }));
-      transport = new StdioClientTransport({
-        command: runtime.config.transport.command,
-        args: runtime.config.transport.args,
-        cwd: runtime.config.transport.cwd,
-        env: { ...inherited, ...requested },
-        stderr: "ignore",
-      });
-    } else {
-      const tokenEnv = runtime.config.transport.bearerTokenEnv;
-      transport = new StreamableHTTPClientTransport(new URL(runtime.config.transport.url), {
-        authProvider: tokenEnv ? {
-          token: async () => {
-            const token = process.env[tokenEnv];
-            if (!token) throw new Error(`MCP bearer token environment variable is not set: ${tokenEnv}`);
-            return token;
-          },
-        } : undefined,
-        onInsufficientScope: "throw",
-      });
-    }
+    const { client, transport } = this.createClient(runtime.config);
     try {
       await client.connect(transport, { timeout: this.requestTimeoutMs });
-      const [toolResult, resourceResult, promptResult] = await Promise.all([
-        client.listTools(undefined, { timeout: this.requestTimeoutMs }),
-        client.listResources(undefined, { timeout: this.requestTimeoutMs }),
-        client.listPrompts(undefined, { timeout: this.requestTimeoutMs }),
-      ]);
-      if (toolResult.tools.length > this.maxToolsPerServer) {
-        throw new Error(`MCP server ${serverId} exposes more than ${this.maxToolsPerServer} tools.`);
-      }
+      const discovered = await this.discoverCapabilities(client, serverId);
       runtime.client = client;
       runtime.transport = transport;
-      runtime.tools = toolResult.tools;
-      runtime.resources = resourceResult.resources;
-      runtime.prompts = promptResult.prompts;
-      const serverInfo = client.getServerVersion();
-      runtime.serverInfo = serverInfo ? { name: serverInfo.name, version: serverInfo.version } : undefined;
-      runtime.protocolEra = client.getProtocolEra();
+      runtime.tools = discovered.tools;
+      runtime.resources = discovered.resources;
+      runtime.prompts = discovered.prompts;
+      runtime.serverInfo = discovered.serverInfo;
+      runtime.protocolEra = discovered.protocolEra;
       runtime.connectedAt = new Date().toISOString();
       runtime.status = "connected";
       this.rebuildTools();
@@ -547,6 +652,112 @@ export class McpRegistry {
       this.log("[mcp] connection failed", { serverId, error: runtime.error });
       throw new McpRegistryError("MCP_CONNECTION_FAILED", `MCP connection failed for ${serverId}: ${runtime.error}`);
     }
+  }
+
+  private createClient(config: McpServerConfig): { client: Client; transport: Transport } {
+    const client = new Client(
+      { name: "jlcircuit-agent", version: "0.1.0" },
+      { versionNegotiation: { mode: "auto", probe: { timeoutMs: Math.min(this.requestTimeoutMs, 5_000) } } },
+    );
+    let transport: Transport;
+    if (config.transport.type === "stdio") {
+      const inherited = getDefaultEnvironment();
+      const requested = Object.fromEntries(config.transport.env.flatMap((name) => {
+        const value = process.env[name];
+        return value === undefined ? [] : [[name, value]];
+      }));
+      transport = new StdioClientTransport({
+        command: config.transport.command,
+        args: config.transport.args,
+        cwd: config.transport.cwd,
+        env: { ...inherited, ...requested },
+        stderr: "ignore",
+      });
+    } else {
+      const tokenEnv = config.transport.bearerTokenEnv;
+      transport = new StreamableHTTPClientTransport(new URL(config.transport.url), {
+        authProvider: tokenEnv ? {
+          token: async () => {
+            const token = process.env[tokenEnv];
+            if (!token) throw new Error(`MCP bearer token environment variable is not set: ${tokenEnv}`);
+            return token;
+          },
+        } : undefined,
+        onInsufficientScope: "throw",
+      });
+    }
+    return { client, transport };
+  }
+
+  private async discoverCapabilities(client: Client, serverId: string): Promise<{
+    tools: Tool[];
+    resources: Resource[];
+    prompts: Prompt[];
+    serverInfo?: { name: string; version: string };
+    protocolEra?: string;
+  }> {
+    const [toolResult, resourceResult, promptResult] = await Promise.all([
+      client.listTools(undefined, { timeout: this.requestTimeoutMs }),
+      client.listResources(undefined, { timeout: this.requestTimeoutMs }),
+      client.listPrompts(undefined, { timeout: this.requestTimeoutMs }),
+    ]);
+    if (toolResult.tools.length > this.maxToolsPerServer) {
+      throw new Error(`MCP server ${serverId} exposes more than ${this.maxToolsPerServer} tools.`);
+    }
+    const serverInfo = client.getServerVersion();
+    return {
+      tools: toolResult.tools,
+      resources: resourceResult.resources,
+      prompts: promptResult.prompts,
+      serverInfo: serverInfo ? { name: serverInfo.name, version: serverInfo.version } : undefined,
+      protocolEra: client.getProtocolEra(),
+    };
+  }
+
+  public async testConnection(serverId: string): Promise<McpConnectionTestResult> {
+    const runtime = this.getRuntime(serverId);
+    const { client, transport } = this.createClient(runtime.config);
+    try {
+      await client.connect(transport, { timeout: this.requestTimeoutMs });
+      const discovered = await this.discoverCapabilities(client, serverId);
+      const result: McpConnectionTestResult = {
+        serverId,
+        ok: true,
+        serverInfo: discovered.serverInfo,
+        protocolEra: discovered.protocolEra,
+        toolCount: discovered.tools.length,
+        resourceCount: discovered.resources.length,
+        promptCount: discovered.prompts.length,
+        testedAt: new Date().toISOString(),
+      };
+      this.store.appendAuditEvent({ eventType: "mcp.server_tested", payload: result });
+      return result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.store.appendAuditEvent({ eventType: "mcp.server_test_failed", payload: { serverId, error: message } });
+      throw new McpRegistryError("MCP_CONNECTION_FAILED", `MCP connection test failed for ${serverId}: ${message}`);
+    } finally {
+      const managedTransport = transport as Transport & { terminateSession?: () => Promise<void> };
+      if (managedTransport.terminateSession) await managedTransport.terminateSession().catch(() => undefined);
+      await client.close().catch(() => undefined);
+    }
+  }
+
+  public getCapabilities(serverId: string): McpServerCapabilities {
+    const runtime = this.getRuntime(serverId);
+    return {
+      serverId,
+      connected: runtime.status === "connected",
+      tools: runtime.tools.map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        allowed: toolAllowedByServer(runtime.config, tool.name),
+        riskLevel: runtime.config.toolRiskLevels[tool.name] ?? runtime.config.defaultRiskLevel,
+        publicName: publicToolName(serverId, tool.name),
+      })),
+      resources: runtime.resources.map((resource) => ({ ...resource })),
+      prompts: runtime.prompts.map((prompt) => ({ ...prompt })),
+    };
   }
 
   public async disconnect(serverId: string): Promise<McpServerView> {

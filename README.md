@@ -61,11 +61,17 @@ POST /v1/skills/reload
 POST /v1/skills/:skillId/enable
 POST /v1/skills/:skillId/disable
 GET  /v1/mcp/servers
+GET  /v1/mcp/config
 POST /v1/mcp/reload
+POST /v1/mcp/servers
+POST /v1/mcp/servers/:serverId/update
+POST /v1/mcp/servers/:serverId/delete
 POST /v1/mcp/servers/:serverId/enable
 POST /v1/mcp/servers/:serverId/disable
 POST /v1/mcp/servers/:serverId/connect
 POST /v1/mcp/servers/:serverId/disconnect
+POST /v1/mcp/servers/:serverId/test
+GET  /v1/mcp/servers/:serverId/capabilities
 GET  /v1/mcp/servers/:serverId/resources
 POST /v1/mcp/servers/:serverId/resources/read
 GET  /v1/mcp/servers/:serverId/prompts
@@ -230,8 +236,10 @@ Copy-Item config/mcp-servers.example.json .jlcircuit-data/mcp-servers.json
 配置中的服务器默认关闭。修改命令、URL 和 allowlist 后，可通过 API 启用并连接：
 
 ```powershell
-Invoke-RestMethod -Method Post http://127.0.0.1:49630/v1/mcp/reload
-Invoke-RestMethod -Method Post http://127.0.0.1:49630/v1/mcp/servers/local-example/enable
+$headers = @{}
+if ($env:JLCIRCUIT_MCP_ADMIN_TOKEN) { $headers["x-jlcircuit-admin-token"] = $env:JLCIRCUIT_MCP_ADMIN_TOKEN }
+Invoke-RestMethod -Method Post -Headers $headers http://127.0.0.1:49630/v1/mcp/reload
+Invoke-RestMethod -Method Post -Headers $headers http://127.0.0.1:49630/v1/mcp/servers/local-example/enable
 Invoke-RestMethod http://127.0.0.1:49630/v1/mcp/servers
 ```
 
@@ -246,7 +254,25 @@ MCP 工具会转换成 `mcp__<server>__<tool>` 命名空间，并通过 `mcp-ass
 - Resources 和 Prompts 分别需要 `allowResources`、`allowPrompts`，读取范围限制为已发现条目；
 - 调用有超时、结果大小限制和 SQLite 审计。
 
-EDA 面板顶部显示 MCP 已连接数量，“插件状态”按钮可查看每个 Server 的状态及能力计数。当前没有插件商店、OAuth 交互授权、自动安装、失败重连或外部写操作执行器。
+EDA 面板顶部显示 MCP 已连接数量，“MCP 管理”可以直接新增、编辑、删除配置，启用或禁用 Server，连接、断开、测试连接，并查看已发现的 Tools、Resources 和 Prompts。配置保存使用临时文件加原子替换；Server ID 创建后不能修改，密钥值不会进入配置文件。
+
+MCP 管理接口只在 Agent Service 绑定回环地址且请求来自本机时开放。建议在 `.env` 中配置管理令牌；EDA 管理窗口会要求输入该令牌，并只在当前 EDA 会话的 `sessionStorage` 中保存：
+
+```env
+JLCIRCUIT_MCP_ADMIN_TOKEN=请替换为足够长的随机值
+# 只有管理请求确实携带 Origin 时才需要配置，多个 Origin 用逗号分隔
+JLCIRCUIT_MCP_ADMIN_ALLOWED_ORIGINS=
+```
+
+带管理令牌的命令行调用示例：
+
+```powershell
+$headers = @{ "x-jlcircuit-admin-token" = $env:JLCIRCUIT_MCP_ADMIN_TOKEN }
+Invoke-RestMethod -Headers $headers http://127.0.0.1:49630/v1/mcp/config
+Invoke-RestMethod -Method Post -Headers $headers http://127.0.0.1:49630/v1/mcp/reload
+```
+
+当前仍没有插件商店、OAuth 交互授权、自动安装、失败自动重连或外部写操作执行器。
 
 ### 多步修改流程
 

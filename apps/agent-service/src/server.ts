@@ -1,5 +1,6 @@
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { timingSafeEqual } from "node:crypto";
 import WebSocket, { WebSocketServer } from "ws";
 import {
   createToolRequest,
@@ -22,6 +23,13 @@ import {
 const host = process.env.JLCIRCUIT_AGENT_HOST ?? "127.0.0.1";
 const port = Number(process.env.JLCIRCUIT_AGENT_PORT ?? 49630);
 const bridgeTimeoutMs = Number(process.env.JLCIRCUIT_BRIDGE_TIMEOUT_MS ?? 15_000);
+const mcpAdminToken = process.env.JLCIRCUIT_MCP_ADMIN_TOKEN?.trim() || undefined;
+const mcpAdminAllowedOrigins = new Set(
+  (process.env.JLCIRCUIT_MCP_ADMIN_ALLOWED_ORIGINS ?? "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean),
+);
 
 const log = (message: string, details?: unknown): void => {
   const suffix = details === undefined ? "" : ` ${JSON.stringify(details)}`;
@@ -145,6 +153,47 @@ const errorResponse = (error: unknown) => ({
   error: "bridge_error",
   message: error instanceof Error ? error.message : "Unknown bridge error",
 });
+
+class HttpRequestError extends Error {
+  public readonly statusCode: number;
+
+  public constructor(statusCode: number, message: string) {
+    super(message);
+    this.name = "HttpRequestError";
+    this.statusCode = statusCode;
+  }
+}
+
+const isLoopbackHost = (value: string): boolean =>
+  ["127.0.0.1", "localhost", "::1", "[::1]"].includes(value.trim().toLowerCase());
+
+const isLoopbackAddress = (value: string | undefined): boolean => {
+  if (!value) return false;
+  const normalized = value.toLowerCase();
+  return normalized === "127.0.0.1" || normalized === "::1" || normalized === "::ffff:127.0.0.1";
+};
+
+const tokenMatches = (provided: string | undefined, expected: string): boolean => {
+  if (!provided) return false;
+  const providedBytes = Buffer.from(provided);
+  const expectedBytes = Buffer.from(expected);
+  return providedBytes.length === expectedBytes.length && timingSafeEqual(providedBytes, expectedBytes);
+};
+
+const requireMcpAdmin = (request: IncomingMessage): void => {
+  if (!isLoopbackHost(host) || !isLoopbackAddress(request.socket.remoteAddress)) {
+    throw new HttpRequestError(403, "MCP management is only available through the local loopback Agent service.");
+  }
+  const origin = typeof request.headers.origin === "string" ? request.headers.origin : undefined;
+  if (origin && !mcpAdminAllowedOrigins.has(origin)) {
+    throw new HttpRequestError(403, `MCP management origin is not allowed: ${origin}`);
+  }
+  const provided = request.headers["x-jlcircuit-admin-token"];
+  const token = Array.isArray(provided) ? provided[0] : provided;
+  if (mcpAdminToken && !tokenMatches(token, mcpAdminToken)) {
+    throw new HttpRequestError(403, "MCP management token is missing or invalid.");
+  }
+};
 
 const callTool = async (
   toolName: string,
@@ -415,10 +464,15 @@ const server = createServer(async (request, response) => {
     const url = new URL(request.url ?? "/", `http://${request.headers.host ?? `${host}:${port}`}`);
 
     if (request.method === "OPTIONS") {
+      const origin = typeof request.headers.origin === "string" ? request.headers.origin : undefined;
+      const isMcpManagement = url.pathname.startsWith("/v1/mcp/");
+      if (isMcpManagement && origin && !mcpAdminAllowedOrigins.has(origin)) {
+        throw new HttpRequestError(403, `MCP management origin is not allowed: ${origin}`);
+      }
       response.writeHead(204, {
-        "access-control-allow-origin": "*",
+        "access-control-allow-origin": isMcpManagement && origin ? origin : "*",
         "access-control-allow-methods": "GET,POST,OPTIONS",
-        "access-control-allow-headers": "content-type",
+        "access-control-allow-headers": "content-type,x-jlcircuit-admin-token",
       });
       response.end();
       return;
@@ -454,17 +508,51 @@ const server = createServer(async (request, response) => {
         configPath: mcpRegistry.path,
         servers: mcpRegistry.list(),
         diagnostics: mcpRegistry.getDiagnostics(),
+        management: {
+          localOnly: true,
+          tokenRequired: Boolean(mcpAdminToken),
+        },
+      });
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/v1/mcp/config") {
+      requireMcpAdmin(request);
+      json(response, 200, {
+        configPath: mcpRegistry.path,
+        configs: mcpRegistry.listConfigs(),
+        servers: mcpRegistry.list(),
+        diagnostics: mcpRegistry.getDiagnostics(),
       });
       return;
     }
 
     if (request.method === "POST" && url.pathname === "/v1/mcp/reload") {
+      requireMcpAdmin(request);
       json(response, 200, await mcpRegistry.reload());
       return;
     }
 
-    const mcpActionMatch = /^\/v1\/mcp\/servers\/([^/]+)\/(enable|disable|connect|disconnect)$/.exec(url.pathname);
+    if (request.method === "POST" && url.pathname === "/v1/mcp/servers") {
+      requireMcpAdmin(request);
+      json(response, 201, await mcpRegistry.createServer(await readBody(request)));
+      return;
+    }
+
+    const mcpConfigActionMatch = /^\/v1\/mcp\/servers\/([^/]+)\/(update|delete)$/.exec(url.pathname);
+    if (request.method === "POST" && mcpConfigActionMatch) {
+      requireMcpAdmin(request);
+      const serverId = decodeURIComponent(mcpConfigActionMatch[1] as string);
+      const result = mcpConfigActionMatch[2] === "update"
+        ? await mcpRegistry.updateServer(serverId, await readBody(request))
+        : await mcpRegistry.deleteServer(serverId);
+      json(response, 200, result);
+      return;
+    }
+
+    const mcpActionMatch = /^\/v1\/mcp\/servers\/([^/]+)\/(enable|disable|connect|disconnect|test)$/.exec(url.pathname);
     if (request.method === "POST" && mcpActionMatch) {
+      requireMcpAdmin(request);
       const serverId = decodeURIComponent(mcpActionMatch[1] as string);
       const action = mcpActionMatch[2];
       const server = action === "enable"
@@ -473,8 +561,18 @@ const server = createServer(async (request, response) => {
           ? await mcpRegistry.setEnabled(serverId, false)
           : action === "connect"
             ? await mcpRegistry.connect(serverId)
-            : await mcpRegistry.disconnect(serverId);
-      json(response, 200, { server });
+            : action === "disconnect"
+              ? await mcpRegistry.disconnect(serverId)
+              : undefined;
+      json(response, 200, action === "test" ? await mcpRegistry.testConnection(serverId) : { server });
+      return;
+    }
+
+    const mcpCapabilitiesMatch = /^\/v1\/mcp\/servers\/([^/]+)\/capabilities$/.exec(url.pathname);
+    if (request.method === "GET" && mcpCapabilitiesMatch) {
+      requireMcpAdmin(request);
+      const serverId = decodeURIComponent(mcpCapabilitiesMatch[1] as string);
+      json(response, 200, mcpRegistry.getCapabilities(serverId));
       return;
     }
 
@@ -740,6 +838,10 @@ const server = createServer(async (request, response) => {
 
     json(response, 404, { error: "not_found" });
   } catch (error) {
+    if (error instanceof HttpRequestError) {
+      json(response, error.statusCode, { error: "request_forbidden", message: error.message });
+      return;
+    }
     if (error instanceof SkillRegistryError) {
       json(response, error.code === "SKILL_NOT_FOUND" ? 404 : 400, {
         error: error.code.toLowerCase(),
@@ -748,7 +850,13 @@ const server = createServer(async (request, response) => {
       return;
     }
     if (error instanceof McpRegistryError) {
-      json(response, error.code.endsWith("NOT_FOUND") ? 404 : error.code === "MCP_CONNECTION_FAILED" ? 502 : 400, {
+      json(response, error.code.endsWith("NOT_FOUND")
+        ? 404
+        : error.code === "MCP_SERVER_EXISTS"
+          ? 409
+          : error.code === "MCP_CONNECTION_FAILED"
+            ? 502
+            : 400, {
         error: error.code.toLowerCase(),
         message: error.message,
       });
@@ -773,6 +881,7 @@ server.listen(port, host, () => {
   console.log(`EDA bridge waiting on ws://${host}:${port}/bridge`);
   console.log(`Session database: ${store.path}`);
   console.log(`MCP config: ${mcpRegistry.path}`);
+  console.log(`MCP management: loopback only, admin token ${mcpAdminToken ? "required" : "not configured"}`);
   void mcpRegistry.start().catch((error) => log("[mcp] startup failed", {
     error: error instanceof Error ? error.message : String(error),
   }));

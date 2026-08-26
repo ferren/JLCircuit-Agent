@@ -23,7 +23,7 @@
       }
       * { box-sizing: border-box; }
       body { margin: 0; min-height: 100vh; color: var(--ink); background: var(--canvas); }
-      button, textarea { font: inherit; }
+      button, input, textarea, select { font: inherit; }
       button { border: 0; border-radius: 8px; cursor: pointer; }
       button:disabled { cursor: wait; opacity: .55; }
       .app { display: flex; flex-direction: column; height: 100vh; min-height: 480px; }
@@ -70,6 +70,44 @@
       .actions { display: flex; flex-wrap: wrap; gap: 7px; justify-content: flex-end; }
       .actions button { padding: 7px 10px; font-size: 12px; }
       .small { color: var(--muted); background: transparent; }
+      [hidden] { display: none !important; }
+      .modal { position: fixed; inset: 0; z-index: 20; display: flex; align-items: center; justify-content: center; padding: 18px; background: rgb(15 23 42 / 44%); }
+      .mcp-dialog { display: flex; flex-direction: column; width: min(920px, 100%); max-height: calc(100vh - 36px); overflow: hidden; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); box-shadow: 0 18px 60px rgb(15 23 42 / 24%); }
+      .mcp-dialog-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--line); }
+      .mcp-dialog-head h2 { margin: 0; font-size: 16px; }
+      .mcp-dialog-head p { margin: 4px 0 0; color: var(--muted); font-size: 11px; word-break: break-all; }
+      .mcp-body { overflow: auto; padding: 14px 16px 18px; }
+      .mcp-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 12px; }
+      .mcp-toolbar .spacer { flex: 1; }
+      .mcp-token { display: flex; align-items: center; gap: 6px; width: min(420px, 100%); }
+      .mcp-token input { min-width: 120px; flex: 1; }
+      .notice { margin-bottom: 12px; padding: 9px 10px; border-radius: 8px; color: var(--muted); background: #f5f7fb; white-space: pre-wrap; font-size: 11px; line-height: 1.45; }
+      .notice.error { color: var(--red); background: var(--red-soft); }
+      .notice.success { color: var(--green); background: var(--green-soft); }
+      .mcp-list { display: grid; gap: 10px; }
+      .mcp-empty { padding: 24px; border: 1px dashed #bdc9da; border-radius: 10px; color: var(--muted); text-align: center; font-size: 12px; }
+      .mcp-card { padding: 12px; border: 1px solid var(--line); border-radius: 11px; background: #fbfcfe; }
+      .mcp-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+      .mcp-card-title { font-size: 13px; font-weight: 650; }
+      .mcp-card-subtitle { margin-top: 3px; color: var(--muted); font-size: 11px; word-break: break-all; }
+      .mcp-card-meta { display: flex; flex-wrap: wrap; gap: 6px 12px; margin-top: 9px; color: var(--muted); font-size: 11px; }
+      .mcp-card-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 11px; }
+      .mcp-card-actions button { padding: 6px 9px; font-size: 11px; }
+      .status-pill { padding: 3px 7px; border-radius: 999px; color: var(--muted); background: #e7edf7; font-size: 10px; white-space: nowrap; }
+      .status-pill.connected { color: var(--green); background: var(--green-soft); }
+      .status-pill.error { color: var(--red); background: var(--red-soft); }
+      .capabilities { margin-top: 10px; padding: 9px; overflow: auto; border-radius: 8px; color: var(--muted); background: #f1f4f9; white-space: pre-wrap; font: 11px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; }
+      .mcp-editor { margin-bottom: 14px; padding: 12px; border: 1px solid #b9c9ee; border-radius: 11px; background: #f8faff; }
+      .mcp-editor h3 { margin: 0 0 10px; font-size: 14px; }
+      .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+      .form-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; color: var(--muted); font-size: 11px; }
+      .form-field.full { grid-column: 1 / -1; }
+      .form-field input, .form-field textarea, .form-field select { width: 100%; padding: 7px 8px; border: 1px solid #c7d2e2; border-radius: 7px; outline: none; color: var(--ink); background: white; font-size: 12px; }
+      .form-field textarea { min-height: 58px; resize: vertical; }
+      .check-row { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 10px; color: var(--ink); font-size: 11px; }
+      .check-row label { display: flex; align-items: center; gap: 5px; }
+      .mcp-editor-actions { display: flex; gap: 8px; margin-top: 12px; }
+      @media (max-width: 640px) { .form-grid { grid-template-columns: 1fr; } .form-field.full { grid-column: auto; } }
     </style>
   </head>
   <body>
@@ -96,7 +134,7 @@
           </div>
           <div class="actions">
             <button id="clear" class="small" type="button">清空对话</button>
-            <button id="plugins" class="small" type="button">插件状态</button>
+            <button id="plugins" class="small" type="button">MCP 管理</button>
             <button id="refresh" class="secondary" type="button">刷新摘要</button>
             <button id="analyze" class="primary" type="button">发送分析</button>
             <button id="plan" class="success" type="button">生成修改计划</button>
@@ -104,6 +142,64 @@
         </div>
       </footer>
     </main>
+    <div id="mcpManager" class="modal" hidden>
+      <section class="mcp-dialog" role="dialog" aria-modal="true" aria-labelledby="mcpManagerTitle">
+        <header class="mcp-dialog-head">
+          <div>
+            <h2 id="mcpManagerTitle">MCP 配置与管理</h2>
+            <p id="mcpConfigPath">正在读取配置路径…</p>
+          </div>
+          <button id="mcpClose" class="secondary" type="button">关闭</button>
+        </header>
+        <div class="mcp-body">
+          <div class="mcp-toolbar">
+            <button id="mcpAdd" class="primary" type="button">新增 Server</button>
+            <button id="mcpReload" class="secondary" type="button">重载配置</button>
+            <span class="spacer"></span>
+            <div id="mcpTokenRow" class="mcp-token" hidden>
+              <input id="mcpAdminToken" type="password" autocomplete="off" placeholder="管理令牌（仅保存在本次 EDA 会话）" />
+              <button id="mcpApplyToken" class="secondary" type="button">应用令牌</button>
+            </div>
+          </div>
+          <div id="mcpNotice" class="notice">正在读取 MCP 配置…</div>
+          <form id="mcpEditor" class="mcp-editor" hidden>
+            <h3 id="mcpEditorTitle">新增 MCP Server</h3>
+            <div class="form-grid">
+              <label class="form-field">Server ID<input id="mcpId" required placeholder="例如 component-library" /></label>
+              <label class="form-field">显示名称<input id="mcpName" placeholder="例如 元件资料服务" /></label>
+              <label class="form-field">传输方式<select id="mcpTransport"><option value="stdio">本地 stdio</option><option value="http">Streamable HTTP</option></select></label>
+              <label class="form-field">默认风险级别<select id="mcpDefaultRisk"><option value="high">high</option><option value="medium">medium</option><option value="low">low</option><option value="read">read</option></select></label>
+              <div id="mcpStdioFields" class="form-field full">
+                <div class="form-grid">
+                  <label class="form-field">启动命令<input id="mcpCommand" placeholder="node 或可执行文件绝对路径" /></label>
+                  <label class="form-field">工作目录（可选）<input id="mcpCwd" placeholder="C:\absolute\path" /></label>
+                  <label class="form-field full">命令参数（每行一个）<textarea id="mcpArgs" placeholder="C:\absolute\path\server.mjs"></textarea></label>
+                  <label class="form-field full">允许传入的环境变量名（逗号或换行分隔）<textarea id="mcpEnv" placeholder="EXAMPLE_API_KEY"></textarea></label>
+                </div>
+              </div>
+              <div id="mcpHttpFields" class="form-field full" hidden>
+                <div class="form-grid">
+                  <label class="form-field full">MCP URL<input id="mcpUrl" placeholder="https://mcp.example.com/mcp" /></label>
+                  <label class="form-field full">Bearer Token 环境变量名（可选）<input id="mcpBearerEnv" placeholder="REMOTE_MCP_TOKEN" /></label>
+                </div>
+              </div>
+              <label class="form-field full">允许工具（逗号或换行分隔，* 表示全部）<textarea id="mcpAllowedTools" placeholder="read_component_data"></textarea></label>
+              <label class="form-field full">工具风险覆盖（每行：工具名=read|low|medium|high）<textarea id="mcpToolRisks" placeholder="read_component_data=read"></textarea></label>
+            </div>
+            <div class="check-row">
+              <label><input id="mcpEnabledDefault" type="checkbox" /> 默认启用</label>
+              <label><input id="mcpAllowResources" type="checkbox" /> 允许 Resources</label>
+              <label><input id="mcpAllowPrompts" type="checkbox" /> 允许 Prompts</label>
+            </div>
+            <div class="mcp-editor-actions">
+              <button class="success" type="submit">保存配置</button>
+              <button id="mcpCancelEdit" class="secondary" type="button">取消</button>
+            </div>
+          </form>
+          <div id="mcpServerList" class="mcp-list"></div>
+        </div>
+      </section>
+    </div>
     <script>
       const API_ORIGIN = 'http://127.0.0.1:49630';
       const runtime = globalThis.eda;
@@ -115,6 +211,12 @@
       const sessionLabel = document.querySelector('#sessionLabel');
       const skillSelect = document.querySelector('#skill');
       const mcpStatus = document.querySelector('#mcpStatus');
+      const mcpManager = document.querySelector('#mcpManager');
+      const mcpServerList = document.querySelector('#mcpServerList');
+      const mcpNotice = document.querySelector('#mcpNotice');
+      const mcpEditor = document.querySelector('#mcpEditor');
+      const mcpTokenRow = document.querySelector('#mcpTokenRow');
+      const mcpAdminTokenInput = document.querySelector('#mcpAdminToken');
       let sessionId = (() => {
         try {
           const existing = globalThis.sessionStorage?.getItem('jlcircuit-agent-last-session');
@@ -126,6 +228,14 @@
       })();
       let busy = false;
       let mcpServers = [];
+      let mcpConfigs = [];
+      let editingMcpId = '';
+      let mcpAdminTokenRequired = false;
+      let mcpAdminToken = (() => {
+        try { return globalThis.sessionStorage?.getItem('jlcircuit-mcp-admin-token') || ''; } catch { return ''; }
+      })();
+      const mcpCapabilityCache = new Map();
+      mcpAdminTokenInput.value = mcpAdminToken;
       sessionLabel.textContent = sessionId;
 
       const selectedSkillIds = () => skillSelect.value ? [skillSelect.value] : undefined;
@@ -155,6 +265,9 @@
         try {
           const result = await request('/v1/mcp/servers', 'GET');
           mcpServers = result.servers || [];
+          mcpAdminTokenRequired = result.management?.tokenRequired === true;
+          mcpTokenRow.hidden = !mcpAdminTokenRequired;
+          document.querySelector('#mcpConfigPath').textContent = `配置文件：${result.configPath || '未知'}`;
           const connected = mcpServers.filter((server) => server.status === 'connected').length;
           const errors = mcpServers.filter((server) => server.status === 'error').length;
           mcpStatus.textContent = `MCP：${connected}/${mcpServers.length} 已连接${errors ? ` · ${errors} 异常` : ''}`;
@@ -171,6 +284,283 @@
         } catch (error) {
           mcpStatus.textContent = 'MCP：状态读取失败';
           if (showDetails) addMessage('assistant', `插件状态读取失败：${String(error)}`, '', 'error');
+        }
+      };
+
+      const setMcpNotice = (text, state = '') => {
+        mcpNotice.className = `notice ${state}`;
+        mcpNotice.textContent = text;
+      };
+
+      const createNode = (tag, className = '', text = '') => {
+        const node = document.createElement(tag);
+        if (className) node.className = className;
+        if (text) node.textContent = text;
+        return node;
+      };
+
+      const statusText = (status) => ({
+        disabled: '已禁用', disconnected: '未连接', connecting: '连接中', connected: '已连接', error: '异常',
+      }[status] || status || '未知');
+
+      const configTransportText = (config) => config.transport?.type === 'stdio'
+        ? `${config.transport.command || '-'} ${(config.transport.args || []).join(' ')}`.trim()
+        : config.transport?.url || '-';
+
+      const renderCapabilities = (capabilities) => {
+        if (!capabilities) return '';
+        const tools = (capabilities.tools || []).map((tool) =>
+          `${tool.allowed ? '✓' : '×'} ${tool.name} · ${tool.riskLevel}${tool.publicName ? ` · ${tool.publicName}` : ''}`);
+        const resources = (capabilities.resources || []).map((item) => item.name || item.uri);
+        const prompts = (capabilities.prompts || []).map((item) => item.name);
+        return [
+          `Tools (${tools.length})`, tools.join('\n') || '无', '',
+          `Resources (${resources.length})`, resources.join('\n') || '无', '',
+          `Prompts (${prompts.length})`, prompts.join('\n') || '无',
+        ].join('\n');
+      };
+
+      const managerButton = (label, className, handler) => {
+        const button = createNode('button', className, label);
+        button.type = 'button';
+        button.addEventListener('click', () => handler(button));
+        return button;
+      };
+
+      const renderMcpManager = () => {
+        mcpServerList.innerHTML = '';
+        if (!mcpConfigs.length) {
+          mcpServerList.appendChild(createNode('div', 'mcp-empty', '尚未配置 MCP Server。点击“新增 Server”开始配置。'));
+          return;
+        }
+        mcpConfigs.forEach((config) => {
+          const server = mcpServers.find((item) => item.id === config.id) || { id: config.id, status: 'disabled', enabled: false };
+          const card = createNode('article', 'mcp-card');
+          const head = createNode('div', 'mcp-card-head');
+          const titleWrap = createNode('div');
+          titleWrap.append(
+            createNode('div', 'mcp-card-title', `${config.name || config.id} (${config.id})`),
+            createNode('div', 'mcp-card-subtitle', `${config.transport?.type || '未知'} · ${configTransportText(config)}`),
+          );
+          const pill = createNode('span', `status-pill ${server.status === 'connected' ? 'connected' : server.status === 'error' ? 'error' : ''}`, statusText(server.status));
+          head.append(titleWrap, pill);
+          card.appendChild(head);
+
+          const meta = createNode('div', 'mcp-card-meta');
+          [
+            `运行：${server.enabled ? '启用' : '禁用'}`,
+            `工具：${server.toolCount ?? 0}`,
+            `资源：${server.resourceCount ?? 0}`,
+            `提示：${server.promptCount ?? 0}`,
+            `默认风险：${config.defaultRiskLevel}`,
+            `Resources：${config.allowResources ? '允许' : '关闭'}`,
+            `Prompts：${config.allowPrompts ? '允许' : '关闭'}`,
+          ].forEach((item) => meta.appendChild(createNode('span', '', item)));
+          card.appendChild(meta);
+          if (server.serverInfo) card.appendChild(createNode('div', 'mcp-card-subtitle', `Server：${server.serverInfo.name} ${server.serverInfo.version} · 协议：${server.protocolEra || '-'}`));
+          if (server.error) card.appendChild(createNode('div', 'notice error', server.error));
+
+          const actions = createNode('div', 'mcp-card-actions');
+          actions.appendChild(managerButton(server.enabled ? '禁用' : '启用', server.enabled ? 'danger' : 'success', (button) =>
+            runMcpAction(config.id, server.enabled ? 'disable' : 'enable', button)));
+          actions.appendChild(managerButton(server.status === 'connected' ? '断开' : '连接', 'secondary', (button) =>
+            runMcpAction(config.id, server.status === 'connected' ? 'disconnect' : 'connect', button)));
+          actions.lastChild.disabled = !server.enabled && server.status !== 'connected';
+          actions.appendChild(managerButton('测试连接', 'secondary', (button) => testMcpConnection(config.id, button)));
+          actions.appendChild(managerButton('查看能力', 'secondary', (button) => loadMcpCapabilities(config.id, button)));
+          actions.lastChild.disabled = server.status !== 'connected';
+          actions.appendChild(managerButton('编辑', 'secondary', () => openMcpEditor(config)));
+          actions.appendChild(managerButton('删除', 'danger', (button) => deleteMcpConfig(config, button)));
+          card.appendChild(actions);
+
+          const cached = mcpCapabilityCache.get(config.id);
+          if (cached) card.appendChild(createNode('pre', 'capabilities', renderCapabilities(cached)));
+          mcpServerList.appendChild(card);
+        });
+      };
+
+      const loadMcpManager = async () => {
+        if (mcpAdminTokenRequired && !mcpAdminToken) {
+          mcpConfigs = [];
+          renderMcpManager();
+          setMcpNotice('Agent 服务启用了 MCP 管理令牌。请输入 .env 中配置的 JLCIRCUIT_MCP_ADMIN_TOKEN。', 'error');
+          return;
+        }
+        setMcpNotice('正在读取 MCP 配置…');
+        try {
+          const result = await request('/v1/mcp/config', 'GET');
+          mcpConfigs = result.configs || [];
+          mcpServers = result.servers || [];
+          document.querySelector('#mcpConfigPath').textContent = `配置文件：${result.configPath || '未知'}`;
+          const diagnostics = (result.diagnostics || []).map((item) => item.message);
+          setMcpNotice(diagnostics.length ? `配置诊断：\n${diagnostics.join('\n')}` : `已加载 ${mcpConfigs.length} 个 MCP Server。`, diagnostics.length ? 'error' : 'success');
+          renderMcpManager();
+        } catch (error) {
+          setMcpNotice(`配置读取失败：${String(error)}`, 'error');
+        }
+      };
+
+      const openMcpManager = async () => {
+        mcpManager.hidden = false;
+        await loadMcpServers(false);
+        await loadMcpManager();
+      };
+
+      const runMcpAction = async (serverId, action, button) => {
+        button.disabled = true;
+        setMcpNotice(`正在执行 ${serverId} / ${action}…`);
+        try {
+          const path = action === 'reload'
+            ? '/v1/mcp/reload'
+            : `/v1/mcp/servers/${encodeURIComponent(serverId)}/${action}`;
+          await request(path, 'POST', {});
+          if (action === 'reload') mcpCapabilityCache.clear();
+          else mcpCapabilityCache.delete(serverId);
+          await loadMcpServers(false);
+          await loadMcpManager();
+          setMcpNotice(`${serverId} / ${action} 已完成。`, 'success');
+        } catch (error) {
+          setMcpNotice(`操作失败：${String(error)}`, 'error');
+          button.disabled = false;
+        }
+      };
+
+      const testMcpConnection = async (serverId, button) => {
+        button.disabled = true;
+        setMcpNotice(`正在测试 ${serverId}，不会改变启用状态…`);
+        try {
+          const result = await request(`/v1/mcp/servers/${encodeURIComponent(serverId)}/test`, 'POST', {});
+          setMcpNotice(`连接测试通过：工具 ${result.toolCount} · 资源 ${result.resourceCount} · 提示 ${result.promptCount} · 协议 ${result.protocolEra || '-'}`, 'success');
+        } catch (error) {
+          setMcpNotice(`连接测试失败：${String(error)}`, 'error');
+        } finally {
+          button.disabled = false;
+        }
+      };
+
+      const loadMcpCapabilities = async (serverId, button) => {
+        button.disabled = true;
+        try {
+          const result = await request(`/v1/mcp/servers/${encodeURIComponent(serverId)}/capabilities`, 'GET');
+          mcpCapabilityCache.set(serverId, result);
+          renderMcpManager();
+          setMcpNotice(`已读取 ${serverId} 的能力清单。`, 'success');
+        } catch (error) {
+          setMcpNotice(`能力读取失败：${String(error)}`, 'error');
+          button.disabled = false;
+        }
+      };
+
+      const splitList = (value) => [...new Set(String(value || '').split(/[\n,]/).map((item) => item.trim()).filter(Boolean))];
+
+      const riskMapFromText = (value) => {
+        const result = {};
+        splitList(value).forEach((line) => {
+          const match = /^([^=:]+)\s*[=:]\s*(read|low|medium|high)$/.exec(line);
+          if (!match) throw new Error(`无效的工具风险覆盖：${line}`);
+          result[match[1].trim()] = match[2];
+        });
+        return result;
+      };
+
+      const updateMcpTransportFields = () => {
+        const stdio = document.querySelector('#mcpTransport').value === 'stdio';
+        document.querySelector('#mcpStdioFields').hidden = !stdio;
+        document.querySelector('#mcpHttpFields').hidden = stdio;
+      };
+
+      const openMcpEditor = (config) => {
+        editingMcpId = config?.id || '';
+        mcpEditor.reset();
+        document.querySelector('#mcpEditorTitle').textContent = editingMcpId ? `编辑 ${editingMcpId}` : '新增 MCP Server';
+        document.querySelector('#mcpId').value = config?.id || '';
+        document.querySelector('#mcpId').disabled = Boolean(editingMcpId);
+        document.querySelector('#mcpName').value = config?.name || '';
+        document.querySelector('#mcpTransport').value = config?.transport?.type || 'stdio';
+        document.querySelector('#mcpDefaultRisk').value = config?.defaultRiskLevel || 'high';
+        document.querySelector('#mcpEnabledDefault').checked = config?.enabledByDefault === true;
+        document.querySelector('#mcpAllowResources').checked = config?.allowResources === true;
+        document.querySelector('#mcpAllowPrompts').checked = config?.allowPrompts === true;
+        document.querySelector('#mcpAllowedTools').value = (config?.allowedTools || []).join('\n');
+        document.querySelector('#mcpToolRisks').value = Object.entries(config?.toolRiskLevels || {}).map(([name, level]) => `${name}=${level}`).join('\n');
+        document.querySelector('#mcpCommand').value = config?.transport?.type === 'stdio' ? config.transport.command || '' : '';
+        document.querySelector('#mcpArgs').value = config?.transport?.type === 'stdio' ? (config.transport.args || []).join('\n') : '';
+        document.querySelector('#mcpCwd').value = config?.transport?.type === 'stdio' ? config.transport.cwd || '' : '';
+        document.querySelector('#mcpEnv').value = config?.transport?.type === 'stdio' ? (config.transport.env || []).join('\n') : '';
+        document.querySelector('#mcpUrl').value = config?.transport?.type === 'http' ? config.transport.url || '' : '';
+        document.querySelector('#mcpBearerEnv').value = config?.transport?.type === 'http' ? config.transport.bearerTokenEnv || '' : '';
+        updateMcpTransportFields();
+        mcpEditor.hidden = false;
+        mcpEditor.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      };
+
+      const closeMcpEditor = () => {
+        editingMcpId = '';
+        mcpEditor.hidden = true;
+      };
+
+      const saveMcpConfig = async (event) => {
+        event.preventDefault();
+        const id = editingMcpId || document.querySelector('#mcpId').value.trim();
+        const transportType = document.querySelector('#mcpTransport').value;
+        let config;
+        try {
+          config = {
+            id,
+            name: document.querySelector('#mcpName').value.trim() || id,
+            enabledByDefault: document.querySelector('#mcpEnabledDefault').checked,
+            transport: transportType === 'stdio' ? {
+              type: 'stdio',
+              command: document.querySelector('#mcpCommand').value.trim(),
+              args: String(document.querySelector('#mcpArgs').value || '').split('\n').map((item) => item.trim()).filter(Boolean),
+              cwd: document.querySelector('#mcpCwd').value.trim() || undefined,
+              env: splitList(document.querySelector('#mcpEnv').value),
+            } : {
+              type: 'http',
+              url: document.querySelector('#mcpUrl').value.trim(),
+              bearerTokenEnv: document.querySelector('#mcpBearerEnv').value.trim() || undefined,
+            },
+            allowedTools: splitList(document.querySelector('#mcpAllowedTools').value),
+            defaultRiskLevel: document.querySelector('#mcpDefaultRisk').value,
+            toolRiskLevels: riskMapFromText(document.querySelector('#mcpToolRisks').value),
+            allowResources: document.querySelector('#mcpAllowResources').checked,
+            allowPrompts: document.querySelector('#mcpAllowPrompts').checked,
+          };
+        } catch (error) {
+          setMcpNotice(String(error), 'error');
+          return;
+        }
+        const submit = mcpEditor.querySelector('button[type="submit"]');
+        submit.disabled = true;
+        try {
+          const path = editingMcpId
+            ? `/v1/mcp/servers/${encodeURIComponent(editingMcpId)}/update`
+            : '/v1/mcp/servers';
+          await request(path, 'POST', config);
+          mcpCapabilityCache.delete(id);
+          closeMcpEditor();
+          await loadMcpServers(false);
+          await loadMcpManager();
+          setMcpNotice(`${id} 配置已保存。`, 'success');
+        } catch (error) {
+          setMcpNotice(`保存失败：${String(error)}`, 'error');
+        } finally {
+          submit.disabled = false;
+        }
+      };
+
+      const deleteMcpConfig = async (config, button) => {
+        if (!globalThis.confirm(`确定删除 MCP Server “${config.name || config.id}” 吗？\n这会从配置文件中移除它并断开连接。`)) return;
+        button.disabled = true;
+        try {
+          await request(`/v1/mcp/servers/${encodeURIComponent(config.id)}/delete`, 'POST', {});
+          mcpCapabilityCache.delete(config.id);
+          await loadMcpServers(false);
+          await loadMcpManager();
+          setMcpNotice(`${config.id} 已删除。`, 'success');
+        } catch (error) {
+          setMcpNotice(`删除失败：${String(error)}`, 'error');
+          button.disabled = false;
         }
       };
 
@@ -220,11 +610,13 @@
       const request = async (path, method = 'POST', body) => {
         const clientUrl = runtime && runtime.sys_ClientUrl;
         if (!clientUrl || typeof clientUrl.request !== 'function') throw new Error('当前 EDA 没有提供 sys_ClientUrl.request。');
+        const headers = { 'content-type': 'application/json' };
+        if (mcpAdminToken) headers['x-jlcircuit-admin-token'] = mcpAdminToken;
         const response = await clientUrl.request(
           `${API_ORIGIN}${path}`,
           method,
           body === undefined ? undefined : JSON.stringify(body),
-          { headers: { 'content-type': 'application/json' } },
+          { headers },
         );
         const payload = await response.json();
         if (!response.ok) throw new Error(payload.message || payload.error || `Agent 服务返回 HTTP ${response.status}`);
@@ -484,7 +876,24 @@
       document.querySelector('#plan').addEventListener('click', createPlan);
       document.querySelector('#refresh').addEventListener('click', () => refresh(false));
       document.querySelector('#clear').addEventListener('click', clearConversation);
-      document.querySelector('#plugins').addEventListener('click', () => loadMcpServers(true));
+      document.querySelector('#plugins').addEventListener('click', openMcpManager);
+      document.querySelector('#mcpClose').addEventListener('click', () => { mcpManager.hidden = true; closeMcpEditor(); });
+      document.querySelector('#mcpAdd').addEventListener('click', () => openMcpEditor());
+      document.querySelector('#mcpReload').addEventListener('click', (event) => runMcpAction('registry', 'reload', event.currentTarget));
+      document.querySelector('#mcpCancelEdit').addEventListener('click', closeMcpEditor);
+      document.querySelector('#mcpTransport').addEventListener('change', updateMcpTransportFields);
+      mcpEditor.addEventListener('submit', saveMcpConfig);
+      document.querySelector('#mcpApplyToken').addEventListener('click', async () => {
+        mcpAdminToken = mcpAdminTokenInput.value.trim();
+        try {
+          if (mcpAdminToken) globalThis.sessionStorage?.setItem('jlcircuit-mcp-admin-token', mcpAdminToken);
+          else globalThis.sessionStorage?.removeItem('jlcircuit-mcp-admin-token');
+        } catch { /* ignore */ }
+        await loadMcpManager();
+      });
+      mcpManager.addEventListener('click', (event) => {
+        if (event.target === mcpManager) { mcpManager.hidden = true; closeMcpEditor(); }
+      });
       instructionInput.addEventListener('keydown', (event) => {
         if (event.key === 'Enter' && !event.shiftKey) {
           event.preventDefault();

@@ -64,6 +64,8 @@ test("SQLite store restores sessions, messages, tasks and audit events after reo
     assert.equal(reopened.getTask("task-1")?.skills?.[0]?.id, "eda-core");
     assert.equal(reopened.listSkillStates().get("eda-core"), false);
     assert.equal(reopened.listMcpServerStates().get("fixture"), true);
+    reopened.deleteMcpServerState("fixture");
+    assert.equal(reopened.listMcpServerStates().has("fixture"), false);
     assert.equal(reopened.countAuditEvents("session-1"), 1);
     reopened.close();
   } finally {

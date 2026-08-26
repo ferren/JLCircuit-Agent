@@ -472,6 +472,10 @@ export class AgentStore {
     `).run(serverId, enabled ? 1 : 0, new Date().toISOString());
   }
 
+  public deleteMcpServerState(serverId: string): void {
+    this.database.prepare("DELETE FROM mcp_server_states WHERE server_id = ?").run(serverId);
+  }
+
   public upsertContextSnapshot(input: {
     sessionId: string;
     projectId?: string;

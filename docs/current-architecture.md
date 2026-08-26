@@ -176,7 +176,7 @@ flowchart TB
 ```mermaid
 flowchart LR
     subgraph EDA[嘉立创 EDA 进程]
-        UI[助手 iframe 面板]
+        UI[助手 iframe：对话 / MCP 管理]
         EXT[扩展入口]
         ADAPTER[EDA Adapter]
         API[嘉立创 EDA Pro API]
@@ -197,6 +197,7 @@ flowchart LR
         STORE[(SQLite)]
 
         HTTP --> SESSION
+        HTTP --> MCPGW
         SESSION --> CONTEXT
         CONTEXT --> STORE
         SESSION --> LLM
@@ -223,17 +224,17 @@ flowchart LR
 
 | 层 | 当前状态 | 当前边界 | 下一完整能力 |
 | --- | --- | --- | --- |
-| EDA 多轮交互面板 | 已实现 | 对话、计划、确认、历史、技能选择 | 差异预览、任务树、回滚入口 |
+| EDA 多轮交互面板 | 已实现 | 对话、计划、确认、历史、技能选择、MCP 配置与生命周期管理 | 差异预览、任务树、回滚入口 |
 | Session / Context Engine | 已实现 | 项目隔离、消息、摘要、任务、最新快照 | 项目语义长期记忆与来源置信度 |
 | Agent Orchestrator | 部分实现 | Chat/Plan、ChangeSet、确认、单类写操作 | 显式意图节点、通用状态图、事务与恢复 |
 | Skill Registry | 已实现 | 声明式清单、提示、启停、自动选择、工具裁剪 | 依赖、签名、版本、安装和热更新 |
 | LLM Router | 部分实现 | 单语言路由及独立视觉路由 | 多供应商策略、重试、降级、成本/延迟策略 |
-| MCP / Plugin Gateway | 部分实现 | 官方客户端、stdio/HTTP、配置注册、发现、命名空间、allowlist、状态和审计 | OAuth、安装、自动重连、进程沙箱和外部写执行器 |
+| MCP / Plugin Gateway | 部分实现 | 官方客户端、stdio/HTTP、配置 CRUD、连接测试、能力查看、命名空间、allowlist、状态和审计 | OAuth、安装、自动重连、进程沙箱和外部写执行器 |
 | 外部资料与知识库 | 开发中 | 尚未读取外部目录或手册 | 授权目录、PDF/网页解析、检索、来源引用 |
 | EDA 工具 | 部分实现 | 读取、DRC、截图、实验性元件移动 | 完整原理图、PCB、BOM、规则和脚本工具 |
 | 执行与验证 | 部分实现 | 确认、项目校验、DRC、截图 | 通用前置条件、差异、事务、回滚和视觉评分 |
 | 持久化与审计 | 已实现 | SQLite 会话、消息、任务、技能、快照、审计 | 制品存储、防篡改审计、保留和迁移策略 |
-| 鉴权与部署安全 | 开发中 | 当前仅依赖回环地址 | Token、身份、权限、严格 CORS、TLS/代理 |
+| 鉴权与部署安全 | 部分实现 | MCP 管理接口已有回环限制、Origin allowlist 和可选 Token；其他 API 仍主要依赖本机边界 | 统一 Token、身份、权限、严格 CORS、TLS/代理 |
 | 评测与可观测性 | 开发中 | 单元测试和控制台日志 | Trace、固定电路集、视觉/电气正确性评测 |
 
 ### 3.4 进程边界
@@ -477,7 +478,9 @@ flowchart LR
 - Resources/Prompts 必须显式开放，并限制为连接后发现的条目；
 - 请求超时、Server/工具/结果大小上限、HTTPS/回环 HTTP 约束；
 - 连接、启停、失败和工具调用写入 SQLite 审计；
-- 管理 API 与 EDA 面板连接状态显示。
+- 配置文件校验后通过临时文件原子替换，拒绝修改既有 Server ID；
+- EDA 内的 MCP 管理窗口支持配置增删改、启停、连接、断开、独立连接测试和能力明细；
+- 管理 API 只接受回环绑定和回环来源，可选 `JLCIRCUIT_MCP_ADMIN_TOKEN`，并拒绝未允许的浏览器 Origin。
 
 ### 7.4 仍在开发中的插件能力
 
@@ -678,11 +681,17 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 | POST | `/v1/skills/:skillId/enable` | 启用技能并持久化状态 |
 | POST | `/v1/skills/:skillId/disable` | 禁用技能并持久化状态 |
 | GET | `/v1/mcp/servers` | MCP 配置路径、Server 状态和加载诊断 |
+| GET | `/v1/mcp/config` | 管理视图所需的规范化配置和运行状态；需要本机管理权限 |
 | POST | `/v1/mcp/reload` | 重新读取配置并按启用状态连接 |
+| POST | `/v1/mcp/servers` | 新增、校验并原子保存 Server 配置 |
+| POST | `/v1/mcp/servers/:serverId/update` | 更新配置；Server ID 不可变 |
+| POST | `/v1/mcp/servers/:serverId/delete` | 删除配置、断开连接并清理启停覆盖状态 |
 | POST | `/v1/mcp/servers/:serverId/enable` | 持久化启用并按策略连接 |
 | POST | `/v1/mcp/servers/:serverId/disable` | 断开并持久化禁用 |
 | POST | `/v1/mcp/servers/:serverId/connect` | 连接已启用 Server 并刷新能力 |
 | POST | `/v1/mcp/servers/:serverId/disconnect` | 断开 Server |
+| POST | `/v1/mcp/servers/:serverId/test` | 使用临时客户端验证握手和能力发现，不改变启停状态 |
+| GET | `/v1/mcp/servers/:serverId/capabilities` | 查看已发现 Tools、Resources 和 Prompts |
 | GET | `/v1/mcp/servers/:serverId/resources` | 列出已允许的已发现资源 |
 | POST | `/v1/mcp/servers/:serverId/resources/read` | 读取已发现资源 |
 | GET | `/v1/mcp/servers/:serverId/prompts` | 列出已允许的已发现提示 |
@@ -732,8 +741,10 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 | `JLCIRCUIT_MCP_MAX_TOOLS_PER_SERVER` | `100` |
 | `JLCIRCUIT_MCP_MAX_TOOL_SCHEMA_CHARS` | `20000` |
 | `JLCIRCUIT_MCP_MAX_RESULT_CHARS` | `1000000` |
+| `JLCIRCUIT_MCP_ADMIN_TOKEN` | 可选；保护 MCP 配置和生命周期管理 API |
+| `JLCIRCUIT_MCP_ADMIN_ALLOWED_ORIGINS` | 可选；逗号分隔的管理请求 Origin allowlist |
 
-配置只保存环境变量名称，不保存密钥值。示例见 `config/mcp-servers.example.json`。
+配置只保存环境变量名称，不保存密钥值。示例见 `config/mcp-servers.example.json`。管理窗口输入的管理令牌只保留在当前 EDA iframe 的 `sessionStorage`，不会写进 MCP 配置。
 
 ### 14.4 语言模型
 
@@ -781,7 +792,7 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 ### 15.2 当前缺口
 
 - `JLCIRCUIT_BRIDGE_TOKEN` 虽然出现在配置示例中，但当前 HTTP 和 WebSocket 握手没有实际校验该 Token；
-- HTTP CORS 当前为 `*`，安全性依赖服务只绑定本机地址；
+- 普通 HTTP API 的 CORS 当前仍为 `*`，安全性依赖服务只绑定本机地址；MCP 配置和生命周期接口另有回环来源、Origin allowlist 和可选管理令牌保护；
 - HTTP API 没有用户身份、角色或授权范围；
 - capability 上报没有用于服务端动态禁用不可用工具；
 - 确认令牌会持久化并通过任务 API 返回，当前安全前提是 Agent 只在可信本机运行；
@@ -818,7 +829,7 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 | 阶段 1：多轮交互与安全计划 | 已实现 | Chat/Plan、允许正常回答或追问、ChangeSet、确认/取消、任务卡片 |
 | 阶段 2：上下文、会话与持久化 | 已实现 | 项目级会话、消息历史、滚动摘要、活动任务、EDA 快照、SQLite 和审计 |
 | 阶段 3：声明式 Skill Registry | 已实现 | 扫描、校验、自动/显式选择、提示注入、工具权限裁剪、状态持久化和 EDA 面板选择器；仍需扩大真实 EDA 多技能回归范围 |
-| 阶段 4：Plugin/MCP Gateway | 部分实现 | 官方 MCP Client、stdio/Streamable HTTP、配置生命周期、发现、命名空间、allowlist、风险、超时、审计和状态界面；OAuth、重连、安装沙箱及外部写执行仍在开发 |
+| 阶段 4：Plugin/MCP Gateway | 部分实现 | 官方 MCP Client、stdio/Streamable HTTP、配置管理界面、CRUD、连接测试、能力查看、发现、命名空间、allowlist、风险、超时和审计；OAuth、自动重连、安装沙箱及外部写执行仍在开发 |
 | 阶段 5：Local Knowledge | 开发中 | 授权外部目录、PDF/手册/参考电路解析、全文及向量检索、来源引用 |
 | 阶段 6：专业 Datasheet Skills | 开发中 | 芯片选型、引脚表、典型应用、参考网表与当前设计交叉校验 |
 | 阶段 7：项目长期记忆 | 开发中 | 带来源、置信度和生效范围的约束、决策、器件和问题记录 |
@@ -840,7 +851,11 @@ Skill / Orchestrator
   -> 标准化结果与审计
 ```
 
-### 17.2 阶段 5：外部目录与资料知识库（开发中）
+### 17.2 阶段 4.1：MCP 配置与管理界面（已实现）
+
+EDA 助手通过受保护的本地管理 API 完成 MCP Server 配置 CRUD、启停、连接、断开、独立测试和能力查看。写配置前使用与运行时相同的 schema 和安全规则校验，再通过临时文件原子替换；界面只接受密钥环境变量名，不接受密钥值。该阶段没有放宽模型工具权限，外部 MCP 工具仍只有显式标为 `read` 的工具可以执行。
+
+### 17.3 阶段 5：外部目录与资料知识库（开发中）
 
 外部资料必须先由用户或管理员授权目录，随后按文件类型经过解析、分块、索引和来源记录。读取芯片手册或参考电路时，模型应返回文件、页码/章节或原始设计来源，不能把检索结果当成无来源事实。
 
@@ -856,7 +871,7 @@ flowchart LR
     CITATION --> CONTEXT[Context Engine]
 ```
 
-### 17.3 阶段 7：项目长期记忆（开发中）
+### 17.4 阶段 7：项目长期记忆（开发中）
 
 长期记忆与普通聊天摘要分开保存，目标记录包括：
 
@@ -868,7 +883,7 @@ flowchart LR
 
 模型推测不能自动升级为长期事实。写入长期记忆需要明确来源，并允许用户查看、修订和删除。
 
-### 17.4 阶段 8：通用执行器（开发中）
+### 17.5 阶段 8：通用执行器（开发中）
 
 目标执行器在每个操作中保存 `expectedBefore`、目标对象、可逆参数和验证规则。执行前比较旧值；执行中建立回滚点；执行后同时进行结构化、DRC/ERC 和视觉验证。任何一步失败都应停止剩余操作，并优先恢复到已知状态。
 
@@ -903,6 +918,7 @@ extensions/jlcircuit-eda/build/dist/jlcircuit-agent_v0.2.0.eext
 - Skill Registry 的 always、关键字和显式选择；
 - 技能工具权限并集、启停持久化和非法清单诊断；
 - MCP stdio 与 Streamable HTTP 真实握手、能力发现和工具调用；
-- MCP allowlist、默认风险、启停持久化、Resources/Prompts 和不安全 HTTP 拒绝。
+- MCP allowlist、默认风险、启停持久化、Resources/Prompts 和不安全 HTTP 拒绝；
+- MCP 配置新增、更新、删除、原子持久化、独立连接测试和状态清理。
 
 真实 EDA API 行为、移动元件后的复杂连线、电气正确性和视觉可读性仍必须在嘉立创 EDA 中进行人工或设备环境验证。
