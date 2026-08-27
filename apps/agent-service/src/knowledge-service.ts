@@ -27,6 +27,38 @@ const PDF_STANDARD_FONT_DATA_URL = `${resolve(
   "../../../node_modules/pdfjs-dist/standard_fonts",
 ).replaceAll("\\", "/")}/`;
 
+export const DATASHEET_ASPECTS = [
+  "identity",
+  "selection",
+  "power",
+  "absolute_maximum",
+  "recommended_conditions",
+  "pinout",
+  "clock_reset",
+  "interfaces",
+  "decoupling",
+  "reference_circuit",
+  "layout",
+  "thermal_package",
+] as const;
+
+export type DatasheetAspect = typeof DATASHEET_ASPECTS[number];
+
+const DATASHEET_ASPECT_CONFIG: Record<DatasheetAspect, { label: string; terms: string[] }> = {
+  identity: { label: "器件身份与功能概述", terms: ["overview", "general description", "features", "产品概述", "主要特性"] },
+  selection: { label: "选型、订购与封装", terms: ["ordering information", "device summary", "part number", "选型", "订购信息"] },
+  power: { label: "电源、电压与电源域", terms: ["VDD", "VCC", "supply voltage", "power supply", "供电电压", "电源"] },
+  absolute_maximum: { label: "绝对最大额定值", terms: ["absolute maximum", "maximum ratings", "极限参数", "绝对最大额定值"] },
+  recommended_conditions: { label: "推荐工作条件", terms: ["recommended operating conditions", "operating conditions", "工作条件", "推荐工作"] },
+  pinout: { label: "引脚与复用功能", terms: ["pin description", "pin assignment", "pinout", "alternate function", "引脚说明", "引脚定义"] },
+  clock_reset: { label: "时钟、晶振与复位", terms: ["clock", "oscillator", "crystal", "reset", "时钟", "晶振", "复位"] },
+  interfaces: { label: "接口与电气特性", terms: ["electrical characteristics", "interface", "UART", "SPI", "I2C", "USB", "接口", "电气特性"] },
+  decoupling: { label: "去耦、旁路与电源滤波", terms: ["decoupling", "bypass capacitor", "power filtering", "去耦", "旁路电容", "滤波电容"] },
+  reference_circuit: { label: "典型应用与参考电路", terms: ["typical application", "application circuit", "reference circuit", "reference schematic", "典型应用", "参考电路", "应用电路"] },
+  layout: { label: "布局布线要求", terms: ["layout guidelines", "PCB layout", "placement", "routing", "布局指南", "布线要求"] },
+  thermal_package: { label: "封装与热设计", terms: ["package information", "thermal resistance", "footprint", "封装信息", "热阻", "焊盘"] },
+};
+
 export const KNOWLEDGE_TOOL_DEFINITIONS: EdaToolDefinition[] = [
   {
     name: "knowledge_sources",
@@ -67,6 +99,27 @@ export const KNOWLEDGE_TOOL_DEFINITIONS: EdaToolDefinition[] = [
     },
     enabled: true,
   },
+  {
+    name: "datasheet_evidence",
+    description: "按芯片型号和专业审查主题组织已授权手册证据，返回覆盖情况、原文片段及可追溯引用；不凭模型记忆生成参数值。",
+    riskLevel: "read",
+    inputSchema: {
+      type: "object",
+      required: ["partNumber"],
+      additionalProperties: false,
+      properties: {
+        partNumber: { type: "string", minLength: 1, maxLength: 120 },
+        aspects: {
+          type: "array",
+          items: { type: "string", enum: [...DATASHEET_ASPECTS] },
+          maxItems: DATASHEET_ASPECTS.length,
+        },
+        sourceIds: { type: "array", items: { type: "string" }, maxItems: 16 },
+        perAspectLimit: { type: "integer", minimum: 1, maximum: 5, default: 3 },
+      },
+    },
+    enabled: true,
+  },
 ];
 
 export type KnowledgeScanResult = {
@@ -78,6 +131,29 @@ export type KnowledgeScanResult = {
   errors: number;
   errorFiles: Array<{ path: string; message: string }>;
   completedAt: string;
+};
+
+export type KnowledgeSearchResult = {
+  chunkId: string;
+  documentId: string;
+  sourceId: string;
+  sourceName: string;
+  title: string;
+  path: string;
+  fileType: string;
+  locator: Record<string, unknown>;
+  excerpt: string;
+  score: number;
+  citation: {
+    sourceId: string;
+    documentId: string;
+    path: string;
+    title: string;
+    page?: unknown;
+    lineStart?: unknown;
+    lineEnd?: unknown;
+    sha256: string;
+  };
 };
 
 export class KnowledgeServiceError extends Error {
@@ -307,6 +383,38 @@ export class KnowledgeService {
         });
         return { requestId, ok: true, data: result, content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       }
+      if (toolName === "datasheet_evidence") {
+        if (args.aspects !== undefined && !Array.isArray(args.aspects)) {
+          throw new KnowledgeServiceError("KNOWLEDGE_QUERY_INVALID", "datasheet_evidence aspects must be an array.");
+        }
+        if (args.sourceIds !== undefined && !Array.isArray(args.sourceIds)) {
+          throw new KnowledgeServiceError("KNOWLEDGE_QUERY_INVALID", "datasheet_evidence sourceIds must be an array.");
+        }
+        const partNumber = typeof args.partNumber === "string" ? args.partNumber.trim() : "";
+        const aspects = Array.isArray(args.aspects)
+          ? args.aspects.filter((item): item is DatasheetAspect =>
+            typeof item === "string" && DATASHEET_ASPECTS.includes(item as DatasheetAspect))
+          : undefined;
+        if (Array.isArray(args.aspects) && aspects?.length !== args.aspects.length) {
+          throw new KnowledgeServiceError("KNOWLEDGE_QUERY_INVALID", "datasheet_evidence contains an unsupported aspect.");
+        }
+        const sourceIds = Array.isArray(args.sourceIds)
+          ? [...new Set(args.sourceIds.filter((item): item is string => typeof item === "string"))].slice(0, 16)
+          : [];
+        const perAspectLimit = Math.max(1, Math.min(Number(args.perAspectLimit) || 3, 5));
+        const result = this.buildDatasheetEvidence(partNumber, aspects, sourceIds, perAspectLimit);
+        this.store.appendAuditEvent({
+          sessionId,
+          eventType: "datasheet.evidence_built",
+          payload: {
+            partNumber: result.partNumber,
+            aspects: result.aspects.map((item) => item.aspect),
+            covered: result.coverage.covered,
+            missing: result.coverage.missing,
+          },
+        });
+        return { requestId, ok: true, data: result, content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
       throw new KnowledgeServiceError("KNOWLEDGE_QUERY_INVALID", `Unknown knowledge tool: ${toolName}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -314,8 +422,13 @@ export class KnowledgeService {
     }
   }
 
-  public search(query: string, sourceIds: string[] = [], limit = 8): unknown[] {
-    return this.store.searchKnowledge(query, sourceIds, limit).map((row) => ({
+  public search(
+    query: string,
+    sourceIds: string[] = [],
+    limit = 8,
+    documentIds: string[] = [],
+  ): KnowledgeSearchResult[] {
+    return this.store.searchKnowledge(query, sourceIds, limit, documentIds).map((row) => ({
       chunkId: row.id,
       documentId: row.documentId,
       sourceId: row.sourceId,
@@ -337,6 +450,114 @@ export class KnowledgeService {
         sha256: row.documentSha256,
       },
     }));
+  }
+
+  public buildDatasheetEvidence(
+    partNumberValue: string,
+    aspectValues: DatasheetAspect[] = ["power", "recommended_conditions", "pinout", "decoupling", "reference_circuit"],
+    sourceIds: string[] = [],
+    perAspectLimit = 3,
+  ): {
+    partNumber: string;
+    documents: Array<{
+      documentId: string;
+      sourceId: string;
+      path: string;
+      title: string;
+      fileType: string;
+      sha256: string;
+      pageCount?: number;
+    }>;
+    coverage: { requested: number; covered: number; missing: DatasheetAspect[] };
+    aspects: Array<{
+      aspect: DatasheetAspect;
+      label: string;
+      status: "found" | "missing";
+      evidence: Array<KnowledgeSearchResult & { matchedTerms: string[] }>;
+    }>;
+    guidance: string[];
+  } {
+    const partNumber = partNumberValue.trim();
+    if (!partNumber || partNumber.length > 120) {
+      throw new KnowledgeServiceError("KNOWLEDGE_QUERY_INVALID", "datasheet_evidence requires partNumber with at most 120 characters.");
+    }
+    const aspects = [...new Set(aspectValues)];
+    if (aspects.length === 0 || aspects.length > DATASHEET_ASPECTS.length ||
+      aspects.some((aspect) => !DATASHEET_ASPECTS.includes(aspect))) {
+      throw new KnowledgeServiceError("KNOWLEDGE_QUERY_INVALID", "datasheet_evidence requires one or more supported aspects.");
+    }
+    const uniqueSourceIds = [...new Set(sourceIds)].slice(0, 16);
+    for (const id of uniqueSourceIds) this.requireSource(id);
+    const safeLimit = Math.max(1, Math.min(perAspectLimit, 5));
+    const enabledSources = new Set(this.listSources().filter((source) => source.enabled).map((source) => source.id));
+    const partKey = partNumber.toLowerCase().replace(/[^a-z0-9]+/g, "");
+    const metadataDocuments = this.store.listKnowledgeDocuments().filter((document) => {
+      if (document.status !== "indexed" || !enabledSources.has(document.sourceId)) return false;
+      if (uniqueSourceIds.length > 0 && !uniqueSourceIds.includes(document.sourceId)) return false;
+      const metadataKey = `${document.title} ${document.relativePath}`.toLowerCase().replace(/[^a-z0-9]+/g, "");
+      return partKey.length > 0 && metadataKey.includes(partKey);
+    });
+    const contentMatches = this.search(partNumber, uniqueSourceIds, 50);
+    const candidateIds = [...new Set([
+      ...metadataDocuments.map((document) => document.id),
+      ...contentMatches.map((result) => result.documentId),
+    ])].slice(0, 16);
+    const documents = candidateIds.flatMap((documentId) => {
+      const document = this.store.getKnowledgeDocument(documentId);
+      return document ? [{
+        documentId: document.id,
+        sourceId: document.sourceId,
+        path: document.relativePath,
+        title: document.title,
+        fileType: document.fileType,
+        sha256: document.sha256,
+        ...(document.pageCount === undefined ? {} : { pageCount: document.pageCount }),
+      }] : [];
+    });
+    const evidenceAspects = aspects.map((aspect) => {
+      const config = DATASHEET_ASPECT_CONFIG[aspect];
+      const candidates = new Map<string, {
+        result: KnowledgeSearchResult;
+        matchedTerms: Set<string>;
+      }>();
+      for (const term of config.terms) {
+        const results = candidateIds.length > 0
+          ? this.search(term, uniqueSourceIds, Math.max(10, safeLimit * 3), candidateIds)
+          : [];
+        for (const result of results) {
+          const candidate = candidates.get(result.chunkId) ?? { result, matchedTerms: new Set<string>() };
+          candidate.matchedTerms.add(term);
+          candidates.set(result.chunkId, candidate);
+        }
+      }
+      const evidence = [...candidates.values()]
+        .sort((left, right) =>
+          right.matchedTerms.size - left.matchedTerms.size || left.result.score - right.result.score)
+        .slice(0, safeLimit)
+        .map(({ result, matchedTerms }) => ({
+          ...result,
+          excerpt: result.excerpt.slice(0, 800),
+          matchedTerms: [...matchedTerms],
+        }));
+      return {
+        aspect,
+        label: config.label,
+        status: evidence.length > 0 ? "found" as const : "missing" as const,
+        evidence,
+      };
+    });
+    const missing = evidenceAspects.filter((item) => item.status === "missing").map((item) => item.aspect);
+    return {
+      partNumber,
+      documents,
+      coverage: { requested: aspects.length, covered: aspects.length - missing.length, missing },
+      aspects: evidenceAspects,
+      guidance: [
+        "这些结果是原文证据片段，不是已验证的结构化参数；具体数值必须由模型连同条件、单位和引用一起提取。",
+        "缺失主题表示当前索引没有找到证据，不能用模型记忆补齐。",
+        "交叉检查当前设计时，还必须读取 EDA 元件、网络和 DRC；仅有手册证据不能证明原理图符合要求。",
+      ],
+    };
   }
 
   private modelSourceViews(): unknown[] {

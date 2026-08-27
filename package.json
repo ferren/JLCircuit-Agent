@@ -16,7 +16,7 @@
     "dev": "node --env-file-if-exists=.env --experimental-strip-types apps/agent-service/src/server.ts",
     "start": "node --env-file-if-exists=.env --experimental-strip-types apps/agent-service/src/server.ts",
     "build:extension": "npm --workspace @jlcircuit/eda-extension run build",
-    "test": "node --test --test-isolation=none --experimental-strip-types apps/agent-service/src/storage.test.ts apps/agent-service/src/context-engine.test.ts apps/agent-service/src/skill-registry.test.ts apps/agent-service/src/mcp-registry.test.ts apps/agent-service/src/knowledge-service.test.ts",
+    "test": "node --test --test-isolation=none --experimental-strip-types apps/agent-service/src/storage.test.ts apps/agent-service/src/context-engine.test.ts apps/agent-service/src/skill-registry.test.ts apps/agent-service/src/mcp-registry.test.ts apps/agent-service/src/knowledge-service.test.ts apps/agent-service/src/llm.test.ts",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck"
   },

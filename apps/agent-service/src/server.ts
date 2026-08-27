@@ -16,7 +16,7 @@ import {
   KnowledgeService,
   KnowledgeServiceError,
 } from "./knowledge-service.ts";
-import { runAgentTurn } from "./llm.ts";
+import { runAgentTurn, type AgentRunEvent } from "./llm.ts";
 import { McpRegistry, McpRegistryError } from "./mcp-registry.ts";
 import { SkillRegistry, SkillRegistryError } from "./skill-registry.ts";
 import {
@@ -149,6 +149,24 @@ const json = (response: ServerResponse, statusCode: number, body: unknown) => {
     "access-control-allow-origin": "*",
   });
   response.end(JSON.stringify(body));
+};
+
+const startSse = (response: ServerResponse): void => {
+  response.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache, no-transform",
+    "connection": "keep-alive",
+    "x-accel-buffering": "no",
+    "access-control-allow-origin": "*",
+  });
+  response.socket?.setNoDelay(true);
+  response.flushHeaders();
+};
+
+const writeSse = (response: ServerResponse, event: string, data: unknown): boolean => {
+  if (response.destroyed || response.writableEnded) return false;
+  response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  return true;
 };
 
 const readBody = async (request: IncomingMessage): Promise<unknown> => {
@@ -288,6 +306,7 @@ const runModelTurn = async (
   mode: "chat" | "plan" = "chat",
   userInstruction = instruction,
   requestedSkillIds?: string[],
+  options: { onEvent?: (event: AgentRunEvent) => void; signal?: AbortSignal } = {},
 ) => {
   log("[llm] turn started", { sessionId, mode, provider: process.env.JLCIRCUIT_MODEL_PROVIDER ?? "stub" });
   const resolvedSkills = skillRegistry.resolve({
@@ -307,6 +326,7 @@ const runModelTurn = async (
     payload: { mode, requestedSkillIds: requestedSkillIds ?? [], skills: skillRefs, tools: toolDefinitions.map((tool) => tool.name) },
   });
   try {
+    options.onEvent?.({ type: "phase", phase: "context", message: "正在读取当前 EDA 设计和会话上下文…" });
     const preparedContext = await contextEngine.prepareTurn({
       sessionId,
       beforeSequence: userMessage.sequence,
@@ -320,6 +340,8 @@ const runModelTurn = async (
       executeTool: callTool,
       activeSkills: resolvedSkills.skills,
       mode,
+      signal: options.signal,
+      onEvent: options.onEvent,
     });
     contextEngine.completeTurn({
       sessionId,
@@ -328,12 +350,15 @@ const runModelTurn = async (
       model: result.model,
       toolCount: result.toolTrace.length,
       plannedOperationCount: result.plannedOperations.length,
-      metadata: { skills: skillRefs },
+      metadata: { skills: skillRefs, status: result.status, runState: result.runState },
     });
     log("[llm] turn completed", {
       model: result.model,
       toolCount: result.toolTrace.length,
       plannedOperationCount: result.plannedOperations.length,
+      status: result.status,
+      stopReason: result.runState.stopReason,
+      modelRequests: result.runState.modelRequests,
       skills: skillRefs.map((skill) => skill.id),
     });
     return result;
@@ -744,6 +769,53 @@ const server = createServer(async (request, response) => {
       return;
     }
 
+    if (request.method === "POST" && url.pathname === "/v1/chat/stream") {
+      const body = (await readBody(request)) as { sessionId?: string; instruction?: string; skillIds?: string[] };
+      const sessionId = body.sessionId ?? "default";
+      const instruction = body.instruction?.trim();
+      log(`[http] POST ${url.pathname}`, { sessionId, instructionLength: instruction?.length ?? 0 });
+      if (!instruction) {
+        json(response, 400, { error: "invalid_request", message: "instruction is required." });
+        return;
+      }
+
+      startSse(response);
+      const abortController = new AbortController();
+      const heartbeat = setInterval(() => {
+        if (!response.destroyed && !response.writableEnded) response.write(": jlcircuit heartbeat\n\n");
+      }, 15_000);
+      response.on("close", () => {
+        if (!response.writableEnded) abortController.abort(new Error("EDA client disconnected from the Agent stream."));
+      });
+      writeSse(response, "connected", { sessionId, status: "running", startedAt: new Date().toISOString() });
+      try {
+        const result = await runModelTurn(
+          sessionId,
+          instruction,
+          "chat",
+          instruction,
+          body.skillIds,
+          {
+            signal: abortController.signal,
+            onEvent: (event) => writeSse(response, event.type, event),
+          },
+        );
+        writeSse(response, "result", { sessionId, ...result });
+        writeSse(response, "done", { sessionId, status: result.status });
+      } catch (error) {
+        if (!abortController.signal.aborted) {
+          writeSse(response, "error", {
+            error: "agent_stream_failed",
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      } finally {
+        clearInterval(heartbeat);
+        if (!response.writableEnded) response.end();
+      }
+      return;
+    }
+
     if (request.method === "POST" && url.pathname === "/v1/chat") {
       const body = (await readBody(request)) as { sessionId?: string; instruction?: string; skillIds?: string[] };
       const sessionId = body.sessionId ?? "default";
@@ -754,7 +826,7 @@ const server = createServer(async (request, response) => {
         return;
       }
       const result = await runModelTurn(sessionId, instruction, "chat", instruction, body.skillIds);
-      json(response, 200, { sessionId, status: "completed", ...result });
+      json(response, 200, { sessionId, ...result });
       return;
     }
 
@@ -777,11 +849,18 @@ const server = createServer(async (request, response) => {
       );
       const changeSet = createChangeSet(result);
       const now = new Date().toISOString();
+      const taskStatus: AgentTask["status"] = changeSet.operations.length > 0
+        ? "waiting_confirmation"
+        : result.status === "awaiting_user" || result.status === "incomplete"
+          ? "awaiting_user"
+          : result.status === "blocked"
+            ? "failed"
+            : "completed";
       const task: AgentTask = {
         taskId: crypto.randomUUID(),
         sessionId,
         instruction,
-        status: changeSet.operations.length > 0 ? "waiting_confirmation" : "awaiting_user",
+        status: taskStatus,
         model: result.model,
         message: result.message,
         context: result.context,

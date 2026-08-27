@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import type { EdaToolDefinition } from "../../../packages/contracts/src/index.ts";
+import { JLCIRCUIT_TOOLS } from "../../../packages/mcp/src/index.ts";
+import { KNOWLEDGE_TOOL_DEFINITIONS } from "./knowledge-service.ts";
 import { SkillRegistry, SkillRegistryError } from "./skill-registry.ts";
 import { AgentStore } from "./storage.ts";
 
@@ -95,5 +97,25 @@ test("Skill Registry persists enable state and reports invalid manifests", () =>
     reopenedStore.close();
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Built-in datasheet review skill combines evidence and EDA read tools", () => {
+  const store = new AgentStore(":memory:");
+  try {
+    const registry = new SkillRegistry(store, [...JLCIRCUIT_TOOLS, ...KNOWLEDGE_TOOL_DEFINITIONS], {
+      roots: [resolve("skills/builtin")],
+    });
+    assert.deepEqual(registry.getDiagnostics(), []);
+    const resolved = registry.resolve({
+      instruction: "请根据 STM32 芯片手册审查供电要求、引脚定义和去耦电容",
+      mode: "chat",
+    });
+    assert.deepEqual(resolved.skills.map((skill) => skill.id), ["eda-core", "datasheet-review", "local-knowledge"]);
+    assert.equal(resolved.allowedToolNames.has("datasheet_evidence"), true);
+    assert.equal(resolved.allowedToolNames.has("easyeda_schematic_components"), true);
+    assert.equal(resolved.allowedToolNames.has("easyeda_schematic_move_component"), false);
+  } finally {
+    store.close();
   }
 });

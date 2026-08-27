@@ -60,6 +60,24 @@
       .secondary { padding: 8px 12px; color: var(--ink); background: #e7edf7; }
       .danger { padding: 8px 12px; color: var(--red); background: var(--red-soft); }
       .details { margin-top: 10px; padding: 9px; border-radius: 8px; background: #f7f9fc; color: var(--muted); white-space: pre-wrap; font-size: 11px; line-height: 1.45; }
+      .execution-card { width: min(760px, 100%); margin: 0 auto 14px; padding: 12px; border: 1px solid #b9c9ee; border-radius: 12px; background: var(--panel); box-shadow: 0 2px 12px rgb(31 60 120 / 7%); }
+      .execution-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+      .execution-state { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 13px; font-weight: 650; }
+      .execution-state-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .spinner { width: 13px; height: 13px; flex: 0 0 auto; border: 2px solid #c8d5f5; border-top-color: var(--blue); border-radius: 50%; animation: spin .8s linear infinite; }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      .execution-card.done { border-color: #abd8c1; }
+      .execution-card.failed { border-color: #f0b4ae; }
+      .execution-card.done .spinner, .execution-card.failed .spinner { animation: none; border: 0; }
+      .execution-card.done .spinner::after { content: '✓'; color: var(--green); }
+      .execution-card.failed .spinner::after { content: '!'; color: var(--red); }
+      .execution-metrics { margin-top: 7px; color: var(--muted); font-size: 10px; }
+      .execution-reasoning { margin-top: 10px; border: 1px solid #e0e6ef; border-radius: 8px; background: #f7f9fc; }
+      .execution-reasoning summary { padding: 8px 9px; cursor: pointer; color: var(--muted); font-size: 11px; user-select: none; }
+      .execution-reasoning pre { max-height: 260px; margin: 0; padding: 0 9px 9px; overflow: auto; color: #536078; white-space: pre-wrap; word-break: break-word; font: 10px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; }
+      .execution-tools { margin-top: 8px; color: var(--muted); white-space: pre-wrap; font-size: 10px; line-height: 1.45; }
+      .execution-answer { margin-top: 10px; white-space: pre-wrap; word-break: break-word; font-size: 13px; line-height: 1.5; }
+      .execution-answer.preview { color: var(--muted); }
       .composer { padding: 10px 16px 14px; border-top: 1px solid var(--line); background: var(--panel); }
       textarea { display: block; width: min(760px, 100%); min-height: 72px; margin: 0 auto; padding: 10px 12px; resize: vertical; border: 1px solid #c7d2e2; border-radius: 10px; outline: none; color: var(--ink); background: #fbfcfe; font-size: 13px; line-height: 1.45; }
       textarea:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgb(36 99 235 / 12%); }
@@ -131,7 +149,7 @@
         </div>
       </header>
       <section id="conversation" class="conversation" aria-live="polite">
-        <div id="welcome" class="welcome">可以连续输入多个问题。按 Enter 发送分析，按 Shift + Enter 换行；需要修改设计时点击“生成修改计划”。</div>
+        <div id="welcome" class="welcome">可以连续输入多个问题。按 Enter 发送分析，按 Shift + Enter 换行；芯片参数与典型应用可用“手册审查”，设计修改使用“生成修改计划”。</div>
       </section>
       <footer class="composer">
         <textarea id="instruction" placeholder="例如：检查当前原理图，或者把选中的 R1 移到 U1 左侧并保持接线不变"></textarea>
@@ -144,6 +162,7 @@
             <button id="clear" class="small" type="button">清空对话</button>
             <button id="plugins" class="small" type="button">MCP 管理</button>
             <button id="knowledge" class="small" type="button">资料库</button>
+            <button id="datasheetReview" class="small" type="button">手册审查</button>
             <button id="refresh" class="secondary" type="button">刷新摘要</button>
             <button id="analyze" class="primary" type="button">发送分析</button>
             <button id="plan" class="success" type="button">生成修改计划</button>
@@ -927,6 +946,192 @@
         return payload;
       };
 
+      const requestStream = async (path, body, onEvent) => {
+        const clientUrl = runtime && runtime.sys_ClientUrl;
+        if (!clientUrl || typeof clientUrl.request !== 'function') throw new Error('当前 EDA 没有提供 sys_ClientUrl.request。');
+        const headers = { 'content-type': 'application/json', accept: 'text/event-stream' };
+        if (mcpAdminToken) headers['x-jlcircuit-admin-token'] = mcpAdminToken;
+        const response = await clientUrl.request(
+          `${API_ORIGIN}${path}`,
+          'POST',
+          JSON.stringify(body),
+          { headers },
+        );
+        if (!response.ok) {
+          const text = await response.text();
+          try {
+            const payload = JSON.parse(text);
+            throw new Error(payload.message || payload.error || `Agent 服务返回 HTTP ${response.status}`);
+          } catch (error) {
+            if (error instanceof SyntaxError) throw new Error(text || `Agent 服务返回 HTTP ${response.status}`);
+            throw error;
+          }
+        }
+
+        let result;
+        let buffer = '';
+        const consumeBlocks = (flush = false) => {
+          const normalized = buffer.replace(/\r\n/g, '\n');
+          const blocks = normalized.split('\n\n');
+          buffer = flush ? '' : blocks.pop() || '';
+          for (const block of blocks) {
+            if (!block || block.startsWith(':')) continue;
+            let eventName = 'message';
+            const dataLines = [];
+            for (const line of block.split('\n')) {
+              if (line.startsWith('event:')) eventName = line.slice(6).trim();
+              if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart());
+            }
+            if (!dataLines.length) continue;
+            let payload;
+            try { payload = JSON.parse(dataLines.join('\n')); } catch { continue; }
+            onEvent(eventName, payload);
+            if (eventName === 'result') result = payload;
+            if (eventName === 'error') throw new Error(payload.message || 'Agent 流式请求失败。');
+          }
+        };
+
+        if (response.body && typeof response.body.getReader === 'function') {
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            consumeBlocks();
+          }
+          buffer += decoder.decode();
+          buffer += '\n\n';
+          consumeBlocks(true);
+        } else {
+          buffer = `${await response.text()}\n\n`;
+          consumeBlocks(true);
+        }
+        if (!result) throw new Error('Agent 流结束，但没有返回最终结果。');
+        return result;
+      };
+
+      const createExecutionView = () => {
+        welcome.style.display = 'none';
+        const card = document.createElement('article');
+        card.className = 'execution-card';
+        const head = document.createElement('div');
+        head.className = 'execution-head';
+        const state = document.createElement('div');
+        state.className = 'execution-state';
+        const spinner = document.createElement('span');
+        spinner.className = 'spinner';
+        const stateText = document.createElement('span');
+        stateText.className = 'execution-state-text';
+        stateText.textContent = '正在连接 Agent…';
+        state.append(spinner, stateText);
+        const elapsed = document.createElement('span');
+        elapsed.className = 'status-pill';
+        elapsed.textContent = '0.0s';
+        head.append(state, elapsed);
+        const metrics = document.createElement('div');
+        metrics.className = 'execution-metrics';
+        metrics.textContent = '模型请求 0 · 工具调用 0 · Token 等待统计';
+        const reasoningDetails = document.createElement('details');
+        reasoningDetails.className = 'execution-reasoning';
+        reasoningDetails.open = true;
+        const reasoningSummary = document.createElement('summary');
+        reasoningSummary.textContent = '模型思考过程（执行完成后自动折叠）';
+        const reasoningText = document.createElement('pre');
+        reasoningText.textContent = '等待模型输出思考过程…';
+        reasoningDetails.append(reasoningSummary, reasoningText);
+        const tools = document.createElement('div');
+        tools.className = 'execution-tools';
+        const answer = document.createElement('div');
+        answer.className = 'execution-answer preview';
+        card.append(head, metrics, reasoningDetails, tools, answer);
+        conversation.appendChild(card);
+        conversation.scrollTop = conversation.scrollHeight;
+
+        const startedAt = performance.now();
+        let modelRequests = 0;
+        let toolCalls = 0;
+        let generatedChars = 0;
+        let hasReasoning = false;
+        let currentAnswer = '';
+        let exactUsage;
+        const timer = setInterval(() => {
+          elapsed.textContent = `${((performance.now() - startedAt) / 1000).toFixed(1)}s`;
+        }, 100);
+        const updateMetrics = () => {
+          const tokenText = exactUsage
+            ? `Token 输入 ${exactUsage.promptTokens} · 输出 ${exactUsage.completionTokens} · 推理 ${exactUsage.reasoningTokens} · 总计 ${exactUsage.totalTokens}`
+            : `生成中约 ${Math.max(0, Math.ceil(generatedChars / 3))} token`;
+          metrics.textContent = `模型请求 ${modelRequests} · 工具调用 ${toolCalls} · ${tokenText}`;
+        };
+        const scroll = () => { conversation.scrollTop = conversation.scrollHeight; };
+
+        return {
+          event(name, payload) {
+            if (name === 'phase') stateText.textContent = payload.message || '执行中…';
+            if (name === 'model_start') {
+              modelRequests = Math.max(modelRequests, payload.request || 0);
+              stateText.textContent = `模型第 ${payload.request || modelRequests} 次请求执行中`;
+              currentAnswer = '';
+              answer.textContent = '';
+              if (hasReasoning) reasoningText.textContent += `\n\n—— 第 ${payload.request} 次模型请求 ——\n`;
+            }
+            if (name === 'reasoning_delta') {
+              if (!hasReasoning) reasoningText.textContent = '';
+              hasReasoning = true;
+              reasoningText.textContent += payload.delta || '';
+              generatedChars += (payload.delta || '').length;
+            }
+            if (name === 'content_delta') {
+              currentAnswer += payload.delta || '';
+              generatedChars += (payload.delta || '').length;
+              answer.textContent = currentAnswer;
+            }
+            if (name === 'usage') exactUsage = payload.cumulative || payload.usage;
+            if (name === 'tool_start') {
+              toolCalls = Math.max(toolCalls, payload.call || 0);
+              tools.textContent += `${tools.textContent ? '\n' : ''}进行中 · ${payload.tool}`;
+            }
+            if (name === 'tool_complete') {
+              toolCalls = Math.max(toolCalls, payload.call || 0);
+              tools.textContent += `${tools.textContent ? '\n' : ''}${payload.status === 'completed' ? '完成' : payload.status === 'blocked' ? '阻止' : '失败'} · ${payload.tool}${payload.error ? ` · ${payload.error}` : ''}`;
+            }
+            updateMetrics();
+            scroll();
+          },
+          complete(result) {
+            clearInterval(timer);
+            elapsed.textContent = `${((performance.now() - startedAt) / 1000).toFixed(1)}s`;
+            exactUsage = result.runState?.usage || exactUsage;
+            modelRequests = result.runState?.modelRequests ?? modelRequests;
+            toolCalls = result.runState?.toolCalls ?? toolCalls;
+            const succeeded = result.status === 'completed' || result.status === 'awaiting_user' || result.status === 'awaiting_approval';
+            card.classList.add(succeeded ? 'done' : 'failed');
+            stateText.textContent = result.status === 'awaiting_user'
+              ? '等待你的补充信息'
+              : result.status === 'incomplete'
+                ? '阶段执行结束，可继续'
+                : succeeded ? '执行完成' : '执行受阻';
+            answer.classList.remove('preview');
+            answer.textContent = result.message || '模型没有返回文本结果。';
+            reasoningDetails.open = false;
+            if (!hasReasoning) reasoningDetails.hidden = true;
+            updateMetrics();
+            scroll();
+          },
+          fail(error) {
+            clearInterval(timer);
+            card.classList.add('failed');
+            stateText.textContent = '执行失败';
+            answer.classList.remove('preview');
+            answer.textContent = `分析失败：${String(error)}`;
+            reasoningDetails.open = false;
+            if (!hasReasoning) reasoningDetails.hidden = true;
+            scroll();
+          },
+        };
+      };
+
       const compactContextLabel = (context) => {
         const summary = context?.summary || {};
         const components = Array.isArray(summary.components) ? summary.components.length : summary.components?.total;
@@ -1029,19 +1234,32 @@
         busy = true;
         instructionInput.value = '';
         addMessage('user', instruction);
-        const pending = addMessage('assistant', '正在读取设计并分析…', '', 'pending');
+        const execution = createExecutionView();
         try {
-          const result = await request('/v1/chat', 'POST', { sessionId, instruction, skillIds: selectedSkillIds() });
-          pending.remove();
-          const trace = (result.toolTrace || []).map((item) => `${item.status}: ${item.tool}`).join('\n');
-          addMessage('assistant', result.message || '模型没有返回文本结果。', [`模型：${result.model || 'unknown'}`, skillLabel(result.skills)].filter(Boolean).join(' · '));
-          if (trace) addDetails(`工具调用：\n${trace}`);
+          const result = await requestStream(
+            '/v1/chat/stream',
+            { sessionId, instruction, skillIds: selectedSkillIds() },
+            (name, payload) => execution.event(name, payload),
+          );
+          execution.complete(result);
           setConnection('connected', 'Agent 已连接');
         } catch (error) {
-          pending.remove();
-          addMessage('assistant', `分析失败：${String(error)}`, '', 'error');
+          execution.fail(error);
           setConnection('error', '请求失败');
         } finally { busy = false; }
+      };
+
+      const startDatasheetReview = async () => {
+        if (busy) return;
+        if ([...skillSelect.options].some((option) => option.value === 'datasheet-review')) {
+          skillSelect.value = 'datasheet-review';
+        }
+        if (!instructionInput.value.trim()) {
+          instructionInput.value = '请审查当前原理图中指定芯片的供电、推荐工作条件、引脚连接、去耦和典型应用符合性，并逐项引用手册。芯片型号或位号：';
+          instructionInput.focus();
+          return;
+        }
+        await sendAnalysis();
       };
 
       const createPlan = async () => {
@@ -1183,6 +1401,7 @@
       document.querySelector('#clear').addEventListener('click', clearConversation);
       document.querySelector('#plugins').addEventListener('click', openMcpManager);
       document.querySelector('#knowledge').addEventListener('click', openKnowledgeManager);
+      document.querySelector('#datasheetReview').addEventListener('click', startDatasheetReview);
       document.querySelector('#mcpClose').addEventListener('click', () => { mcpManager.hidden = true; closeMcpEditor(); });
       document.querySelector('#mcpAdd').addEventListener('click', () => openMcpEditor());
       document.querySelector('#mcpReload').addEventListener('click', (event) => runMcpAction('registry', 'reload', event.currentTarget));

@@ -780,11 +780,20 @@ export class AgentStore {
     return row ? rowToKnowledgeChunk(row) : undefined;
   }
 
-  public searchKnowledge(query: string, sourceIds: string[], limit: number): KnowledgeSearchRow[] {
+  public searchKnowledge(
+    query: string,
+    sourceIds: string[],
+    limit: number,
+    documentIds: string[] = [],
+  ): KnowledgeSearchRow[] {
     const safeLimit = Math.max(1, Math.min(limit, 50));
     const sourceFilter = sourceIds.length > 0
       ? ` AND chunks.source_id IN (${sourceIds.map(() => "?").join(",")})`
       : "";
+    const documentFilter = documentIds.length > 0
+      ? ` AND chunks.document_id IN (${documentIds.map(() => "?").join(",")})`
+      : "";
+    const scopeParameters = [...sourceIds, ...documentIds];
     const trimmed = query.trim();
     let rows: SqlRow[];
     if (trimmed.length < 3) {
@@ -794,10 +803,10 @@ export class AgentStore {
         FROM knowledge_chunks chunks
         JOIN knowledge_documents documents ON documents.id = chunks.document_id
         JOIN knowledge_sources sources ON sources.id = chunks.source_id
-        WHERE chunks.content LIKE ?${sourceFilter} AND sources.enabled = 1
+        WHERE chunks.content LIKE ?${sourceFilter}${documentFilter} AND sources.enabled = 1
         ORDER BY documents.relative_path, chunks.ordinal
         LIMIT ?
-      `).all(`%${trimmed}%`, ...sourceIds, safeLimit) as SqlRow[];
+      `).all(`%${trimmed}%`, ...scopeParameters, safeLimit) as SqlRow[];
     } else {
       const expression = trimmed
         .split(/\s+/)
@@ -812,10 +821,10 @@ export class AgentStore {
         JOIN knowledge_chunks chunks ON chunks.id = knowledge_chunks_fts.chunk_id
         JOIN knowledge_documents documents ON documents.id = chunks.document_id
         JOIN knowledge_sources sources ON sources.id = chunks.source_id
-        WHERE knowledge_chunks_fts MATCH ?${sourceFilter} AND sources.enabled = 1
+        WHERE knowledge_chunks_fts MATCH ?${sourceFilter}${documentFilter} AND sources.enabled = 1
         ORDER BY score, documents.relative_path, chunks.ordinal
         LIMIT ?
-      `).all(expression, ...sourceIds, safeLimit) as SqlRow[];
+      `).all(expression, ...scopeParameters, safeLimit) as SqlRow[];
     }
     return rows.map((row) => ({
       ...rowToKnowledgeChunk(row),

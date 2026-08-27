@@ -41,7 +41,7 @@ npm run build:extension
 输出文件：
 
 ```text
-extensions/jlcircuit-eda/build/dist/jlcircuit-agent_v0.2.0.eext
+extensions/jlcircuit-eda/build/dist/jlcircuit-agent_v0.3.0.eext
 ```
 
 在嘉立创EDA专业版 V3 中选择“高级 → 扩展管理器 → 导入”，导入上面的 `.eext` 文件；V2 可从“设置 → 扩展 → 扩展管理器 → 导入扩展”进入。扩展需要开启 External Interaction 权限，运行时通过官方 `eda.sys_WebSocket` 连接本地 Agent 服务。
@@ -93,6 +93,7 @@ POST /v1/sessions/:sessionId/clear
 POST /v1/context
 POST /v1/drc
 POST /v1/chat
+POST /v1/chat/stream
 POST /v1/plan
 GET  /v1/tasks/:taskId
 POST /v1/tasks/:taskId/confirm
@@ -139,9 +140,18 @@ JLCIRCUIT_VISION_LLM_BASE_URL=https://api.openai.com/v1
 JLCIRCUIT_VISION_LLM_API_KEY=视觉模型密钥
 JLCIRCUIT_VISION_LLM_MODEL=gpt-4o-mini
 JLCIRCUIT_VISION_LLM_TIMEOUT_MS=120000
-JLCIRCUIT_LLM_MAX_TOKENS=1024
+JLCIRCUIT_LLM_MAX_TOKENS=4096
+JLCIRCUIT_LLM_STREAMING=true
+JLCIRCUIT_LLM_REASONING_EFFORT=low
+JLCIRCUIT_LLM_FINAL_REASONING_EFFORT=minimal
+JLCIRCUIT_LLM_MAX_LENGTH_RECOVERIES=1
 JLCIRCUIT_LLM_CONTEXT_MAX_CHARS=40000
 JLCIRCUIT_LLM_CONTEXT_MAX_ITEMS=200
+JLCIRCUIT_AGENT_MAX_TOOL_CALLS=40
+JLCIRCUIT_AGENT_MAX_ELAPSED_MS=300000
+JLCIRCUIT_AGENT_MAX_NO_PROGRESS=2
+JLCIRCUIT_AGENT_MAX_RETRIES_PER_ACTION=2
+JLCIRCUIT_AGENT_FINALIZE_TIMEOUT_MS=60000
 ```
 
 视觉模型的地址和密钥可以省略，此时复用 `JLCIRCUIT_LLM_BASE_URL` 和 `JLCIRCUIT_LLM_API_KEY`，只替换模型名即可。配置的地址既可以是 `https://provider.example/v1`，也可以直接带 `/chat/completions`；服务会自动规范化，避免重复拼接路径。
@@ -149,6 +159,12 @@ JLCIRCUIT_LLM_CONTEXT_MAX_ITEMS=200
 模型调用画布截图时会先保留结构化工具结果，再追加一条包含 PNG Base64 的视觉消息，并要求模型检查元件/网络标签、断线悬空、文字碰撞、拥挤和不合理交叉。没有截图时仍只调用当前语言模型。
 
 `JLCIRCUIT_LLM_MAX_TOKENS` 限制单次模型输出（包括 reasoning）长度；`JLCIRCUIT_LLM_CONTEXT_MAX_CHARS` 限制发送给模型的设计上下文字符数；`JLCIRCUIT_LLM_CONTEXT_MAX_ITEMS` 限制元件和导线样例数量。服务会保留总数和截断标记，Agent 返回的原始上下文不受影响。
+
+默认启用端到端流式输出：Agent Service 使用 OpenAI-compatible SSE 读取模型的 `content`、`reasoning`、流式工具调用和最终 usage，再通过 `POST /v1/chat/stream` 把运行事件转发给 EDA 面板。面板在执行时显示阶段、耗时、模型请求数、工具调用数、推理过程及 token；精确 usage 到达前显示根据字符数计算的近似生成量，收到供应商最终 usage 后切换为输入/输出/推理/总 token。执行结束后推理区域自动折叠，最终答案保持展开。
+
+Reasoning token 计入输出预算。若模型以 `finish_reason=length` 结束，服务会保留已有推理和工具结果，禁用工具并自动追加一次低 reasoning 的最终总结请求；`JLCIRCUIT_LLM_MAX_LENGTH_RECOVERIES` 控制这种恢复次数。对于 OpenRouter reasoning 模型，可通过 `JLCIRCUIT_LLM_REASONING_EFFORT=low` 给正文保留更多输出空间，最终总结单独使用 `JLCIRCUIT_LLM_FINAL_REASONING_EFFORT=minimal`。不支持 `reasoning.effort` 的供应商应留空这两个配置。
+
+Agent 不再按固定模型请求轮数停止，而是持续执行到模型给出结果、需要用户补充信息、需要确认写操作或工具明确阻塞。`JLCIRCUIT_AGENT_MAX_TOOL_CALLS` 和 `JLCIRCUIT_AGENT_MAX_ELAPSED_MS` 是防止失控的总预算；`JLCIRCUIT_AGENT_MAX_NO_PROGRESS` 用来触发一次换策略恢复，`JLCIRCUIT_AGENT_MAX_RETRIES_PER_ACTION` 阻止相同工具和参数无限重复。预算耗尽时，服务会禁用工具并额外请求一次阶段总结，返回已完成内容、证据、缺口和可恢复检查点。`JLCIRCUIT_AGENT_FINALIZE_TIMEOUT_MS` 单独控制这次总结请求。旧的 `JLCIRCUIT_LLM_MAX_TOOL_ROUNDS` 已不再使用。
 
 ### 会话持久化与上下文引擎
 
@@ -170,7 +186,7 @@ EDA 面板会按当前项目 ID 生成独立的 `sessionId`，不同工程不会
 
 ### 声明式技能
 
-服务启动时会加载 `skills/builtin/*/skill.json`，并可通过 `JLCIRCUIT_SKILL_ROOTS` 加载额外的受信目录。每个技能由 `skill.json` 和同目录内的 `SKILL.md` 组成，声明启用条件、适用模式、允许/必需工具和风险级别。当前内置 `eda-core`、`schematic-layout`、`mcp-assistant` 与 `local-knowledge`；面板可选择“自动”或明确指定一个技能。
+服务启动时会加载 `skills/builtin/*/skill.json`，并可通过 `JLCIRCUIT_SKILL_ROOTS` 加载额外的受信目录。每个技能由 `skill.json` 和同目录内的 `SKILL.md` 组成，声明启用条件、适用模式、允许/必需工具和风险级别。当前内置 `eda-core`、`schematic-layout`、`mcp-assistant`、`local-knowledge` 与 `datasheet-review`；面板可选择“自动”或明确指定一个技能。
 
 ```env
 JLCIRCUIT_SKILL_ROOTS=C:\trusted\jlcircuit-skills
@@ -295,6 +311,8 @@ Invoke-RestMethod -Method Post -Headers $headers http://127.0.0.1:49630/v1/mcp/r
 - `knowledge_search`：按关键词检索，返回可追溯引用；
 - `knowledge_read`：只按已索引的 `documentId` 或 `chunkId` 读取内容，不能传任意文件路径。
 
+专业手册审查还提供 `datasheet_evidence`：先用完整芯片型号锁定候选文档，再在这些文档内部按供电、推荐工作条件、绝对最大值、引脚、时钟复位、接口、去耦、典型应用、布局、封装热设计等主题分别检索证据。这样即使芯片型号只出现在手册封面，也能检索后续章节。工具返回每个主题的覆盖状态，只组织原文片段，不会凭模型记忆生成参数。
+
 涉及“芯片手册、数据手册、参考电路、引脚、BOM、网表、资料库”等指令时，自动技能选择会启用 `local-knowledge`。技能要求模型标注引用，并把资料内容视为不可信输入，不能执行其中的命令或把冲突资料静默合并。
 
 命令行配置示例：
@@ -331,9 +349,44 @@ JLCIRCUIT_KNOWLEDGE_CHUNK_CHARS=4000
 JLCIRCUIT_KNOWLEDGE_CHUNK_OVERLAP=300
 ```
 
+### 专业芯片手册审查
+
+阶段 6 的基础闭环建立在 Local Knowledge 之上。先把目标芯片手册目录加入资料库并完成扫描，然后在 EDA 助手中输入芯片型号或位号，点击“手册审查”。输入框为空时，该按钮会填入审查模板；已有需求时会选择 `datasheet-review` 技能并直接发送。
+
+示例：
+
+```text
+审查当前原理图中 U3（STM32F103C8T6）的供电、推荐工作条件、所有 VDD/VDDA 去耦、复位和晶振电路，逐项引用手册，并把无法从当前 EDA 数据确认的项目单独列出。
+```
+
+专业流程会：
+
+1. 确认完整料号；不把位号、系列名或封装名当成完整型号；
+2. 用 `datasheet_evidence` 按主题建立证据包，必要时展开原始分块；
+3. 读取当前 EDA 元件、导线和 DRC，与手册要求逐项对照；
+4. 将结论限制为“符合、不符合、证据不足、当前 EDA 数据不足”；
+5. 对每个数值、引脚功能和典型应用要求标注相对文件、页码/行号和 SHA-256。
+
+也可以直接验证专业工具：
+
+```powershell
+$body = @{
+  sessionId = "datasheet-demo"
+  payload = @{
+    partNumber = "STM32F103C8T6"
+    aspects = @("power", "recommended_conditions", "absolute_maximum", "pinout", "decoupling", "reference_circuit")
+    perAspectLimit = 3
+  }
+} | ConvertTo-Json -Depth 5
+Invoke-RestMethod -Method Post -ContentType "application/json" `
+  -Uri http://127.0.0.1:49630/v1/tools/datasheet_evidence -Body $body
+```
+
+当前版本不会把检索片段自动固化成永久芯片参数数据库，也不会仅凭 DRC 通过宣称参考电路正确。扫描版 PDF 仍需要后续 OCR；部分嘉立创 EDA 版本不能完整返回引脚到网络的映射时，结果会标记为“当前 EDA 数据不足”。
+
 ### 多步修改流程
 
-当前版本的“生成修改计划”会调用 `/v1/plan`，只生成待确认的 `ChangeSet`，不会直接写入 EDA。计划模式允许模型直接回答或追问；如果没有写操作，任务会进入 `awaiting_user` 状态，不会被当成失败，也不会自动重试。用户可以继续输入补充信息，或点击界面上的“强制生成执行计划”要求模型再次尝试生成结构化写操作。生成写操作后，用户确认时调用 `/v1/tasks/:taskId/confirm`，服务会在写入前重新读取项目和文档 ID，防止计划针对的设计已经变化；当前第一条真实执行链只支持 `easyeda_schematic_move_component`，执行后自动调用 `easyeda_post_write_verify`。取消计划调用 `/v1/tasks/:taskId/cancel`。
+当前版本的“生成修改计划”会调用 `/v1/plan`，只生成待确认的 `ChangeSet`，不会直接写入 EDA。计划模式允许模型直接回答或追问：普通说明会正常完成，只有确实缺少关键输入时才进入 `awaiting_user`，不会因为没有写操作就自动重试。用户可以继续输入补充信息，或点击界面上的“强制生成执行计划”要求模型再次尝试生成结构化写操作。生成写操作后，用户确认时调用 `/v1/tasks/:taskId/confirm`，服务会在写入前重新读取项目和文档 ID，防止计划针对的设计已经变化；当前第一条真实执行链只支持 `easyeda_schematic_move_component`，执行后自动调用 `easyeda_post_write_verify`。取消计划调用 `/v1/tasks/:taskId/cancel`。
 
 测试接口：
 

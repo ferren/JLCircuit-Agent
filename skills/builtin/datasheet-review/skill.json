@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "datasheet-review",
+  "name": "芯片手册与设计审查",
+  "version": "1.0.0",
+  "description": "按芯片型号提取带引用的手册证据，并与当前原理图的元件、连线和 DRC 进行交叉检查。",
+  "entry": "SKILL.md",
+  "enabledByDefault": true,
+  "riskLevel": "read",
+  "priority": 900,
+  "activation": {
+    "always": false,
+    "keywords": ["datasheet", "芯片手册", "数据手册", "手册审查", "芯片参数", "芯片选型", "选型", "引脚", "pinout", "典型应用", "application circuit", "参考电路", "供电", "电源", "supply voltage", "去耦", "绝对最大", "工作条件"],
+    "modes": ["chat", "plan"]
+  },
+  "tools": {
+    "allowed": [
+      "datasheet_evidence",
+      "knowledge_search",
+      "knowledge_read",
+      "easyeda_get_context",
+      "easyeda_schematic_components",
+      "easyeda_schematic_wires",
+      "easyeda_run_drc"
+    ],
+    "required": ["datasheet_evidence"]
+  }
+}

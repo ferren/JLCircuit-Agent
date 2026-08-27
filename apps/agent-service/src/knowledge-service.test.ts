@@ -36,9 +36,18 @@ test("Local Knowledge indexes text, BOM and PDF with citations and incremental c
   const markdownPath = join(sourceDirectory, "power.md");
   const bomPath = join(sourceDirectory, "bom.csv");
   const pdfPath = join(sourceDirectory, "stm32.pdf");
-  writeFileSync(markdownPath, "# 电源设计\n芯片供电电压为 3.3V。\n去耦电容应靠近 VDD 引脚。\n");
+  writeFileSync(markdownPath, [
+    "# 电源设计",
+    "芯片供电电压为 3.3V。",
+    "去耦电容应靠近 VDD 引脚。",
+    "STM32 device family notes.",
+    "background ".repeat(600),
+    "Decoupling bypass capacitor typical application reference circuit.",
+  ].join("\n"));
   writeFileSync(bomPath, "Designator,Value\nC1,100nF\nR1,10k\n");
-  writeFileSync(pdfPath, createSimplePdf("STM32 datasheet VDD 3.3V reference circuit"));
+  writeFileSync(pdfPath, createSimplePdf(
+    "STM32 datasheet VDD 3.3V supply voltage recommended operating conditions pin description decoupling bypass capacitor typical application reference circuit",
+  ));
   const store = new AgentStore(":memory:");
   const service = new KnowledgeService(store);
   try {
@@ -69,6 +78,23 @@ test("Local Knowledge indexes text, BOM and PDF with citations and incremental c
     assert.equal(pdfResults.length > 0, true);
     assert.equal(pdfResults[0]?.path, "stm32.pdf");
     assert.equal((pdfResults[0]?.citation as Record<string, unknown>).page, 1);
+    const evidenceResponse = await service.callTool("datasheet_evidence", "knowledge-test", {
+      partNumber: "STM32",
+      aspects: ["power", "pinout", "decoupling", "reference_circuit", "thermal_package"],
+      sourceIds: ["board-docs"],
+      perAspectLimit: 2,
+    });
+    assert.equal(evidenceResponse.ok, true);
+    const evidence = evidenceResponse.data as {
+      coverage: { covered: number; missing: string[] };
+      aspects: Array<{ aspect: string; evidence: Array<{ citation: { path: string; page?: number; lineStart?: number } }> }>;
+    };
+    assert.equal(evidence.coverage.covered, 4, JSON.stringify(evidence));
+    assert.deepEqual(evidence.coverage.missing, ["thermal_package"]);
+    assert.match(evidence.aspects.find((item) => item.aspect === "power")?.evidence[0]?.citation.path ?? "", /power\.md|stm32\.pdf/);
+    const referenceEvidence = evidence.aspects.find((item) => item.aspect === "reference_circuit")?.evidence[0];
+    assert.equal(referenceEvidence?.citation.path, "power.md");
+    assert.equal(Number(referenceEvidence?.citation.lineStart) > 1, true);
     const read = await service.callTool("knowledge_read", "knowledge-test", {
       chunkId: pdfResults[0]?.chunkId,
       maxChars: 10_000,
@@ -89,6 +115,12 @@ test("Local Knowledge indexes text, BOM and PDF with citations and incremental c
       chunkId: pdfResults[0]?.chunkId,
     });
     assert.equal(disabledRead.ok, false);
+    const disabledEvidence = await service.callTool("datasheet_evidence", "knowledge-test", {
+      partNumber: "STM32",
+      aspects: ["power"],
+      sourceIds: ["board-docs"],
+    });
+    assert.equal((disabledEvidence.data as { coverage: { covered: number } }).coverage.covered, 0);
     service.updateSource("board-docs", {
       id: "board-docs",
       name: "板卡资料",

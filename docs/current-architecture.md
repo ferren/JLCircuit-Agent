@@ -1,9 +1,9 @@
 # JLCircuit Agent 完整架构与实现状态
 
 > 文档状态：唯一维护的架构文档；同时描述当前实现和完整目标架构
-> 最后复核：2026-08-26
+> 最后复核：2026-08-27
 > Agent Service：0.1.0
-> 嘉立创 EDA 扩展：0.2.0
+> 嘉立创 EDA 扩展：0.3.0
 
 ## 1. 文档目的
 
@@ -25,7 +25,7 @@
 | **部分实现** | 主链路存在，但能力范围、兼容性或真实 EDA 验证仍不完整 |
 | **开发中** | 属于目标架构，当前没有可依赖的完整运行链路 |
 
-目前系统是一个带声明式 Skill Registry、MCP Gateway MVP 和 Local Knowledge MVP 的本地 EDA Agent。外部目录授权、PDF/文本解析、中英文全文检索和来源引用已经形成基础闭环；向量检索、OCR、完整插件安装/隔离生命周期、项目语义长期记忆、通用回滚和多数 PCB 写入能力仍为**开发中**。
+目前系统是一个带声明式 Skill Registry、MCP Gateway MVP、Local Knowledge MVP 和专业 Datasheet Review MVP 的本地 EDA Agent。外部目录授权、PDF/文本解析、中英文全文检索、按芯片/主题组织证据及与当前 EDA 数据交叉审查已经形成基础闭环；向量检索、OCR、结构化器件参数库、完整插件安装/隔离生命周期、项目语义长期记忆、通用回滚和多数 PCB 写入能力仍为**开发中**。
 
 ## 2. 架构原则与当前结论
 
@@ -38,6 +38,7 @@
   -> Context Engine 组装会话历史、任务和最新 EDA 快照
   -> Skill Registry 自动或显式选择工作流并裁剪可见工具
   -> 按需检索已授权的本地手册、BOM、网表并返回来源引用
+  -> Datasheet Review 按芯片和主题生成证据包，与 EDA 元件/连线/DRC 对照
   -> LLM 分析或生成结构化 ChangeSet
   -> 用户确认高风险操作
   -> EDA 扩展执行受限工具
@@ -62,7 +63,7 @@ flowchart TB
     subgraph UX[用户与嘉立创 EDA 前端]
         USER[自然语言与多轮交互<br/>已实现]:::done
         SELECT[当前项目/文档/选区<br/>已实现]:::done
-        PANEL[对话、计划、技能、MCP/资料库管理<br/>已实现]:::done
+        PANEL[流式对话、执行状态、Token/推理、计划、技能、MCP/资料库管理<br/>已实现]:::done
         PREVIEW[结构化差异预览与回滚入口<br/>开发中]:::developing
     end
 
@@ -74,7 +75,7 @@ flowchart TB
     end
 
     subgraph AGENT[主智能体编排层]
-        ORCH[任务编排与状态机<br/>部分实现]:::partial
+        ORCH[目标驱动 Supervisor、进展检测与任务状态机<br/>部分实现]:::partial
         INTENT[显式意图分类与专业路由<br/>开发中]:::developing
         PLANNER[多步规划 / ChangeSet<br/>部分实现]:::partial
         EXECUTOR[事务执行、旧值校验、回滚点<br/>开发中]:::developing
@@ -96,6 +97,7 @@ flowchart TB
         FILES[授权外部目录与受限文件读取<br/>已实现]:::done
         KNOWLEDGE[PDF / 文本 / BOM / 网表知识库 MVP<br/>部分实现]:::partial
         SEARCH[FTS 全文检索与来源引用已实现<br/>向量检索开发中]:::partial
+        DATASHEET[专业 Datasheet 证据包与审查技能 MVP<br/>部分实现]:::partial
     end
 
     subgraph MODELS[模型路由层]
@@ -145,6 +147,7 @@ flowchart TB
     ORCH --> MCP --> PLUGIN
     PLUGIN --> FILES --> KNOWLEDGE --> SEARCH
     SEARCH --> CTX
+    KNOWLEDGE --> DATASHEET --> CTX
     ORCH --> ROUTER
     ROUTER --> LANGUAGE
     ROUTER --> VISION
@@ -177,7 +180,7 @@ flowchart TB
 ```mermaid
 flowchart LR
     subgraph EDA[嘉立创 EDA 进程]
-        UI[助手 iframe：对话 / MCP / 资料库管理]
+        UI[助手 iframe：对话 / 手册审查 / MCP / 资料库管理]
         EXT[扩展入口]
         ADAPTER[EDA Adapter]
         API[嘉立创 EDA Pro API]
@@ -192,7 +195,7 @@ flowchart LR
         CONTEXT[Context Engine]
         SKILLS[Skill Registry]
         MCPGW[MCP Registry / Gateway]
-        KNOWLEDGE[Local Knowledge Service<br/>目录授权 / PDF.js / 分块 / FTS5]
+        KNOWLEDGE[Local Knowledge Service<br/>PDF.js / FTS5 / Datasheet evidence]
         LLM[LLM Router]
         CATALOG[静态工具目录]
         BRIDGE[WebSocket Bridge Gateway]
@@ -232,11 +235,11 @@ flowchart LR
 | --- | --- | --- | --- |
 | EDA 多轮交互面板 | 已实现 | 对话、计划、确认、历史、技能选择、MCP 配置与资料库管理 | 差异预览、任务树、回滚入口 |
 | Session / Context Engine | 已实现 | 项目隔离、消息、摘要、任务、最新快照 | 项目语义长期记忆与来源置信度 |
-| Agent Orchestrator | 部分实现 | Chat/Plan、ChangeSet、确认、单类写操作 | 显式意图节点、通用状态图、事务与恢复 |
-| Skill Registry | 已实现 | 声明式清单、提示、启停、自动选择、工具裁剪 | 依赖、签名、版本、安装和热更新 |
+| Agent Orchestrator | 部分实现 | 目标驱动工具循环、进展/重复检测、多维预算、阶段总结、Chat/Plan、ChangeSet、确认、单类写操作 | 显式意图节点、持久化子任务图、跨回合自动恢复、事务与回滚 |
+| Skill Registry | 已实现 | 声明式清单、提示、启停、自动选择、工具裁剪及专业手册审查工作流 | 依赖、签名、版本、安装和热更新 |
 | LLM Router | 部分实现 | 单语言路由及独立视觉路由 | 多供应商策略、重试、降级、成本/延迟策略 |
 | MCP / Plugin Gateway | 部分实现 | 官方客户端、stdio/HTTP、配置 CRUD、连接测试、能力查看、命名空间、allowlist、状态和审计 | OAuth、安装、自动重连、进程沙箱和外部写执行器 |
-| 外部资料与知识库 | 部分实现 | 授权目录、PDF/文本/BOM/网表解析、FTS5 中英文检索、页码/行号/哈希引用、管理界面 | OCR、向量/混合检索、网页采集、专业手册结构化抽取 |
+| 外部资料与知识库 | 部分实现 | 授权目录、PDF/文本/BOM/网表解析、FTS5 中英文检索、页码/行号/哈希引用、按芯片和主题构建证据包、管理界面 | OCR、向量/混合检索、网页采集、永久结构化器件参数库 |
 | EDA 工具 | 部分实现 | 读取、DRC、截图、实验性元件移动 | 完整原理图、PCB、BOM、规则和脚本工具 |
 | 执行与验证 | 部分实现 | 确认、项目校验、DRC、截图 | 通用前置条件、差异、事务、回滚和视觉评分 |
 | 持久化与审计 | 已实现 | SQLite 会话、消息、任务、技能、知识索引、快照、审计 | 制品存储、防篡改审计、保留和迁移策略 |
@@ -247,7 +250,7 @@ flowchart LR
 
 | 组件 | 所在进程 | 当前职责 |
 | --- | --- | --- |
-| 助手 iframe | 嘉立创 EDA | 用户输入、消息列表、计划卡片、确认/取消、历史恢复、MCP 与资料库管理 |
+| 助手 iframe | 嘉立创 EDA | 用户输入、消息列表、专业手册审查入口、计划卡片、确认/取消、历史恢复、MCP 与资料库管理 |
 | EDA 扩展入口 | 嘉立创 EDA | 打开 iframe、启动 Bridge Client |
 | EDA Adapter | 嘉立创 EDA | 调用官方 Pro API，读取图元、执行移动、DRC 和截图 |
 | Agent Service | 独立 Node.js 进程 | HTTP API、会话、任务、上下文、模型调用、知识索引、风险控制和审计 |
@@ -344,7 +347,8 @@ cancelled
 ```mermaid
 stateDiagram-v2
     [*] --> planning
-    planning --> awaiting_user: 只回答或需要补充信息
+    planning --> completed: 普通说明或分析答复
+    planning --> awaiting_user: 需要补充关键输入
     planning --> waiting_confirmation: 生成可执行 ChangeSet
     awaiting_user --> planning: 用户补充后发起新计划
     waiting_confirmation --> cancelled: 用户取消
@@ -455,6 +459,7 @@ skills/builtin/<skill-id>/SKILL.md
 | `schematic-layout` | 已实现 | 布局可读性分析和元件移动计划 | 只读工具 + 高风险移动工具 |
 | `mcp-assistant` | 已实现 | 调用管理员配置、启用和允许的 MCP 只读工具 | `mcp__*`，并受运行时风险过滤 |
 | `local-knowledge` | 已实现 | 检索芯片手册、参考电路、引脚、BOM 和网表并强制保留来源 | `knowledge_sources/search/read` 只读工具 |
+| `datasheet-review` | 已实现 | 按完整料号审查参数、引脚、去耦和典型应用，并与 EDA 元件/连线/DRC 对照 | `datasheet_evidence`、知识读取及 EDA 只读工具 |
 
 ### 7.2 每轮技能解析
 
@@ -512,12 +517,25 @@ flowchart LR
 - 当前解析 PDF、纯文本、Markdown、JSON、CSV/TSV、YAML、HTML/XML、BOM、网表和日志；PDF 使用 `pdfjs-dist` 逐页提取文本；
 - 按配置大小分块并保存文档/分块 SHA-256、PDF 页码或文本行号；
 - SQLite FTS5 使用 `trigram` tokenizer 支持中英文关键词检索；
-- `knowledge_sources`、`knowledge_search`、`knowledge_read` 都是只读模型工具，其中读取只能使用已索引的 `documentId`/`chunkId`，不能传任意绝对路径；
+- `knowledge_sources`、`knowledge_search`、`knowledge_read` 和 `datasheet_evidence` 都是只读模型工具，其中读取只能使用已索引的 `documentId`/`chunkId`，不能传任意绝对路径；
 - 返回模型的资料源和结果不包含根目录绝对路径，引用包含资料源、相对文件、页码或行号及哈希；
 - 同一资料源的并发扫描会合并为一个 Promise；批量扫描按源串行执行，避免同时解析大量 PDF；
 - 资料源增删改、扫描、检索和读取写入审计；删除资料源只删除 SQLite 索引，不修改原文件。
 
 当前索引是本机 SQLite 全文检索，不是向量数据库。图片型/扫描版 PDF 无 OCR，HTML 解析是简化文本抽取，参考原理图仅能按已支持的文本/网表格式索引，尚未解析嘉立创专有二进制设计文件。
+
+### 7.6 专业 Datasheet Review 当前已实现
+
+`datasheet_evidence` 不直接输出模型推测的芯片参数。它先通过文件名、标题和全文命中锁定最多 16 份候选文档，再只在候选文档内把一个完整料号按专业主题拆成多个检索任务，避免手册后续页面没有重复印刷料号时漏检。当前主题包括器件概述、选型订购、电源、绝对最大额定值、推荐工作条件、引脚、时钟复位、接口、去耦、典型应用、布局以及封装热设计。每个主题返回：
+
+- `found/missing` 覆盖状态；
+- 命中的原始分块、匹配术语和检索分数；
+- 相对文件、PDF 页码或文本行号、文档 SHA-256；
+- 资料缺口以及不得用模型记忆补齐的提示。
+
+`datasheet-review` 技能规定专业审查顺序：先确认完整料号，再构建证据包，必要时展开原文，然后读取 EDA 元件、导线和 DRC。最终结论只能是“符合、不符合、证据不足、当前 EDA 数据不足”，并强制区分绝对最大额定值与推荐工作条件。EDA 面板“手册审查”按钮会选择该技能并提供输入模板。
+
+当前所谓“交叉检查”由模型基于受控证据包和 EDA 结构化工具结果完成，不会把派生结论写入永久参数库。若 EDA API 未返回完整引脚到网络映射，必须标为数据不足；DRC 通过也不能替代典型应用审查。
 
 ## 8. SQLite 持久化
 
@@ -551,7 +569,7 @@ flowchart LR
 
 ### 9.1 模型协议
 
-Agent Service 使用 OpenAI-compatible `POST /chat/completions`，发送：
+Agent Service 使用 OpenAI-compatible `POST /chat/completions`，默认发送 `stream: true`，并解析供应商 SSE 中的正文、reasoning、工具调用片段、结束原因和 usage。非流式 JSON 响应仍作为兼容回退。请求还包含：
 
 - `model`；
 - `messages`；
@@ -560,15 +578,23 @@ Agent Service 使用 OpenAI-compatible `POST /chat/completions`，发送：
 - `temperature: 0.2`；
 - `max_tokens`。
 
+EDA 面板通过 `POST /v1/chat/stream` 接收第二层 SSE。事件包括上下文准备、模型请求、reasoning/content 增量、工具开始/完成、精确 token usage、最终结果和错误。OpenRouter 的精确 usage 位于最后一个 SSE 消息；到达前 UI 只显示明确标注的近似生成 token。模型请求超时按“流空闲时间”计算，每次收到数据都会重置，不会因为持续正常输出而触发总时长超时。
+
+如果模型以 `finish_reason=length` 结束，尤其是只有 reasoning 没有正文时，Supervisor 不再直接标记 `empty_response`。它会禁用工具、要求模型基于现有证据直接给出简洁结论，并使用独立的低 reasoning 配置；恢复仍失败才返回 `output_length/incomplete`。
+
 支持当前语言模型直接看图，或单独配置视觉模型。Base URL 可以是 `/v1` 根地址，也可以带 `/chat/completions`，服务会进行规范化。
 
-### 9.2 工具回合
+### 9.2 目标驱动工具循环
 
-模型最多执行 `JLCIRCUIT_LLM_MAX_TOOL_ROUNDS` 轮工具调用，默认 3 轮。
+模型工具循环不以固定请求轮数作为完成条件。Supervisor 持续执行“观察上下文 → 选择工具 → 记录证据 → 判断进展 → 继续或结束”，直到模型给出用户答复、缺少关键用户输入、产生待确认写操作，或工具明确阻塞。
+
+每次运行维护目标、模型请求数、工具调用数、连续无进展次数、相同动作重试次数和可恢复检查点。工具名、标准化参数及当前 EDA 快照版本共同组成动作指纹；相同动作返回相同结果不算新进展。第一次达到无进展阈值时要求模型换工具、缩小范围或说明缺口；恢复后仍无进展才进入 `blocked`。
+
+工具调用总数和运行时间仍有安全预算，但只作为异常熔断，不代表任务已经完成。预算触发后，Supervisor 禁用全部工具，额外执行一次最终总结请求，要求模型返回已完成工作、证据、未完成项、停止原因和继续方式。结果标记为 `incomplete` 并携带检查点，而不是返回固定的“超过工具轮数”。
 
 - Chat 模式：只执行 `riskLevel=read` 工具；写工具被阻止。
 - Plan 模式：只读工具正常执行；高风险工具转换为待确认的 `ChangeOperation`。
-- 没有写操作：允许模型直接回答或追问，任务进入 `awaiting_user`。
+- 没有写操作：允许模型直接回答或追问；普通信息答复进入 `completed`，确实缺少关键输入时由模型状态标记进入 `awaiting_user`。
 - “强制生成执行计划”：使用更明确的内部指令再次请求，但仍不允许模型猜测缺失参数。
 
 ## 10. 修改执行和验证
@@ -698,6 +724,7 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 | `knowledge_sources` | read | 可用 | 已授权资料源和索引统计，不返回绝对路径 |
 | `knowledge_search` | read | 可用 | 中英文全文检索及页码/行号/哈希引用 |
 | `knowledge_read` | read | 可用 | 仅按已索引文档或分块 ID 读取内容 |
+| `datasheet_evidence` | read | 可用 | 按完整料号和专业主题组织手册证据及覆盖缺口 |
 
 ## 13. HTTP API
 
@@ -741,6 +768,7 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 | GET | `/v1/sessions/:sessionId/audit` | 返回最近 200 条审计事件 |
 | POST | `/v1/sessions/:sessionId/clear` | 清除消息和摘要，保留任务与审计 |
 | POST | `/v1/chat` | 连续对话和只读工具分析 |
+| POST | `/v1/chat/stream` | SSE 连续对话；实时阶段、推理、正文、工具状态、Token 和最终结果 |
 | POST | `/v1/plan` | 生成 ChangeSet 或请求补充信息 |
 | GET | `/v1/tasks/:taskId` | 查询任务 |
 | POST | `/v1/tasks/:taskId/confirm` | 确认并执行写操作 |
@@ -808,8 +836,16 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 | `JLCIRCUIT_LLM_API_KEY` | API Key |
 | `JLCIRCUIT_LLM_MODEL` | 语言模型名 |
 | `JLCIRCUIT_LLM_TIMEOUT_MS` | 请求超时 |
-| `JLCIRCUIT_LLM_MAX_TOKENS` | 最大输出 token |
-| `JLCIRCUIT_LLM_MAX_TOOL_ROUNDS` | 最大工具轮数 |
+| `JLCIRCUIT_LLM_MAX_TOKENS` | 单次请求最大输出 token（含部分模型的 reasoning）；默认 `4096` |
+| `JLCIRCUIT_LLM_STREAMING` | 是否使用模型 SSE，默认 true |
+| `JLCIRCUIT_LLM_REASONING_EFFORT` | 普通请求 reasoning 强度；留空使用供应商默认 |
+| `JLCIRCUIT_LLM_FINAL_REASONING_EFFORT` | 最终总结和长度恢复 reasoning 强度；OpenRouter 默认 minimal |
+| `JLCIRCUIT_LLM_MAX_LENGTH_RECOVERIES` | `finish_reason=length` 后自动总结次数，默认 1 |
+| `JLCIRCUIT_AGENT_MAX_TOOL_CALLS` | 单次运行工具调用总预算，默认 40 |
+| `JLCIRCUIT_AGENT_MAX_ELAPSED_MS` | 单次运行时间预算，默认 300000ms |
+| `JLCIRCUIT_AGENT_MAX_NO_PROGRESS` | 触发换策略的连续无进展操作数，默认 2 |
+| `JLCIRCUIT_AGENT_MAX_RETRIES_PER_ACTION` | 相同动作额外重试次数，默认 2 |
+| `JLCIRCUIT_AGENT_FINALIZE_TIMEOUT_MS` | 预算触发后最终总结超时，默认 60000ms |
 
 ### 14.6 视觉模型
 
@@ -842,6 +878,7 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 - MCP 与资料库管理 API 共用回环地址、Origin allowlist 和可选统一管理 Token；
 - 本地资料源必须显式授权绝对目录，扫描跳过符号链接，并在读取前校验真实路径仍位于授权根目录；
 - 模型不能传文件路径读取本机文件，只能检索或读取已索引 ID，且返回模型的数据不含根目录绝对路径；
+- 专业手册工具只返回证据包和缺口，不把无来源的模型推测固化为芯片参数；
 - 截图 Base64 不写入审计数据库；
 - `.env`、数据库和密钥文件默认被 Git 忽略。
 
@@ -870,10 +907,11 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 7. 已能动态连接配置文件中的 MCP Server，但不支持插件自动安装、签名和版本升级。
 8. Skill Registry 目前只支持声明式提示与静态工具权限，不执行代码，也不支持依赖解析和热安装。
 9. 本地资料库目前只有 FTS5 全文检索，没有向量/混合检索、OCR、网页采集或嘉立创专有设计格式解析。
-10. 任务执行没有通用事务或自动回滚点。
-11. Bridge 只支持单个活动 EDA 连接。
-12. MCP 外部写工具不会提供给模型，也没有确认执行链。
-13. Node.js 内置 SQLite 在当前 Node 24 运行时可能打印 `ExperimentalWarning`。
+10. Datasheet Review 尚未建立永久结构化参数库、表格级解析器或文档版本优先级；交叉检查质量仍受 EDA 引脚/网络可见性限制。
+11. 任务执行没有通用事务或自动回滚点。
+12. Bridge 只支持单个活动 EDA 连接。
+13. MCP 外部写工具不会提供给模型，也没有确认执行链。
+14. Node.js 内置 SQLite 在当前 Node 24 运行时可能打印 `ExperimentalWarning`。
 
 ## 17. 完整目标架构的开发路线
 
@@ -887,7 +925,7 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 | 阶段 3：声明式 Skill Registry | 已实现 | 扫描、校验、自动/显式选择、提示注入、工具权限裁剪、状态持久化和 EDA 面板选择器；仍需扩大真实 EDA 多技能回归范围 |
 | 阶段 4：Plugin/MCP Gateway | 部分实现 | 官方 MCP Client、stdio/Streamable HTTP、配置管理界面、CRUD、连接测试、能力查看、发现、命名空间、allowlist、风险、超时和审计；OAuth、自动重连、安装沙箱及外部写执行仍在开发 |
 | 阶段 5：Local Knowledge | 部分实现 | 已完成授权目录、PDF/文本/BOM/网表解析、FTS5 检索、来源引用、管理界面和只读模型工具；向量检索、OCR、网页/专有设计格式解析仍在开发 |
-| 阶段 6：专业 Datasheet Skills | 开发中 | 芯片选型、引脚表、典型应用、参考网表与当前设计交叉校验 |
+| 阶段 6：专业 Datasheet Skills | 部分实现 | 已完成按完整料号/主题构建证据包、覆盖缺口、专业提示约束、手册审查入口及 EDA 元件/连线/DRC 交叉检查流程；表格结构化、版本优先级和参考网表自动比对仍在开发 |
 | 阶段 7：项目长期记忆 | 开发中 | 带来源、置信度和生效范围的约束、决策、器件和问题记录 |
 | 阶段 8：通用执行与回滚 | 开发中 | 旧值前置条件、差异预览、事务、回滚点、更多原理图/PCB/BOM/规则工具 |
 | 阶段 9：安全、观测与评测 | 开发中 | Token/鉴权、严格 CORS、Trace、指标、固定电路集、视觉和电气正确性评测 |
@@ -927,9 +965,25 @@ flowchart LR
     CITATION --> CONTEXT[Context Engine]
 ```
 
-当前已落地的是：资料源 CRUD、启停与增量扫描，PDF.js 逐页文本提取，文本行号定位，SQLite v4 文档/分块/FTS5 表，三项只读知识工具，`local-knowledge` 自动技能，以及 EDA 内资料库配置、文档错误查看和测试搜索界面。尚未实现 OCR、embedding、rerank、网页同步和专有原理图结构解析。
+当前已落地的是：资料源 CRUD、启停与增量扫描，PDF.js 逐页文本提取，文本行号定位，SQLite v4 文档/分块/FTS5 表，四项只读知识/手册工具，`local-knowledge` 自动技能，以及 EDA 内资料库配置、文档错误查看和测试搜索界面。尚未实现 OCR、embedding、rerank、网页同步和专有原理图结构解析。
 
-### 17.4 阶段 7：项目长期记忆（开发中）
+### 17.4 阶段 6：专业 Datasheet Skills（MVP 已实现，增强能力开发中）
+
+```mermaid
+flowchart LR
+    PART[完整料号/位号] --> EVIDENCE[datasheet_evidence<br/>按主题检索]
+    EVIDENCE --> COVERAGE[证据片段 + 引用 + 缺口]
+    COVERAGE --> EXPAND[knowledge_read<br/>展开上下文]
+    EDAFACT[EDA 元件 / 导线 / DRC] --> REVIEW[专业审查工作流]
+    EXPAND --> REVIEW
+    REVIEW --> RESULT[符合 / 不符合 / 证据不足 / EDA 数据不足]
+```
+
+基础闭环不预先猜测手册表格结构，而是把供电、推荐条件、极限值、引脚、时钟复位、接口、去耦、典型应用、布局和封装热设计分别检索。模型必须对具体数值、引脚功能和建议保留来源。多芯片选型比较时，对每个完整料号使用相同主题分别构建证据包。
+
+后续增强包括：PDF 表格和章节结构化解析、芯片/封装/温度后缀归一化、文档版本优先级、参考网表自动比对、器件参数缓存与失效规则，以及固定芯片集上的事实准确率评测。
+
+### 17.5 阶段 7：项目长期记忆（开发中）
 
 长期记忆与普通聊天摘要分开保存，目标记录包括：
 
@@ -941,7 +995,7 @@ flowchart LR
 
 模型推测不能自动升级为长期事实。写入长期记忆需要明确来源，并允许用户查看、修订和删除。
 
-### 17.5 阶段 8：通用执行器（开发中）
+### 17.6 阶段 8：通用执行器（开发中）
 
 目标执行器在每个操作中保存 `expectedBefore`、目标对象、可逆参数和验证规则。执行前比较旧值；执行中建立回滚点；执行后同时进行结构化、DRC/ERC 和视觉验证。任何一步失败都应停止剩余操作，并优先恢复到已知状态。
 
@@ -963,7 +1017,7 @@ npm run build:extension
 输出：
 
 ```text
-extensions/jlcircuit-eda/build/dist/jlcircuit-agent_v0.2.0.eext
+extensions/jlcircuit-eda/build/dist/jlcircuit-agent_v0.3.0.eext
 ```
 
 测试覆盖当前包括：
@@ -973,11 +1027,15 @@ extensions/jlcircuit-eda/build/dist/jlcircuit-agent_v0.2.0.eext
 - 较早消息滚动摘要；
 - Context Engine 合并历史、活动任务和最新 EDA 快照；
 - 跨项目会话污染阻止；
+- 目标驱动 Agent 可跨越三次工具请求继续运行，并在工具/时间预算或无进展熔断后执行无工具阶段总结；
+- 模型可区分普通完成、等待用户输入和工具阻塞，内部状态标记不会显示给用户；
 - Skill Registry 的 always、关键字和显式选择；
+- 内置 Datasheet Review 技能自动激活、专业证据工具与 EDA 只读权限联合裁剪；
 - 技能工具权限并集、启停持久化和非法清单诊断；
 - MCP stdio 与 Streamable HTTP 真实握手、能力发现和工具调用；
 - MCP allowlist、默认风险、启停持久化、Resources/Prompts 和不安全 HTTP 拒绝；
 - MCP 配置新增、更新、删除、原子持久化、独立连接测试和状态清理；
-- Local Knowledge 绝对目录授权、相对路径拒绝、文本/BOM/PDF 解析、中英文检索、页码/行号引用、绝对路径隐藏、增量扫描和删除文件清理。
+- Local Knowledge 绝对目录授权、相对路径拒绝、文本/BOM/PDF 解析、中英文检索、页码/行号引用、绝对路径隐藏、增量扫描和删除文件清理；
+- Datasheet evidence 按芯片和主题检索、主题覆盖/缺口、禁用资料源阻断以及引用完整性。
 
 真实 EDA API 行为、移动元件后的复杂连线、电气正确性和视觉可读性仍必须在嘉立创 EDA 中进行人工或设备环境验证。
