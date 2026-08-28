@@ -85,6 +85,7 @@ export interface SchematicWireSummary {
 export interface MoveComponentResult {
   primitiveId: string;
   requestedPosition: { x: number; y: number };
+  createdWireIds: string[];
   movedWireIds: string[];
   unresolvedWireIds: string[];
   connectionCheck: "passed" | "inconclusive" | "failed";
@@ -159,7 +160,8 @@ export class JlcEdaAdapter {
     const canReadComponents = Boolean(getMethod(this.eda.sch_PrimitiveComponent, "getAll"));
     const canReadWires = Boolean(getMethod(this.eda.sch_PrimitiveWire, "getAll"));
     const canModifyComponent = Boolean(getMethod(this.eda.sch_PrimitiveComponent, "modify"));
-    const canModifyWire = Boolean(getMethod(this.eda.sch_PrimitiveWire, "modify"));
+    const canCreateWire = Boolean(getMethod(this.eda.sch_PrimitiveWire, "create"));
+    const canDeleteWire = Boolean(getMethod(this.eda.sch_PrimitiveWire, "delete"));
     const canCaptureCanvas = Boolean(getMethod(this.eda.dmt_EditorControl, "getCurrentRenderedAreaImage"));
     const canLocateCanvas = Boolean(
       getMethod(this.eda.dmt_EditorControl, "zoomTo") || getMethod(this.eda.dmt_EditorControl, "zoomToRegion"),
@@ -181,9 +183,9 @@ export class JlcEdaAdapter {
           enabled: canModifyComponent,
           riskLevel: "high",
           beta: true,
-          reason: canModifyWire
-            ? "仅对可识别的引脚端点执行导线补偿；复杂分支仍需 DRC/ERC 和人工确认。"
-            : "原理图导线 modify API 不可用，只能修改元件坐标。",
+          reason: canCreateWire && canDeleteWire
+            ? "保留原导线并创建正交桥接线；创建失败时删除新线并回滚元件。复杂总线仍需人工确认。"
+            : "原理图导线 create/delete API 不完整；为避免断线，保持连接模式将拒绝移动。",
         },
         { name: "canvas_capture", enabled: canCaptureCanvas, riskLevel: "read", beta: true },
         { name: "canvas_locate", enabled: canLocateCanvas, riskLevel: "read", beta: true },
@@ -335,53 +337,134 @@ export class JlcEdaAdapter {
     if (!modifyComponent) throw new Error("SCH_PrimitiveComponent.modify is unavailable.");
     const component = await findPrimitive(componentApi, primitiveId);
     if (!component) throw new Error(`Schematic component not found: ${primitiveId}`);
+    const oldX = await readNumber(component, ["getState_X", "getState_x", "x"]);
+    const oldY = await readNumber(component, ["getState_Y", "getState_y", "y"]);
+    if (oldX === undefined || oldY === undefined) {
+      throw new Error(`Cannot read the current position of schematic component: ${primitiveId}`);
+    }
     const oldPins = await readPins(componentApi, primitiveId);
     const beforeWires = await this.getSchematicWires();
-    await modifyComponent.call(componentApi, primitiveId, { x, y });
-    const newPins = await readPins(componentApi, primitiveId);
-    const pinMoves = matchPinMoves(oldPins, newPins);
-    const movedWireIds: string[] = [];
-    if (preserveConnections && getMethod(wireApi, "modify")) {
-      for (const wire of beforeWires) {
-        const updatedLine = replaceLineEndpoints(wire.line, pinMoves);
-        if (!updatedLine || linesEqual(updatedLine, wire.line)) continue;
-        await getMethod(wireApi, "modify")?.call(wireApi, wire.primitiveId, { line: updatedLine });
-        movedWireIds.push(wire.primitiveId);
-      }
+    const pinMoves = oldPins.map((from) => ({
+      from,
+      to: { ...from, x: from.x + x - oldX, y: from.y + y - oldY },
+    }));
+    const createWire = getMethod(wireApi, "create");
+    const deleteWire = getMethod(wireApi, "delete");
+    if (preserveConnections && oldPins.length === 0) {
+      throw new Error("Cannot preserve connections because the component pin positions are unavailable. The component was not moved.");
     }
-    const afterWires = await this.getSchematicWires();
-    const unresolvedWireIds = preserveConnections
-      ? beforeWires.flatMap((wire) => {
-          const relevantMoves = pinMoves.filter((move) => linePoints(wire.line).some((point) => samePoint(point, move.from)));
-          if (relevantMoves.length === 0) return [];
-          const after = afterWires.find((candidate) => candidate.primitiveId === wire.primitiveId);
-          const stillAttached = after
-            ? relevantMoves.every((move) => linePoints(after.line).some((point) => samePoint(point, move.to)))
-            : false;
-          return stillAttached ? [] : [wire.primitiveId];
+    if (preserveConnections && (!createWire || !deleteWire)) {
+      throw new Error("Cannot preserve connections because SCH_PrimitiveWire.create/delete is unavailable. The component was not moved.");
+    }
+    const bridgePlans = preserveConnections
+      ? pinMoves.flatMap((move) => {
+          const attachedWires = beforeWires.filter((wire) =>
+            linePoints(wire.line).some((point) => samePoint(point, move.from)));
+          if (attachedWires.length === 0) return [];
+          const namedNets = [...new Set(attachedWires.map((wire) => wire.net).filter((net): net is string => Boolean(net)))];
+          if (namedNets.length > 1) {
+            throw new Error(
+              `Cannot preserve pin at (${move.from.x}, ${move.from.y}) because it touches multiple nets: ${namedNets.join(", ")}. ` +
+              "The component was not moved.",
+            );
+          }
+          return [{
+            move,
+            net: namedNets[0],
+            line: createOrthogonalBridgeLine(move.from, move.to),
+          }];
         })
       : [];
-    const save = payload.save === true;
-    if (save) await callMethod(this.eda.sch_Document, "save");
-    const connectionCheck = !preserveConnections
-      ? "inconclusive"
-      : unresolvedWireIds.length > 0
-        ? "failed"
-        : getMethod(componentApi, "getAllPinsByPrimitiveId")
-          ? "passed"
-          : "inconclusive";
-    return {
-      primitiveId,
-      requestedPosition: { x, y },
-      movedWireIds,
-      unresolvedWireIds,
-      connectionCheck,
-      warning:
-        connectionCheck === "passed"
-          ? "仅校验了可识别的导线端点；复杂分支、总线和网络标签仍需运行 DRC/ERC。"
-          : "官方 API 的图元修改不保证等价于界面拖拽，请人工检查导线连接。",
-      saved: save,
-    };
+    if (preserveConnections && bridgePlans.length === 0) {
+      throw new Error(
+        "Cannot preserve connections because no wire endpoints matched the component pins. The component was not moved. " +
+        "Use preserveConnections=false only after confirming that the component is intentionally unconnected.",
+      );
+    }
+    const createdWires: Array<{ primitiveId: string; move: { from: PinPosition; to: PinPosition } }> = [];
+    let componentMoved = false;
+    try {
+      const modifiedComponent = await modifyComponent.call(componentApi, primitiveId, { x, y });
+      componentMoved = true;
+      if (!modifiedComponent) throw new Error("SCH_PrimitiveComponent.modify returned no updated component.");
+      for (const plan of bridgePlans) {
+        const createdWire = await createWire?.call(wireApi, plan.line, plan.net);
+        if (!createdWire) {
+          throw new Error(`SCH_PrimitiveWire.create failed for pin at (${plan.move.to.x}, ${plan.move.to.y}).`);
+        }
+        const createdWireId = await readString(createdWire, ["getState_PrimitiveId", "getState_primitiveId", "primitiveId", "id"]);
+        const createdLine = await readLine(createdWire);
+        if (!createdWireId || !createdLine || !linePoints(createdLine).some((point) => samePoint(point, plan.move.to))) {
+          throw new Error(`SCH_PrimitiveWire.create returned an unverifiable bridge for pin at (${plan.move.to.x}, ${plan.move.to.y}).`);
+        }
+        createdWires.push({ primitiveId: createdWireId, move: plan.move });
+      }
+      const currentComponent = await findPrimitive(componentApi, primitiveId);
+      const currentX = await readNumber(currentComponent, ["getState_X", "getState_x", "x"]);
+      const currentY = await readNumber(currentComponent, ["getState_Y", "getState_y", "y"]);
+      if (currentX === undefined || currentY === undefined || !samePoint({ x: currentX, y: currentY }, { x, y })) {
+        throw new Error("Component position verification failed after modify.");
+      }
+      let unresolvedWireIds = createdWires.map((wire) => wire.primitiveId);
+      for (const settleMs of [0, 50, 150, 300, 500]) {
+        if (settleMs > 0) await waitFor(settleMs);
+        const verificationResults = await Promise.all(createdWires.map(async (created) => {
+          const currentWire = await findPrimitive(wireApi, created.primitiveId);
+          const currentLine = await readLine(currentWire);
+          return currentLine && linePoints(currentLine).some((point) => samePoint(point, created.move.to))
+            ? undefined
+            : created.primitiveId;
+        }));
+        unresolvedWireIds = verificationResults.filter((wireId): wireId is string => typeof wireId === "string");
+        if (unresolvedWireIds.length === 0) break;
+      }
+      const save = payload.save === true;
+      if (save) await callMethod(this.eda.sch_Document, "save");
+      const connectionCheck = preserveConnections && unresolvedWireIds.length === 0 ? "passed" : "inconclusive";
+      const createdWireIds = createdWires.map((wire) => wire.primitiveId);
+      return {
+        primitiveId,
+        requestedPosition: { x, y },
+        createdWireIds,
+        movedWireIds: createdWireIds,
+        unresolvedWireIds,
+        connectionCheck,
+        warning:
+          connectionCheck === "passed"
+            ? "已保留原导线、创建正交桥接线并复核新引脚端点；复杂总线和网络标签仍需运行 DRC/ERC。"
+            : unresolvedWireIds.length > 0
+              ? `桥接线创建调用已成功，但 EDA 读模型暂未返回 ${unresolvedWireIds.join(", ")}；未自动回滚，请立即执行 DRC/ERC 和画布检查。`
+              : "没有检测到落在器件引脚上的导线端点；元件可能未接线，仍需人工检查。",
+        saved: save,
+      };
+    } catch (error) {
+      const rollbackErrors: string[] = [];
+      for (const created of [...createdWires].reverse()) {
+        try {
+          const deleted = await deleteWire?.call(wireApi, created.primitiveId);
+          if (deleted !== true) rollbackErrors.push(`created wire rollback returned no success: ${created.primitiveId}`);
+        } catch (rollbackError) {
+          rollbackErrors.push(`created wire rollback failed for ${created.primitiveId}: ${String(rollbackError)}`);
+        }
+      }
+      if (componentMoved) {
+        try {
+          const rolledBackComponent = await modifyComponent.call(componentApi, primitiveId, { x: oldX, y: oldY });
+          if (!rolledBackComponent) rollbackErrors.push("component rollback returned no result");
+        } catch (rollbackError) {
+          rollbackErrors.push(`component rollback failed: ${String(rollbackError)}`);
+        }
+      }
+      if (payload.save === true && rollbackErrors.length === 0) {
+        try { await callMethod(this.eda.sch_Document, "save"); } catch (saveError) {
+          rollbackErrors.push(`saving rollback failed: ${String(saveError)}`);
+        }
+      }
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(rollbackErrors.length === 0
+        ? `${reason} The component and created bridge wires were rolled back.`
+        : `${reason} Automatic rollback was incomplete: ${rollbackErrors.join("; ")}`);
+    }
   }
 }
 
@@ -534,41 +617,31 @@ const readLine = async (wire: unknown): Promise<Array<number> | Array<Array<numb
   return undefined;
 };
 
+const flatLinePoints = (line: Array<number>): PinPosition[] =>
+  line.reduce<PinPosition[]>((points, value, index, values) => {
+    if (index % 2 === 0 && typeof values[index + 1] === "number") points.push({ x: value, y: values[index + 1] });
+    return points;
+  }, []);
+
 const linePoints = (line: Array<number> | Array<Array<number>>): PinPosition[] =>
   line.length === 0
     ? []
     : typeof line[0] === "number"
-      ? (line as Array<number>).reduce<PinPosition[]>((points, value, index, values) => {
-          if (index % 2 === 0 && typeof values[index + 1] === "number") points.push({ x: value, y: values[index + 1] });
-          return points;
-        }, [])
-      : (line as Array<Array<number>>).map(([x, y]) => ({ x, y }));
+      ? flatLinePoints(line as Array<number>)
+      : (line as Array<Array<number>>).flatMap((segment) => flatLinePoints(segment));
 
-const replaceLineEndpoints = (
-  line: Array<number> | Array<Array<number>>,
-  moves: Array<{ from: PinPosition; to: PinPosition }>,
-): Array<number> | Array<Array<number>> | undefined => {
-  const points = linePoints(line);
-  if (points.length < 2) return undefined;
-  const updated = points.map((point, index) => {
-    if (index !== 0 && index !== points.length - 1) return point;
-    return moves.find((move) => samePoint(point, move.from))?.to ?? point;
-  });
-  return typeof line[0] === "number"
-    ? updated.flatMap((point) => [point.x, point.y])
-    : updated.map((point) => [point.x, point.y]);
-};
+const createOrthogonalBridgeLine = (from: PinPosition, to: PinPosition): Array<number> =>
+  sameCoordinate(from.x, to.x) || sameCoordinate(from.y, to.y)
+    ? [from.x, from.y, to.x, to.y]
+    : [from.x, from.y, to.x, from.y, to.x, to.y];
 
-const matchPinMoves = (before: PinPosition[], after: PinPosition[]) =>
-  before.length === after.length ? before.map((from, index) => ({ from, to: after[index] })) : [];
+const sameCoordinate = (left: number, right: number): boolean => Math.abs(left - right) < 1e-6;
 
 const samePoint = (left: PinPosition, right: PinPosition): boolean =>
-  Math.abs(left.x - right.x) < 1e-6 && Math.abs(left.y - right.y) < 1e-6;
+  sameCoordinate(left.x, right.x) && sameCoordinate(left.y, right.y);
 
-const linesEqual = (
-  left: Array<number> | Array<Array<number>>,
-  right: Array<number> | Array<Array<number>>,
-): boolean => JSON.stringify(left) === JSON.stringify(right);
+const waitFor = (milliseconds: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 const requireString = (value: unknown, name: string): string => {
   if (typeof value !== "string" || value.length === 0) throw new Error(`${name} must be a non-empty string.`);

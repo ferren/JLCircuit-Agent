@@ -41,7 +41,7 @@ npm run build:extension
 输出文件：
 
 ```text
-extensions/jlcircuit-eda/build/dist/jlcircuit-agent_v0.3.0.eext
+extensions/jlcircuit-eda/build/dist/jlcircuit-agent_v0.3.8.eext
 ```
 
 在嘉立创EDA专业版 V3 中选择“高级 → 扩展管理器 → 导入”，导入上面的 `.eext` 文件；V2 可从“设置 → 扩展 → 扩展管理器 → 导入扩展”进入。扩展需要开启 External Interaction 权限，运行时通过官方 `eda.sys_WebSocket` 连接本地 Agent 服务。
@@ -160,7 +160,9 @@ JLCIRCUIT_AGENT_FINALIZE_TIMEOUT_MS=60000
 
 `JLCIRCUIT_LLM_MAX_TOKENS` 限制单次模型输出（包括 reasoning）长度；`JLCIRCUIT_LLM_CONTEXT_MAX_CHARS` 限制发送给模型的设计上下文字符数；`JLCIRCUIT_LLM_CONTEXT_MAX_ITEMS` 限制元件和导线样例数量。服务会保留总数和截断标记，Agent 返回的原始上下文不受影响。
 
-默认启用端到端流式输出：Agent Service 使用 OpenAI-compatible SSE 读取模型的 `content`、`reasoning`、流式工具调用和最终 usage，再通过 `POST /v1/chat/stream` 把运行事件转发给 EDA 面板。面板在执行时显示阶段、耗时、模型请求数、工具调用数、推理过程及 token；精确 usage 到达前显示根据字符数计算的近似生成量，收到供应商最终 usage 后切换为输入/输出/推理/总 token。执行结束后推理区域自动折叠，最终答案保持展开。
+默认启用端到端流式输出：Agent Service 使用 OpenAI-compatible SSE 读取模型的 `content`、`reasoning`、流式工具调用和最终 usage，再通过 `POST /v1/chat/stream` 把运行事件转发给 EDA 面板。面板顶部具有位于对话滚动区之外的常驻运行状态栏，持续显示阶段、耗时、模型请求数、工具调用数及 token，执行结束后保留最近一次状态和最终用量。精确 usage 到达前显示根据字符数计算的近似生成量，收到供应商最终 usage 后切换为输入/输出/推理/总 token。思考区默认跟随最新输出滚到底部；用户向上滚动后暂停跟随，手动回到底部时自动恢复。执行结束后推理区域自动折叠，最终答案保持展开。
+
+助手回复支持常用 Markdown 格式，包括标题、粗体/斜体、列表、引用、表格、链接、行内代码和 fenced code block；流式输出与历史消息使用同一渲染器，代码和链接会以安全 DOM 节点呈现。
 
 Reasoning token 计入输出预算。若模型以 `finish_reason=length` 结束，服务会保留已有推理和工具结果，禁用工具并自动追加一次低 reasoning 的最终总结请求；`JLCIRCUIT_LLM_MAX_LENGTH_RECOVERIES` 控制这种恢复次数。对于 OpenRouter reasoning 模型，可通过 `JLCIRCUIT_LLM_REASONING_EFFORT=low` 给正文保留更多输出空间，最终总结单独使用 `JLCIRCUIT_LLM_FINAL_REASONING_EFFORT=minimal`。不支持 `reasoning.effort` 的供应商应留空这两个配置。
 
@@ -195,9 +197,9 @@ JLCIRCUIT_SKILL_MAX_ACTIVE=3
 JLCIRCUIT_SKILL_MAX_INSTRUCTION_CHARS=20000
 ```
 
-自动模式会启用 always 技能，并按用户指令关键字选择专用技能。模型只会看到这些技能联合允许的工具；Chat 模式仍禁止写入，Plan 模式仍只产生待确认 ChangeSet。技能启停状态保存在 SQLite。技能入口必须留在自身目录内，未知工具、重复 ID、越界入口和过大的说明文件会被拒绝。当前技能是声明和提示词，不会执行技能目录中的任意脚本；外部 MCP 工具由下述 MCP 插件网关独立加载和约束。
+自动模式会启用 always 技能，并按用户指令关键字选择专用技能。模型只会看到这些技能联合允许的工具；只读工具可以在对话中执行，写工具只会转换为待确认的 `ChangeSet`，不会在模型回合中直接写入。技能启停状态保存在 SQLite。技能入口必须留在自身目录内，未知工具、重复 ID、越界入口和过大的说明文件会被拒绝。当前技能是声明和提示词，不会执行技能目录中的任意脚本；外部 MCP 工具由下述 MCP 插件网关独立加载和约束。
 
-`POST /v1/chat` 和 `POST /v1/plan` 可传 `skillIds` 数组明确选择技能；省略时自动选择：
+`POST /v1/chat`、`POST /v1/chat/stream` 和兼容接口 `POST /v1/plan` 可传 `skillIds` 数组明确选择技能；省略时自动选择：
 
 ```json
 {"sessionId":"demo","instruction":"检查并改善原理图布局","skillIds":["schematic-layout"]}
@@ -386,7 +388,9 @@ Invoke-RestMethod -Method Post -ContentType "application/json" `
 
 ### 多步修改流程
 
-当前版本的“生成修改计划”会调用 `/v1/plan`，只生成待确认的 `ChangeSet`，不会直接写入 EDA。计划模式允许模型直接回答或追问：普通说明会正常完成，只有确实缺少关键输入时才进入 `awaiting_user`，不会因为没有写操作就自动重试。用户可以继续输入补充信息，或点击界面上的“强制生成执行计划”要求模型再次尝试生成结构化写操作。生成写操作后，用户确认时调用 `/v1/tasks/:taskId/confirm`，服务会在写入前重新读取项目和文档 ID，防止计划针对的设计已经变化；当前第一条真实执行链只支持 `easyeda_schematic_move_component`，执行后自动调用 `easyeda_post_write_verify`。取消计划调用 `/v1/tasks/:taskId/cancel`。
+EDA 面板中的普通问题和修改要求统一调用 `/v1/chat/stream`。模型可以直接回答、要求用户补充必要参数，也可以调用当前技能允许的写工具；写工具调用不会立即执行，而是被记录为待确认的 `ChangeSet`，并在同一轮流式响应结束后显示“确认执行”按钮。登记 ChangeSet 不要求用户预先回复“确认”或“登记”；如果模型错误地提前索要这类口头确认，Supervisor 会在同一请求内自动纠偏一次，要求其直接登记操作，避免增加无效用户轮次。顶部“优先生成修改方案”只是同一接口的快捷入口：它会附加更明确的内部指令并启用 `schematic-layout` 技能，不再使用独立的非流式执行通道。`/v1/plan` 目前仅为旧客户端保留。
+
+两种入口都会实时显示阶段、推理、工具调用和 token 消耗。没有写操作是合法结果：说明类问题会正常完成，信息不足时模型会明确追问；只有实际生成了可执行操作，界面才显示确认入口。用户可点击任务卡片的“确认执行”，也可以在存在待确认任务时输入精确确认词“执行”或“确认执行”；两种方式都会调用 `/v1/tasks/:taskId/confirm`，服务会校验任务状态和 confirmation token，并在写入前重新读取项目和文档 ID，防止计划针对的设计已经变化。当前第一条真实执行链只支持 `easyeda_schematic_move_component`，执行后自动调用 `easyeda_post_write_verify`；取消任务调用 `/v1/tasks/:taskId/cancel`。
 
 测试接口：
 
@@ -399,7 +403,7 @@ Invoke-RestMethod -Method Post `
 
 嘉立创EDA扩展从 `ws://127.0.0.1:49630/bridge` 主动连接 Agent 服务。当前已实现上下文、原理图元件、导线、DRC，以及实验性的 `easyeda_schematic_move_component`。
 
-移动元件工具只对可识别的引脚导线端点做补偿，复杂分支、总线和网络标签仍要求 DRC/ERC 与人工确认；写入必须显式传入 `confirmWrite: true`。
+移动元件工具不再调用实际环境中无法可靠更新既有复杂导线的 `SCH_PrimitiveWire.modify`。保持连接时，扩展保留全部原导线，按旧引脚到新引脚创建独立的水平/垂直桥接线，并使用原网络名辅助网络继承；任一桥接线创建失败时，会删除本轮已创建的桥接线并回滚元件。若创建调用已返回有效图元，但 EDA 的读取模型暂时看不到新线，则保留修改并返回 `connectionCheck=inconclusive`，交由紧随其后的 DRC/ERC 和截图复核，避免因读取缓存滞后误回滚。无法读取引脚、缺少 `SCH_PrimitiveWire.create/delete`，或没有找到任何与引脚匹配的导线端点时，则在移动前拒绝执行。确认元件原本未接线时，才可显式传入 `preserveConnections: false`。复杂总线和网络标签仍要求 DRC/ERC 与人工确认；写入必须显式传入 `confirmWrite: true`。
 
 视觉验证工具使用嘉立创EDA的 `DMT_EditorControl`：先定位或缩放画布，再获取实际渲染区域 PNG。图片目前通过 Bridge JSON 的 Base64 内容块返回，便于支持视觉输入的模型直接查看；后续可替换成二进制帧或本地制品 URL。
 

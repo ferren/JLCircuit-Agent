@@ -309,10 +309,14 @@ const runModelTurn = async (
   options: { onEvent?: (event: AgentRunEvent) => void; signal?: AbortSignal } = {},
 ) => {
   log("[llm] turn started", { sessionId, mode, provider: process.env.JLCIRCUIT_MODEL_PROVIDER ?? "stub" });
+  const requestedPlanSkills = mode === "plan" && skillRegistry.list().some((skill) =>
+    skill.id === "schematic-layout" && skill.enabled)
+    ? [...new Set([...(requestedSkillIds ?? []), "schematic-layout"])]
+    : requestedSkillIds;
   const resolvedSkills = skillRegistry.resolve({
     instruction: userInstruction,
     mode,
-    requestedSkillIds,
+    requestedSkillIds: requestedPlanSkills,
   });
   const skillRefs = resolvedSkills.skills.map(({ id, name, version, reason }) => ({ id, name, version, reason }));
   const userMessage = contextEngine.beginTurn(sessionId, userInstruction, mode, { skills: skillRefs });
@@ -392,9 +396,51 @@ const buildPlanInstruction = (instruction: string, forceExecutionPlan: boolean):
     "请优先生成结构化写操作，不要只返回说明。",
     "如果缺少 primitiveId，先调用 easyeda_schematic_components 查找匹配的元件。",
     "信息足够时必须调用 easyeda_schematic_move_component；参数必须包含 primitiveId、x、y，并设置 preserveConnections=true。",
+    "不要要求用户先回复确认、登记或批准；调用写工具后系统会自动生成确认执行按钮。",
     "如果即使读取元件列表后仍然缺少关键信息，请明确指出需要用户补充什么，不要猜测参数。",
     `原始用户需求：${instruction}`,
   ].join("\n");
+};
+
+const createTaskFromResult = (
+  sessionId: string,
+  instruction: string,
+  result: Awaited<ReturnType<typeof runModelTurn>>,
+  persistWithoutOperations = false,
+): AgentTask | undefined => {
+  const changeSet = createChangeSet(result);
+  if (!persistWithoutOperations && changeSet.operations.length === 0) return undefined;
+  const now = new Date().toISOString();
+  const taskStatus: AgentTask["status"] = changeSet.operations.length > 0
+    ? "waiting_confirmation"
+    : result.status === "awaiting_user" || result.status === "incomplete"
+      ? "awaiting_user"
+      : result.status === "blocked"
+        ? "failed"
+        : "completed";
+  const task: AgentTask = {
+    taskId: crypto.randomUUID(),
+    sessionId,
+    instruction,
+    status: taskStatus,
+    model: result.model,
+    message: result.message,
+    context: result.context,
+    toolTrace: result.toolTrace,
+    changeSet,
+    confirmationToken: changeSet.operations.length > 0 ? crypto.randomUUID() : undefined,
+    skills: result.skills.map(({ id, name, version, reason }) => ({ id, name, version, reason })),
+    createdAt: now,
+    updatedAt: now,
+  };
+  store.saveTask(task);
+  store.appendAuditEvent({
+    sessionId,
+    taskId: task.taskId,
+    eventType: "task.created",
+    payload: { status: task.status, operationCount: task.changeSet.operations.length },
+  });
+  return task;
 };
 
 const taskView = (task: AgentTask) => ({ ...task });
@@ -471,6 +517,18 @@ const executeTask = async (task: AgentTask): Promise<boolean> => {
       ok: result.ok,
       data: result.ok ? result.data : undefined,
       error: result.ok ? undefined : result.error?.message,
+    });
+    if (!result.ok) break;
+  }
+
+  const executedOperationIds = new Set(operations.map((operation) => operation.operationId));
+  for (const operation of task.changeSet.operations) {
+    if (executedOperationIds.has(operation.id)) continue;
+    operations.push({
+      operationId: operation.id,
+      tool: operation.tool,
+      ok: false,
+      error: "前序写操作失败，为避免扩大影响，本操作未执行。",
     });
   }
 
@@ -770,10 +828,16 @@ const server = createServer(async (request, response) => {
     }
 
     if (request.method === "POST" && url.pathname === "/v1/chat/stream") {
-      const body = (await readBody(request)) as { sessionId?: string; instruction?: string; skillIds?: string[] };
+      const body = (await readBody(request)) as {
+        sessionId?: string;
+        instruction?: string;
+        skillIds?: string[];
+        forceExecutionPlan?: boolean;
+      };
       const sessionId = body.sessionId ?? "default";
       const instruction = body.instruction?.trim();
-      log(`[http] POST ${url.pathname}`, { sessionId, instructionLength: instruction?.length ?? 0 });
+      const forceExecutionPlan = body.forceExecutionPlan === true;
+      log(`[http] POST ${url.pathname}`, { sessionId, instructionLength: instruction?.length ?? 0, forceExecutionPlan });
       if (!instruction) {
         json(response, 400, { error: "invalid_request", message: "instruction is required." });
         return;
@@ -791,16 +855,19 @@ const server = createServer(async (request, response) => {
       try {
         const result = await runModelTurn(
           sessionId,
-          instruction,
+          buildPlanInstruction(instruction, forceExecutionPlan),
           "chat",
           instruction,
-          body.skillIds,
+          forceExecutionPlan
+            ? [...new Set([...(body.skillIds ?? []), "schematic-layout"])]
+            : body.skillIds,
           {
             signal: abortController.signal,
             onEvent: (event) => writeSse(response, event.type, event),
           },
         );
-        writeSse(response, "result", { sessionId, ...result });
+        const task = createTaskFromResult(sessionId, instruction, result);
+        writeSse(response, "result", { sessionId, ...result, task: task ? taskView(task) : undefined });
         writeSse(response, "done", { sessionId, status: result.status });
       } catch (error) {
         if (!abortController.signal.aborted) {
@@ -817,16 +884,31 @@ const server = createServer(async (request, response) => {
     }
 
     if (request.method === "POST" && url.pathname === "/v1/chat") {
-      const body = (await readBody(request)) as { sessionId?: string; instruction?: string; skillIds?: string[] };
+      const body = (await readBody(request)) as {
+        sessionId?: string;
+        instruction?: string;
+        skillIds?: string[];
+        forceExecutionPlan?: boolean;
+      };
       const sessionId = body.sessionId ?? "default";
       const instruction = body.instruction?.trim();
+      const forceExecutionPlan = body.forceExecutionPlan === true;
       log(`[http] POST ${url.pathname}`, { sessionId, instructionLength: instruction?.length ?? 0 });
       if (!instruction) {
         json(response, 400, { error: "invalid_request", message: "instruction is required." });
         return;
       }
-      const result = await runModelTurn(sessionId, instruction, "chat", instruction, body.skillIds);
-      json(response, 200, { sessionId, ...result });
+      const result = await runModelTurn(
+        sessionId,
+        buildPlanInstruction(instruction, forceExecutionPlan),
+        "chat",
+        instruction,
+        forceExecutionPlan
+          ? [...new Set([...(body.skillIds ?? []), "schematic-layout"])]
+          : body.skillIds,
+      );
+      const task = createTaskFromResult(sessionId, instruction, result);
+      json(response, 200, { sessionId, ...result, task: task ? taskView(task) : undefined });
       return;
     }
 
@@ -847,37 +929,7 @@ const server = createServer(async (request, response) => {
         instruction,
         body.skillIds,
       );
-      const changeSet = createChangeSet(result);
-      const now = new Date().toISOString();
-      const taskStatus: AgentTask["status"] = changeSet.operations.length > 0
-        ? "waiting_confirmation"
-        : result.status === "awaiting_user" || result.status === "incomplete"
-          ? "awaiting_user"
-          : result.status === "blocked"
-            ? "failed"
-            : "completed";
-      const task: AgentTask = {
-        taskId: crypto.randomUUID(),
-        sessionId,
-        instruction,
-        status: taskStatus,
-        model: result.model,
-        message: result.message,
-        context: result.context,
-        toolTrace: result.toolTrace,
-        changeSet,
-        confirmationToken: changeSet.operations.length > 0 ? crypto.randomUUID() : undefined,
-        skills: result.skills.map(({ id, name, version, reason }) => ({ id, name, version, reason })),
-        createdAt: now,
-        updatedAt: now,
-      };
-      store.saveTask(task);
-      store.appendAuditEvent({
-        sessionId,
-        taskId: task.taskId,
-        eventType: "task.created",
-        payload: { status: task.status, operationCount: task.changeSet.operations.length },
-      });
+      const task = createTaskFromResult(sessionId, instruction, result, true)!;
       json(response, 200, taskView(task));
       return;
     }
@@ -917,9 +969,8 @@ const server = createServer(async (request, response) => {
       task.updatedAt = new Date().toISOString();
       store.saveTask(task);
       store.appendAuditEvent({ sessionId: task.sessionId, taskId: task.taskId, eventType: "task.confirmed" });
-      let succeeded = false;
       try {
-        succeeded = await executeTask(task);
+        await executeTask(task);
       } catch (error) {
         task.status = "failed";
         task.execution = {
@@ -935,7 +986,7 @@ const server = createServer(async (request, response) => {
           payload: task.execution,
         });
       }
-      json(response, succeeded ? 200 : 502, taskView(task));
+      json(response, 200, taskView(task));
       return;
     }
 

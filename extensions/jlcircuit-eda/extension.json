@@ -3,7 +3,7 @@
   "uuid": "234378fa9bd24c41be893b5e7b0ce0f7",
   "displayName": "JLCircuit Agent",
   "description": "嘉立创智能电路助手：读取设计上下文并生成可确认的结构化变更。",
-  "version": "0.3.0",
+  "version": "0.3.8",
   "publisher": "JLCircuit Agent",
   "engines": {
     "eda": "^3.2.0"

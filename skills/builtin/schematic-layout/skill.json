@@ -10,7 +10,7 @@
   "priority": 100,
   "activation": {
     "always": false,
-    "keywords": ["移动", "布局", "排版", "可读性", "重叠", "交叉", "连线", "move", "layout"],
+    "keywords": ["移动", "修改", "调整", "整理", "集中", "重排", "布局", "排版", "可读性", "重叠", "交叉", "连线", "move", "modify", "layout"],
     "modes": ["chat", "plan"]
   },
   "tools": {

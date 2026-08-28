@@ -119,3 +119,20 @@ test("Built-in datasheet review skill combines evidence and EDA read tools", () 
     store.close();
   }
 });
+
+test("Built-in layout skill exposes confirmation-gated move operations in ordinary chat", () => {
+  const store = new AgentStore(":memory:");
+  try {
+    const registry = new SkillRegistry(store, [...JLCIRCUIT_TOOLS, ...KNOWLEDGE_TOOL_DEFINITIONS], {
+      roots: [resolve("skills/builtin")],
+    });
+    const resolved = registry.resolve({
+      instruction: "把电源元件集中到左侧并整理连线",
+      mode: "chat",
+    });
+    assert.equal(resolved.skills.some((skill) => skill.id === "schematic-layout"), true);
+    assert.equal(resolved.allowedToolNames.has("easyeda_schematic_move_component"), true);
+  } finally {
+    store.close();
+  }
+});

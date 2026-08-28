@@ -1,9 +1,9 @@
 # JLCircuit Agent 完整架构与实现状态
 
 > 文档状态：唯一维护的架构文档；同时描述当前实现和完整目标架构
-> 最后复核：2026-08-27
+> 最后复核：2026-08-28
 > Agent Service：0.1.0
-> 嘉立创 EDA 扩展：0.3.0
+> 嘉立创 EDA 扩展：0.3.8
 
 ## 1. 文档目的
 
@@ -13,7 +13,7 @@
 - 嘉立创 EDA 扩展、Agent Service、LLM、MCP/插件和数据层的目标关系；
 - 会话、上下文、工作记忆和任务状态的实际实现；
 - Skill Registry、插件、外部目录、芯片手册和参考电路的接入方式；
-- 只读分析、修改计划、用户确认、执行和视觉验证流程；
+- 统一对话、修改操作确认、执行和视觉验证流程；
 - HTTP、WebSocket、工具目录、配置和持久化数据结构；
 - 当前安全边界、已知限制和分阶段演进方向。
 
@@ -63,7 +63,7 @@ flowchart TB
     subgraph UX[用户与嘉立创 EDA 前端]
         USER[自然语言与多轮交互<br/>已实现]:::done
         SELECT[当前项目/文档/选区<br/>已实现]:::done
-        PANEL[流式对话、执行状态、Token/推理、计划、技能、MCP/资料库管理<br/>已实现]:::done
+        PANEL[统一流式 Markdown 对话、执行状态、Token/推理、确认任务、技能、MCP/资料库管理<br/>已实现]:::done
         PREVIEW[结构化差异预览与回滚入口<br/>开发中]:::developing
     end
 
@@ -110,7 +110,7 @@ flowchart TB
     subgraph TOOLS[工具与执行适配层]
         CATALOG[静态 EDA 工具目录<br/>已实现]:::done
         SCHREAD[原理图读取、DRC、截图<br/>部分实现]:::partial
-        SCHWRITE[元件移动并补偿部分导线<br/>部分实现]:::partial
+        SCHWRITE[元件移动并创建正交桥接线<br/>部分实现]:::partial
         PCBRW[PCB 布线、铺铜、规则修复<br/>开发中]:::developing
         BOM[BOM、器件库、封装校验<br/>开发中]:::developing
         SCRIPT[规则与自动检查脚本<br/>开发中]:::developing
@@ -233,9 +233,9 @@ flowchart LR
 
 | 层 | 当前状态 | 当前边界 | 下一完整能力 |
 | --- | --- | --- | --- |
-| EDA 多轮交互面板 | 已实现 | 对话、计划、确认、历史、技能选择、MCP 配置与资料库管理 | 差异预览、任务树、回滚入口 |
+| EDA 多轮交互面板 | 已实现 | 统一流式对话、修改确认、历史、技能选择、MCP 配置与资料库管理 | 差异预览、任务树、回滚入口 |
 | Session / Context Engine | 已实现 | 项目隔离、消息、摘要、任务、最新快照 | 项目语义长期记忆与来源置信度 |
-| Agent Orchestrator | 部分实现 | 目标驱动工具循环、进展/重复检测、多维预算、阶段总结、Chat/Plan、ChangeSet、确认、单类写操作 | 显式意图节点、持久化子任务图、跨回合自动恢复、事务与回滚 |
+| Agent Orchestrator | 部分实现 | 目标驱动工具循环、进展/重复检测、多维预算、阶段总结、统一对话、ChangeSet、确认、单类写操作 | 显式意图节点、持久化子任务图、跨回合自动恢复、事务与回滚 |
 | Skill Registry | 已实现 | 声明式清单、提示、启停、自动选择、工具裁剪及专业手册审查工作流 | 依赖、签名、版本、安装和热更新 |
 | LLM Router | 部分实现 | 单语言路由及独立视觉路由 | 多供应商策略、重试、降级、成本/延迟策略 |
 | MCP / Plugin Gateway | 部分实现 | 官方客户端、stdio/HTTP、配置 CRUD、连接测试、能力查看、命名空间、allowlist、状态和审计 | OAuth、安装、自动重连、进程沙箱和外部写执行器 |
@@ -310,7 +310,7 @@ Skill Registry 只加载声明式清单和 Markdown 工作流，不执行技能�
 
 ### 5.2 ChangeSet
 
-模型在计划模式下调用高风险工具时，不会立即执行，而是转换为 `ChangeOperation` 并收集到 `ChangeSet`：
+模型在统一对话中调用非只读工具时，不会立即执行，而是转换为 `ChangeOperation` 并收集到 `ChangeSet`：
 
 ```text
 ChangeSet
@@ -446,7 +446,7 @@ skills/builtin/<skill-id>/SKILL.md
 
 - `id`、名称、版本、描述和入口文件；
 - 默认启用状态、优先级和最大风险级别；
-- `always`、关键字和适用的 Chat/Plan 模式；
+- `always`、关键字和适用的运行模式；
 - `tools.allowed` 和 `tools.required`。
 
 加载时会检查技能 ID、重复项、入口越界、符号链接后的真实路径、说明文件大小、未知工具、必需工具和工具风险是否超过技能声明。启用/禁用覆盖状态写入 SQLite 的 `skill_states`。
@@ -465,7 +465,7 @@ skills/builtin/<skill-id>/SKILL.md
 
 ```mermaid
 flowchart LR
-    INPUT[用户指令 + Chat/Plan 模式] --> REQUESTED[显式 skillIds]
+    INPUT[用户指令 + 对话入口] --> REQUESTED[显式 skillIds]
     INPUT --> AUTO[always 与关键字自动匹配]
     REQUESTED --> VALIDATE[启用状态与模式校验]
     AUTO --> VALIDATE
@@ -473,10 +473,10 @@ flowchart LR
     LIMIT --> PROMPT[注入所选 SKILL.md]
     LIMIT --> UNION[合并 tools.allowed]
     UNION --> FILTER[裁剪模型可见工具]
-    FILTER --> SAFETY[叠加 Chat/Plan 与确认安全策略]
+    FILTER --> SAFETY[叠加风险分级与确认安全策略]
 ```
 
-技能权限只会缩小模型可见工具，不会扩大系统权限。即使技能允许高风险工具，Chat 模式仍阻止写入；Plan 模式仍只记录 ChangeSet；真实执行仍需要确认令牌和执行器 allowlist。
+技能权限只会缩小模型可见工具，不会扩大系统权限。即使技能允许高风险工具，模型回合也只会记录 `ChangeSet`；真实执行仍需要确认令牌和执行器 allowlist。外部 MCP 写工具当前不会进入执行链。
 
 ### 7.3 MCP Gateway 当前已实现
 
@@ -592,10 +592,11 @@ EDA 面板通过 `POST /v1/chat/stream` 接收第二层 SSE。事件包括上下
 
 工具调用总数和运行时间仍有安全预算，但只作为异常熔断，不代表任务已经完成。预算触发后，Supervisor 禁用全部工具，额外执行一次最终总结请求，要求模型返回已完成工作、证据、未完成项、停止原因和继续方式。结果标记为 `incomplete` 并携带检查点，而不是返回固定的“超过工具轮数”。
 
-- Chat 模式：只执行 `riskLevel=read` 工具；写工具被阻止。
-- Plan 模式：只读工具正常执行；高风险工具转换为待确认的 `ChangeOperation`。
+- 统一对话：只读工具正常执行；技能允许的非只读工具统一转换为待确认的 `ChangeOperation`，模型回合不执行写入。
+- 自动技能选择：修改、移动、布局、整理等请求会启用 `schematic-layout`，普通分析只使用所需只读技能。
+- 先登记、后确认：登记 ChangeSet 不需要口头确认；操作形成后由 UI 在同一轮显示确认按钮。模型若提前要求用户回复“确认”或“登记”，Supervisor 会在同一请求内自动纠偏一次。
 - 没有写操作：允许模型直接回答或追问；普通信息答复进入 `completed`，确实缺少关键输入时由模型状态标记进入 `awaiting_user`。
-- “强制生成执行计划”：使用更明确的内部指令再次请求，但仍不允许模型猜测缺失参数。
+- “优先生成修改方案”：仍调用同一个流式接口，只附加更明确的内部指令并显式启用 `schematic-layout`；它是快捷入口，不是独立模式。
 
 ## 10. 修改执行和验证
 
@@ -607,18 +608,18 @@ sequenceDiagram
     participant Bridge as WebSocket Bridge
     participant EDA as EDA Adapter
 
-    UI->>Agent: POST /v1/plan
+    UI->>Agent: POST /v1/chat/stream（自然语言修改要求）
     Agent->>Bridge: easyeda_get_context
     Bridge->>EDA: 读取当前设计
     Agent->>Agent: LLM 生成 ChangeSet
     Agent->>DB: 保存 waiting_confirmation 任务
-    Agent-->>UI: 计划 + confirmationToken
+    Agent-->>UI: 流式进度 + ChangeSet + confirmationToken
     UI->>Agent: POST /v1/tasks/:id/confirm
     Agent->>DB: 清除并持久化 confirmationToken
     Agent->>Bridge: 再次 easyeda_get_context
     Agent->>Agent: 比较 projectId/documentId
     Agent->>Bridge: easyeda_schematic_move_component
-    Bridge->>EDA: 修改元件并补偿可识别导线端点
+    Bridge->>EDA: 修改元件并创建正交桥接线
     Agent->>Bridge: easyeda_post_write_verify
     Bridge->>EDA: DRC/ERC + 画布截图
     Agent->>DB: 保存 completed/failed 和验证结果
@@ -638,14 +639,16 @@ sequenceDiagram
 
 `easyeda_schematic_move_component`：
 
-1. 读取元件旧引脚位置；
-2. 读取导线快照；
-3. 调用 `SCH_PrimitiveComponent.modify` 修改坐标；
-4. 重新读取引脚位置；
-5. 对能匹配旧引脚端点的导线首尾点执行补偿；
-6. 返回 `movedWireIds`、`unresolvedWireIds` 和 `connectionCheck`。
+1. 读取元件旧坐标、旧引脚位置和完整导线快照；
+2. 解析全部导线端点，按旧引脚坐标查找其当前连接线和网络名；
+3. 为每个已接线引脚预计算从旧位置到新位置的水平/垂直桥接路径；
+4. 无法读取引脚、缺少导线创建/删除能力，或没有任何导线端点与引脚匹配时，在移动前拒绝执行；只有确认元件原本未接线时才允许显式关闭 `preserveConnections`；
+5. 调用 `SCH_PrimitiveComponent.modify` 修改坐标，保留全部原导线，再通过 `SCH_PrimitiveWire.create` 为每个已接线引脚创建独立正交桥接线；
+6. 校验创建调用返回的图元，再通过按 ID 重读和短时重试等待画布读模型刷新；若返回图元有效但读模型仍不可见，则返回 `inconclusive` 并交给 DRC/ERC 和截图复核，不因缓存滞后自动回滚；
+7. 创建失败时删除本轮已创建的桥接线并恢复元件旧坐标；
+8. 成功时返回 `createdWireIds`、兼容字段 `movedWireIds`、`unresolvedWireIds` 和 `connectionCheck`。
 
-这不是编辑器鼠标拖拽行为的完全等价实现。复杂分支、总线、网络标签和特殊连线仍可能无法自动保持。
+这仍不是编辑器鼠标拖拽行为的完全等价实现。桥接线可能较长并穿过其他区域，复杂总线、网络标签和特殊连线仍可能无法自动保持，因此必须执行 DRC/ERC、截图和人工复核。
 
 ### 10.3 验证边界
 
@@ -675,7 +678,7 @@ EDA 扩展主动连接，并使用官方 `eda.sys_WebSocket.register/send/close`
   "type": "hello",
   "protocolVersion": 1,
   "client": "jlcircuit-eda-extension",
-  "extensionVersion": "0.2.0",
+  "extensionVersion": "0.3.8",
   "capabilities": {}
 }
 ```
@@ -720,7 +723,7 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 | `easyeda_canvas_capture` | read | Beta | 当前渲染区域 PNG |
 | `easyeda_canvas_capture_region` | read | Beta | 指定区域 PNG |
 | `easyeda_post_write_verify` | read | Beta | 上下文、DRC 和截图闭环 |
-| `easyeda_schematic_move_component` | high | Beta | 移动元件并补偿可识别导线端点 |
+| `easyeda_schematic_move_component` | high | Beta | 移动元件并为已接线引脚创建正交桥接线 |
 | `knowledge_sources` | read | 可用 | 已授权资料源和索引统计，不返回绝对路径 |
 | `knowledge_search` | read | 可用 | 中英文全文检索及页码/行号/哈希引用 |
 | `knowledge_read` | read | 可用 | 仅按已索引文档或分块 ID 读取内容 |
@@ -767,9 +770,9 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 | GET | `/v1/sessions/:sessionId` | 恢复会话、最近 100 条消息和最近 20 个任务 |
 | GET | `/v1/sessions/:sessionId/audit` | 返回最近 200 条审计事件 |
 | POST | `/v1/sessions/:sessionId/clear` | 清除消息和摘要，保留任务与审计 |
-| POST | `/v1/chat` | 连续对话和只读工具分析 |
-| POST | `/v1/chat/stream` | SSE 连续对话；实时阶段、推理、正文、工具状态、Token 和最终结果 |
-| POST | `/v1/plan` | 生成 ChangeSet 或请求补充信息 |
+| POST | `/v1/chat` | 统一非流式对话；可直接回答、追问或返回待确认 ChangeSet |
+| POST | `/v1/chat/stream` | 统一 SSE 对话；实时阶段、推理、正文、工具状态、Token、可选 ChangeSet 和最终结果 |
+| POST | `/v1/plan` | 旧客户端兼容接口；新 EDA 面板不再调用 |
 | GET | `/v1/tasks/:taskId` | 查询任务 |
 | POST | `/v1/tasks/:taskId/confirm` | 确认并执行写操作 |
 | POST | `/v1/tasks/:taskId/cancel` | 取消等待确认的任务 |
@@ -863,8 +866,7 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 
 - 服务默认只监听 `127.0.0.1`；
 - 模型不直接访问 EDA API；
-- Chat 模式阻止写工具；
-- Plan 模式只记录写操作，不立即执行；
+- 模型回合中的非只读工具只记录为待确认操作，不立即执行；
 - 写操作需要确认令牌；
 - 写入前重新校验项目和文档；
 - 项目级会话隔离；
@@ -908,7 +910,7 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 8. Skill Registry 目前只支持声明式提示与静态工具权限，不执行代码，也不支持依赖解析和热安装。
 9. 本地资料库目前只有 FTS5 全文检索，没有向量/混合检索、OCR、网页采集或嘉立创专有设计格式解析。
 10. Datasheet Review 尚未建立永久结构化参数库、表格级解析器或文档版本优先级；交叉检查质量仍受 EDA 引脚/网络可见性限制。
-11. 任务执行没有通用事务或自动回滚点。
+11. 任务执行没有通用事务或自动回滚点；元件移动工具已单独实现写前快照、失败回滚和端点复核。
 12. Bridge 只支持单个活动 EDA 连接。
 13. MCP 外部写工具不会提供给模型，也没有确认执行链。
 14. Node.js 内置 SQLite 在当前 Node 24 运行时可能打印 `ExperimentalWarning`。
@@ -920,7 +922,7 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 | 阶段 | 状态 | 主要交付 |
 | --- | --- | --- |
 | 阶段 0：EDA Bridge 与可视验证 | 部分实现 | WebSocket Bridge、上下文读取、DRC、截图、实验性元件移动；复杂连线和更多 EDA API 仍需验证 |
-| 阶段 1：多轮交互与安全计划 | 已实现 | Chat/Plan、允许正常回答或追问、ChangeSet、确认/取消、任务卡片 |
+| 阶段 1：多轮交互与安全计划 | 已实现 | 统一流式对话、允许正常回答或追问、ChangeSet、确认/取消、任务卡片 |
 | 阶段 2：上下文、会话与持久化 | 已实现 | 项目级会话、消息历史、滚动摘要、活动任务、EDA 快照、SQLite 和审计 |
 | 阶段 3：声明式 Skill Registry | 已实现 | 扫描、校验、自动/显式选择、提示注入、工具权限裁剪、状态持久化和 EDA 面板选择器；仍需扩大真实 EDA 多技能回归范围 |
 | 阶段 4：Plugin/MCP Gateway | 部分实现 | 官方 MCP Client、stdio/Streamable HTTP、配置管理界面、CRUD、连接测试、能力查看、发现、命名空间、allowlist、风险、超时和审计；OAuth、自动重连、安装沙箱及外部写执行仍在开发 |
@@ -1017,7 +1019,7 @@ npm run build:extension
 输出：
 
 ```text
-extensions/jlcircuit-eda/build/dist/jlcircuit-agent_v0.3.0.eext
+extensions/jlcircuit-eda/build/dist/jlcircuit-agent_v0.3.8.eext
 ```
 
 测试覆盖当前包括：

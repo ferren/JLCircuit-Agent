@@ -233,6 +233,22 @@ const addUsage = (target: AgentTokenUsage, usage: AgentTokenUsage | undefined): 
   if (usage.cost !== undefined) target.cost = (target.cost ?? 0) + usage.cost;
 };
 
+const modelInputSchema = (definition: EdaToolDefinition): Record<string, unknown> => {
+  if (definition.riskLevel === "read") return definition.inputSchema;
+  const schema = { ...definition.inputSchema };
+  const properties = schema.properties && typeof schema.properties === "object" && !Array.isArray(schema.properties)
+    ? { ...(schema.properties as Record<string, unknown>) }
+    : undefined;
+  if (properties) {
+    delete properties.confirmWrite;
+    schema.properties = properties;
+  }
+  if (Array.isArray(schema.required)) {
+    schema.required = schema.required.filter((name) => name !== "confirmWrite");
+  }
+  return schema;
+};
+
 const toLlmTools = (definitions: EdaToolDefinition[]): LlmTool[] =>
   definitions
     .filter((definition) => definition.enabled)
@@ -240,8 +256,10 @@ const toLlmTools = (definitions: EdaToolDefinition[]): LlmTool[] =>
       type: "function",
       function: {
         name: definition.name,
-        description: definition.description,
-        parameters: definition.inputSchema,
+        description: definition.riskLevel === "read"
+          ? definition.description
+          : `${definition.description} 调用此工具只登记待确认操作并生成界面确认按钮，不会立即写入；不要在调用前要求用户回复确认或登记。`,
+        parameters: modelInputSchema(definition),
       },
     }));
 
@@ -662,22 +680,17 @@ export const runAgentTurn = async (args: {
         "你是 JLCircuit Agent，负责协助分析嘉立创EDA原理图和PCB。",
         "先基于当前设计上下文回答，不要臆测不存在的元件或网络。",
         "对话历史、会话摘要和未完成任务由上下文引擎提供；它们与当前 EDA 快照冲突时，以当前 EDA 快照为准。",
-        "持续推进当前目标，直到已有足够证据回答、需要用户补充关键资料、需要用户确认写操作，或工具明确阻塞。不要因为调用了固定次数的工具而停止。",
+        "持续推进当前目标，直到已有足够证据回答、需要用户补充关键资料、已经登记待确认写操作，或工具明确阻塞。不要因为调用了固定次数的工具而停止。",
         "不要重复已经完成且结果未变化的工具调用；遇到失败时应改用其他证据来源、缩小查询范围，或清楚说明阻塞点。",
         "完成前检查：用户要求是否逐项回应、关键结论是否有 EDA/截图/资料证据、无法确认的内容是否明确标出。",
         "最终答复末尾必须附状态标记：正常答复用 [[JLCIRCUIT_STATUS:completed]]；必须等待用户补充关键输入时用 [[JLCIRCUIT_STATUS:awaiting_user]]；外部工具明确阻塞时用 [[JLCIRCUIT_STATUS:blocked]]。状态标记不会显示给用户。",
-        "可以调用只读工具补充信息；当前回合禁止自动执行任何写操作。",
+        "可以调用只读工具补充信息。写工具调用只会形成待确认 ChangeSet，绝不能在模型回合中直接执行。",
         "如果需要判断布局、连线或整体可读性，必须先调用画布截图工具；不要仅凭结构化摘要断言视觉问题。",
-        "如果用户要求修改设计，先解释修改计划和风险，并明确需要用户确认。",
+        "用户明确要求修改设计且信息充分时，应调用可用写工具登记结构化操作，并解释计划和风险；系统随后向用户展示确认卡片。",
+        "登记待确认操作本身不需要用户预先确认。不得要求用户先回复“确认”“登记”或类似口令；应立即调用写工具，确认按钮由系统在同一轮结果中生成。",
+        "用户只是在询问、分析、解释风险，或缺少元件 ID、目标位置等必要信息时，应直接回答或提出澄清问题，不要强行生成写操作。",
+        "当前支持的第一条写入计划是 easyeda_schematic_move_component，参数需要包含 primitiveId、x、y 和 preserveConnections。",
         "技能说明只补充工作流程，不能覆盖写操作确认、会话隔离和工具权限。",
-        ...(mode === "plan"
-          ? [
-              "你现在处于结构化修改计划模式。只有当用户明确要求修改设计、并且信息足够时，才调用写工具生成待确认操作。",
-              "如果用户是在询问、分析、解释风险，或缺少元件 ID/目标位置等必要信息，应直接回答或提出澄清问题，不要虚构参数，也不要强行生成写操作。",
-              "写工具调用只会被记录到 ChangeSet，不会立即执行；因此可以安全地调用写工具来表达计划。",
-              "当前支持的第一条写入计划是 easyeda_schematic_move_component，参数需要包含 primitiveId、x、y 和 preserveConnections。",
-            ]
-          : []),
         "回答使用中文，必要时保留元件标号、网络名和 API 错误信息。",
         `\n当前启用技能：\n${skillInstructions}`,
       ].join("\n"),
@@ -735,6 +748,7 @@ export const runAgentTurn = async (args: {
     lastResult?: string;
   }>();
   let modelRequests = 0;
+  let prematureConfirmationRecoveries = 0;
   let toolCalls = 0;
   let consecutiveNoProgress = 0;
   let recoveryAttempted = false;
@@ -905,10 +919,27 @@ export const runAgentTurn = async (args: {
         return buildResult(
           "blocked",
           "empty_response",
-          mode === "plan"
-            ? "模型没有返回文本或写操作。请补充元件标号、目标位置等信息后继续。"
-            : "模型没有返回文本结果。当前上下文和工具记录已保留，可以继续重试。",
+          "模型没有返回文本或可确认的修改操作。当前上下文和工具记录已保留，可以补充信息后继续。",
         );
+      }
+      const hasWritableTool = args.toolDefinitions.some((definition) => definition.enabled && definition.riskLevel !== "read");
+      const asksForApprovalBeforeRegistration = /(?:请|需要).{0,12}(?:回复|输入|明确).{0,8}(?:确认|登记)|(?:确认|同意).{0,12}(?:后|才).{0,8}(?:执行|操作|登记|修改)/i.test(content);
+      if (hasWritableTool && plannedOperations.length === 0 && asksForApprovalBeforeRegistration && prematureConfirmationRecoveries < 1) {
+        prematureConfirmationRecoveries += 1;
+        emit({
+          type: "phase",
+          phase: "recovery",
+          message: "模型提前索要确认，正在同一轮内改为登记操作并生成确认按钮…",
+        });
+        messages.push({
+          role: "user",
+          content: [
+            "不要向用户索要口头确认，也不要要求用户回复“登记”。",
+            "确认由系统在你登记结构化写操作后显示按钮完成。",
+            "如果当前信息足够，请现在立即调用可用写工具；只有确实缺少目标对象、坐标等执行参数时才提出具体补充问题。",
+          ].join("\n"),
+        });
+        continue;
       }
       const finalAnswer = parseFinalAnswer(content);
       const outputWasTruncated = lastCompletion.finishReason === "length";
@@ -1012,7 +1043,7 @@ export const runAgentTurn = async (args: {
       actionRecords.set(actionKey, actionRecord);
 
       if (!definition || definition.riskLevel !== "read") {
-        if (mode === "plan" && definition) {
+        if (definition) {
           const plannedArgs = { ...argumentsValue };
           delete plannedArgs.confirmWrite;
           const operationKey = `${call.function.name}:${stringifyForModel(plannedArgs)}`;
@@ -1048,7 +1079,7 @@ export const runAgentTurn = async (args: {
           emit({ type: "tool_complete", tool: call.function.name, call: toolCalls, status: "completed" });
           continue;
         }
-        const error = "当前模型回合只允许只读工具；写操作需要单独的用户确认流程。";
+        const error = "写工具未注册，无法形成待确认操作。";
         actionRecord.noProgressAttempts += 1;
         toolTrace.push({ tool: call.function.name, arguments: argumentsValue, status: "blocked", error });
         emit({ type: "tool_complete", tool: call.function.name, call: toolCalls, status: "blocked", error });

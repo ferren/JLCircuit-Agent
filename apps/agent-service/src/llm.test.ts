@@ -38,6 +38,21 @@ const readTool: EdaToolDefinition = {
   },
 };
 
+const writeTool: EdaToolDefinition = {
+  name: "test_write",
+  description: "Write test operation",
+  riskLevel: "high",
+  enabled: true,
+  inputSchema: {
+    type: "object",
+    required: ["target", "confirmWrite"],
+    properties: {
+      target: { type: "string" },
+      confirmWrite: { const: true },
+    },
+  },
+};
+
 type MockAssistant = {
   content?: string | null;
   reasoning?: string | null;
@@ -163,6 +178,86 @@ test("agent continues past three tool requests until the model completes", { con
       assert.equal(result.runState.modelRequests, 5);
       assert.equal(result.runState.toolCalls, 4);
       assert.equal(result.runState.stopReason, "model_completed");
+    },
+  );
+});
+
+test("ordinary chat records write tool calls as confirmation-required operations", { concurrency: false }, async () => {
+  await withMockModel(
+    [
+      {
+        content: null,
+        tool_calls: [{
+          id: "write-call-1",
+          type: "function",
+          function: { name: "test_write", arguments: JSON.stringify({ target: "U1" }) },
+        }],
+      },
+      { content: "已生成待确认修改。" },
+    ],
+    async (requests) => {
+      let executed = false;
+      const result = await runAgentTurn({
+        instruction: "修改 U1",
+        sessionId: "llm-test",
+        preparedContext,
+        toolDefinitions: [writeTool],
+        activeSkills: [],
+        mode: "chat",
+        executeTool: async (): Promise<ToolResponse> => {
+          executed = true;
+          return { requestId: crypto.randomUUID(), ok: true };
+        },
+      });
+
+      assert.equal(executed, false);
+      assert.equal(result.plannedOperations.length, 1);
+      assert.equal(result.plannedOperations[0]?.tool, "test_write");
+      assert.deepEqual(result.plannedOperations[0]?.args, { target: "U1" });
+      assert.equal(result.message, "已生成待确认修改。");
+      const tools = requests[0]?.tools as Array<{ function?: { description?: string; parameters?: Record<string, unknown> } }>;
+      const modelTool = tools[0]?.function;
+      assert.match(modelTool?.description ?? "", /不要在调用前要求用户回复确认或登记/);
+      assert.deepEqual(modelTool?.parameters?.required, ["target"]);
+      assert.equal(Object.hasOwn(modelTool?.parameters?.properties as object, "confirmWrite"), false);
+    },
+  );
+});
+
+test("premature confirmation requests are corrected within the same turn", { concurrency: false }, async () => {
+  await withMockModel(
+    [
+      { content: "请先回复确认，确认后我才能登记并执行修改。" },
+      {
+        content: null,
+        tool_calls: [{
+          id: "write-call-after-recovery",
+          type: "function",
+          function: { name: "test_write", arguments: JSON.stringify({ target: "U2" }) },
+        }],
+      },
+      { content: "已登记 U2 修改，请使用界面的确认执行按钮。" },
+    ],
+    async (requests) => {
+      const result = await runAgentTurn({
+        instruction: "修改 U2",
+        sessionId: "llm-test",
+        preparedContext,
+        toolDefinitions: [writeTool],
+        activeSkills: [],
+        mode: "chat",
+        executeTool: async (): Promise<ToolResponse> => {
+          assert.fail("write tools must not execute before UI confirmation");
+        },
+      });
+
+      assert.equal(requests.length, 3);
+      assert.equal(result.status, "awaiting_approval");
+      assert.equal(result.plannedOperations.length, 1);
+      assert.deepEqual(result.plannedOperations[0]?.args, { target: "U2" });
+      assert.equal(result.message, "已登记 U2 修改，请使用界面的确认执行按钮。");
+      const recoveryMessages = requests[1]?.messages as Array<{ role?: string; content?: string }>;
+      assert.match(recoveryMessages.at(-1)?.content ?? "", /不要向用户索要口头确认/);
     },
   );
 });
