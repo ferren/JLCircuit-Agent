@@ -120,7 +120,7 @@ test("Built-in datasheet review skill combines evidence and EDA read tools", () 
   }
 });
 
-test("Built-in layout skill exposes confirmation-gated move operations in ordinary chat", () => {
+test("Built-in layout skill exposes confirmation-gated schematic write operations in ordinary chat", () => {
   const store = new AgentStore(":memory:");
   try {
     const registry = new SkillRegistry(store, [...JLCIRCUIT_TOOLS, ...KNOWLEDGE_TOOL_DEFINITIONS], {
@@ -132,6 +132,20 @@ test("Built-in layout skill exposes confirmation-gated move operations in ordina
     });
     assert.equal(resolved.skills.some((skill) => skill.id === "schematic-layout"), true);
     assert.equal(resolved.allowedToolNames.has("easyeda_schematic_move_component"), true);
+    assert.equal(resolved.allowedToolNames.has("easyeda_schematic_place_component"), true);
+    assert.equal(resolved.allowedToolNames.has("easyeda_schematic_create_rectangle"), true);
+    const drawing = registry.resolve({ instruction: "放置一个器件并画矩形模块框", mode: "chat" });
+    assert.equal(drawing.skills.some((skill) => skill.id === "schematic-layout"), true);
+    assert.equal(drawing.allowedToolNames.has("easyeda_schematic_place_component"), true);
+    assert.equal(drawing.allowedToolNames.has("easyeda_schematic_create_wire"), true);
+    assert.equal(drawing.allowedToolNames.has("easyeda_schematic_create_bus"), true);
+    assert.equal(drawing.allowedToolNames.has("easyeda_schematic_create_polygon"), true);
+    assert.equal(drawing.allowedToolNames.has("easyeda_schematic_create_text"), true);
+    for (const instruction of ["确认", "登记", "继续登记"]) {
+      const followUp = registry.resolve({ instruction, mode: "chat" });
+      assert.equal(followUp.skills.some((skill) => skill.id === "schematic-layout"), true, instruction);
+      assert.equal(followUp.allowedToolNames.has("easyeda_schematic_move_component"), true, instruction);
+    }
   } finally {
     store.close();
   }

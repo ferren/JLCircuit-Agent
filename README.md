@@ -41,7 +41,7 @@ npm run build:extension
 输出文件：
 
 ```text
-extensions/jlcircuit-eda/build/dist/jlcircuit-agent_v0.3.8.eext
+extensions/jlcircuit-eda/build/dist/jlcircuit-agent_v0.3.9.eext
 ```
 
 在嘉立创EDA专业版 V3 中选择“高级 → 扩展管理器 → 导入”，导入上面的 `.eext` 文件；V2 可从“设置 → 扩展 → 扩展管理器 → 导入扩展”进入。扩展需要开启 External Interaction 权限，运行时通过官方 `eda.sys_WebSocket` 连接本地 Agent 服务。
@@ -95,7 +95,10 @@ POST /v1/drc
 POST /v1/chat
 POST /v1/chat/stream
 POST /v1/plan
+GET  /v1/providers
+POST /v1/providers/:providerId/restart
 GET  /v1/tasks/:taskId
+POST /v1/tasks/:taskId/retry
 POST /v1/tasks/:taskId/confirm
 POST /v1/tasks/:taskId/cancel
 POST /v1/tools/easyeda_canvas_locate
@@ -107,24 +110,66 @@ WS   ws://127.0.0.1:49630/bridge
 
 ## 接入大语言模型
 
-Agent 服务支持 OpenAI-compatible Chat Completions 接口，默认不配置模型时使用 `stub`，不会发起外部请求。复制 `.env.example` 为本地环境配置，并设置模型提供方、接口地址、密钥和模型名：
+Agent Service 默认使用 **Codex App Server** 作为智能体内核。JLCircuit 自己保留 Session、Skill、EDA 工具权限、ChangeSet 确认、Bridge 和验证链；Codex App Server 负责持久化模型线程、工具循环、推理/正文流和 token 统计。每个模型 Provider 对应一个按需启动的 `codex app-server` 子进程，同一 Provider 的会话复用该进程，不会修改用户的 Codex 全局配置。
+
+先安装并确认 `codex --version` 可用，然后复制环境和 Provider 示例：
 
 ```powershell
 $envFile = ".env"
 Copy-Item .env.example $envFile
+New-Item -ItemType Directory -Force .jlcircuit-data | Out-Null
+Copy-Item config/codex-providers.example.json .jlcircuit-data/codex-providers.json
 
-$env:JLCIRCUIT_MODEL_PROVIDER="deepseek"
-$env:JLCIRCUIT_LLM_BASE_URL="https://api.deepseek.com/v1"
-$env:JLCIRCUIT_LLM_API_KEY="你的API密钥"
-$env:JLCIRCUIT_LLM_MODEL="deepseek-chat"
+# 也可以把这些值写入项目根目录的 .env
+$env:OPENAI_API_KEY="你的API密钥"
 npm run dev
 ```
 
-也可以直接编辑项目根目录的 `.env`；`npm run dev` 会自动加载它。`.env` 已被 Git 忽略，不应提交 API 密钥。
+Provider 配置使用 `apiKeyEnv` 引用密钥，不保存密钥值；`httpHeaders` 只允许非敏感静态头，Authorization/API-Key 类头及常见密钥 Query 参数会被拒绝，应改用 `apiKeyEnv` 或 `envHttpHeaders`。`.env` 与 `.jlcircuit-data/` 均已被 Git 忽略。完整示例见 `config/codex-providers.example.json`：
 
-也可以把 `JLCIRCUIT_MODEL_PROVIDER` 设置为 `openai`，并使用 `https://api.openai.com/v1` 和对应模型。模型回合会先读取当前 EDA 上下文，再按需调用只读工具；高风险写工具不会在模型回合中自动执行。
+```json
+{
+  "defaultProvider": "openrouter",
+  "providers": {
+    "openrouter": {
+      "name": "OpenRouter",
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "model": "openai/gpt-5.4",
+      "apiKeyEnv": "OPENROUTER_API_KEY",
+      "wireApi": "responses",
+      "reasoningEffort": "high",
+      "modelMetadata": {
+        "contextWindow": 262144,
+        "maxOutputTokens": 32768,
+        "inputModalities": ["text", "image"],
+        "reasoningEfforts": ["low", "high"],
+        "defaultReasoningEffort": "high"
+      },
+      "enabled": true
+    }
+  }
+}
+```
+
+```env
+JLCIRCUIT_AGENT_BACKEND=codex-app-server
+JLCIRCUIT_CODEX_COMMAND=codex
+JLCIRCUIT_CODEX_PROVIDERS_CONFIG=.jlcircuit-data/codex-providers.json
+JLCIRCUIT_CODEX_HOME_ROOT=.jlcircuit-data/codex-home
+JLCIRCUIT_CODEX_MAX_PROCESSES=4
+JLCIRCUIT_CODEX_REQUEST_TIMEOUT_MS=30000
+OPENROUTER_API_KEY=你的API密钥
+```
+
+本集成当前只接受 `wireApi: "responses"`。例如 OpenRouter 的 Base URL 填 `https://openrouter.ai/api/v1`，Codex 会调用其 `/responses`；只有 Chat Completions 的兼容后端不能直接放进该进程池。对 Codex 内置目录没有的第三方模型，应配置 `modelMetadata`：服务会在 `.jlcircuit-data/codex-home/<id>/jlcircuit-model-catalog.json` 生成该 Provider 专用目录，并用 `model_catalog_json` 仅注入对应的 App Server 进程，消除“Model metadata not found”的兜底行为；该目录不含密钥，也不修改用户全局 Codex 配置。`contextWindow` 必须大于 `maxOutputTokens`，`inputModalities` 必须含 `text`，并且默认推理档位必须出现在 `reasoningEfforts` 中。Provider 的 `baseUrl`、`model`、`wire_api` 和密钥环境变量通过当前子进程的启动参数/环境注入，仅作用于 JLCircuit 启动的 App Server。每个 Provider 使用独立 `CODEX_HOME` 和空工作目录，不读取用户全局 Codex Skills/MCP/配置；子进程还显式禁用 Plugin/App/Hook/Skill Search、Shell/Unified Exec、Browser/Computer Use 和多智能体等内置能力，只保留 JLCircuit 动态工具。子进程环境只保留操作系统运行所需变量、本 Provider 密钥及 `envHttpHeaders` 明确引用的变量，不继承其他 Provider 密钥。修改 Provider JSON 后需要重启 Agent Service；EDA 输入区可以选择本轮 Provider。
+
+`GET /v1/providers` 可查看 Provider、密钥环境变量是否存在及子进程状态；`POST /v1/providers/:id/restart` 可重启单个 Provider 进程，该管理操作受本地管理 Origin/Token 保护。每个 `(sessionId, providerId)` 的 Codex thread ID 持久化在 SQLite，服务重启后通过 `thread/resume` 恢复。清空对话时会同时删除该会话的 thread 映射。
+
+需要兼容旧的 Chat Completions 供应商时，可设置 `JLCIRCUIT_AGENT_BACKEND=legacy`，继续使用 `JLCIRCUIT_MODEL_PROVIDER`、`JLCIRCUIT_LLM_BASE_URL`、`JLCIRCUIT_LLM_API_KEY` 和 `JLCIRCUIT_LLM_MODEL`。这是迁移回退路径，不经过 Provider 进程池。
 
 ### 图像识别模型路由
+
+Codex App Server 后端会把截图工具返回的 PNG 作为动态工具的 `inputImage` 交回当前 Provider，因此应选择支持图像输入的模型。当前独立视觉模型路由仅由 `legacy` 后端使用；Codex 进程池的跨 Provider 视觉降级仍在开发。
 
 当模型可以识别图片时，将截图直接交给当前语言模型：
 
@@ -142,11 +187,14 @@ JLCIRCUIT_VISION_LLM_MODEL=gpt-4o-mini
 JLCIRCUIT_VISION_LLM_TIMEOUT_MS=120000
 JLCIRCUIT_LLM_MAX_TOKENS=4096
 JLCIRCUIT_LLM_STREAMING=true
+# Z.AI 流式 Function Call；provider=zai 时默认启用，其他供应商默认关闭
+JLCIRCUIT_LLM_TOOL_STREAM=true
 JLCIRCUIT_LLM_REASONING_EFFORT=low
 JLCIRCUIT_LLM_FINAL_REASONING_EFFORT=minimal
 JLCIRCUIT_LLM_MAX_LENGTH_RECOVERIES=1
 JLCIRCUIT_LLM_CONTEXT_MAX_CHARS=40000
 JLCIRCUIT_LLM_CONTEXT_MAX_ITEMS=200
+JLCIRCUIT_LLM_TOOL_RESULT_MAX_CHARS=50000
 JLCIRCUIT_AGENT_MAX_TOOL_CALLS=40
 JLCIRCUIT_AGENT_MAX_ELAPSED_MS=300000
 JLCIRCUIT_AGENT_MAX_NO_PROGRESS=2
@@ -160,13 +208,13 @@ JLCIRCUIT_AGENT_FINALIZE_TIMEOUT_MS=60000
 
 `JLCIRCUIT_LLM_MAX_TOKENS` 限制单次模型输出（包括 reasoning）长度；`JLCIRCUIT_LLM_CONTEXT_MAX_CHARS` 限制发送给模型的设计上下文字符数；`JLCIRCUIT_LLM_CONTEXT_MAX_ITEMS` 限制元件和导线样例数量。服务会保留总数和截断标记，Agent 返回的原始上下文不受影响。
 
-默认启用端到端流式输出：Agent Service 使用 OpenAI-compatible SSE 读取模型的 `content`、`reasoning`、流式工具调用和最终 usage，再通过 `POST /v1/chat/stream` 把运行事件转发给 EDA 面板。面板顶部具有位于对话滚动区之外的常驻运行状态栏，持续显示阶段、耗时、模型请求数、工具调用数及 token，执行结束后保留最近一次状态和最终用量。精确 usage 到达前显示根据字符数计算的近似生成量，收到供应商最终 usage 后切换为输入/输出/推理/总 token。思考区默认跟随最新输出滚到底部；用户向上滚动后暂停跟随，手动回到底部时自动恢复。执行结束后推理区域自动折叠，最终答案保持展开。
+默认启用端到端流式输出：Codex App Server 将 reasoning、正文、动态工具状态和 `thread/tokenUsage/updated` 通过 JSON-RPC 推送给 Agent Service，Agent Service 再通过 `POST /v1/chat/stream` 的 SSE 转发给 EDA 面板。`legacy` 后端则继续直接读取 OpenAI-compatible SSE。面板顶部具有位于对话滚动区之外的常驻运行状态栏，持续显示阶段、耗时、模型请求数、工具调用数及 token，执行结束后保留最近一次状态和最终用量。思考区默认跟随最新输出滚到底部；用户向上滚动后暂停跟随，手动回到底部时自动恢复。执行结束后推理区域自动折叠，最终答案保持展开。
 
 助手回复支持常用 Markdown 格式，包括标题、粗体/斜体、列表、引用、表格、链接、行内代码和 fenced code block；流式输出与历史消息使用同一渲染器，代码和链接会以安全 DOM 节点呈现。
 
-Reasoning token 计入输出预算。若模型以 `finish_reason=length` 结束，服务会保留已有推理和工具结果，禁用工具并自动追加一次低 reasoning 的最终总结请求；`JLCIRCUIT_LLM_MAX_LENGTH_RECOVERIES` 控制这种恢复次数。对于 OpenRouter reasoning 模型，可通过 `JLCIRCUIT_LLM_REASONING_EFFORT=low` 给正文保留更多输出空间，最终总结单独使用 `JLCIRCUIT_LLM_FINAL_REASONING_EFFORT=minimal`。不支持 `reasoning.effort` 的供应商应留空这两个配置。
+`reasoningEffort` 在 Codex Provider JSON 中按 Provider 配置。`JLCIRCUIT_LLM_MAX_TOKENS`、长度恢复与 `JLCIRCUIT_LLM_FINAL_REASONING_EFFORT` 属于 `legacy` 后端；Codex App Server 后端由 Codex 管理单轮模型输出和工具续接，JLCircuit 只保留总工具数与总耗时熔断。
 
-Agent 不再按固定模型请求轮数停止，而是持续执行到模型给出结果、需要用户补充信息、需要确认写操作或工具明确阻塞。`JLCIRCUIT_AGENT_MAX_TOOL_CALLS` 和 `JLCIRCUIT_AGENT_MAX_ELAPSED_MS` 是防止失控的总预算；`JLCIRCUIT_AGENT_MAX_NO_PROGRESS` 用来触发一次换策略恢复，`JLCIRCUIT_AGENT_MAX_RETRIES_PER_ACTION` 阻止相同工具和参数无限重复。预算耗尽时，服务会禁用工具并额外请求一次阶段总结，返回已完成内容、证据、缺口和可恢复检查点。`JLCIRCUIT_AGENT_FINALIZE_TIMEOUT_MS` 单独控制这次总结请求。旧的 `JLCIRCUIT_LLM_MAX_TOOL_ROUNDS` 已不再使用。
+Agent 不再按固定模型请求轮数停止。Codex App Server 在一个 turn 内持续执行到最终答复、等待用户、产生待确认写操作、被中断或明确失败；JLCircuit 只用 `JLCIRCUIT_AGENT_MAX_TOOL_CALLS` 和 `JLCIRCUIT_AGENT_MAX_ELAPSED_MS` 做异常熔断。`JLCIRCUIT_AGENT_MAX_NO_PROGRESS`、`JLCIRCUIT_AGENT_MAX_RETRIES_PER_ACTION` 和最终阶段总结属于 `legacy` Supervisor。
 
 ### 会话持久化与上下文引擎
 
@@ -388,9 +436,9 @@ Invoke-RestMethod -Method Post -ContentType "application/json" `
 
 ### 多步修改流程
 
-EDA 面板中的普通问题和修改要求统一调用 `/v1/chat/stream`。模型可以直接回答、要求用户补充必要参数，也可以调用当前技能允许的写工具；写工具调用不会立即执行，而是被记录为待确认的 `ChangeSet`，并在同一轮流式响应结束后显示“确认执行”按钮。登记 ChangeSet 不要求用户预先回复“确认”或“登记”；如果模型错误地提前索要这类口头确认，Supervisor 会在同一请求内自动纠偏一次，要求其直接登记操作，避免增加无效用户轮次。顶部“优先生成修改方案”只是同一接口的快捷入口：它会附加更明确的内部指令并启用 `schematic-layout` 技能，不再使用独立的非流式执行通道。`/v1/plan` 目前仅为旧客户端保留。
+EDA 面板中的普通问题和修改要求统一调用 `/v1/chat/stream`。模型可以直接回答、要求用户补充必要参数，也可以调用当前技能允许的写工具；写动态工具只会登记待确认 `ChangeSet`，并在同一轮结束后显示“确认执行”按钮，不要求用户预先回复“确认”或“登记”。服务会对“确认”“登记”“继续登记”等短跟进自动恢复布局技能和强化执行计划提示；App Server 的开发指令明确要求信息足够时直接调用动态写工具。旧 `legacy` Supervisor 还保留同轮纠偏逻辑。顶部“优先生成修改方案”只是同一流式接口的快捷入口；`/v1/plan` 仅为旧客户端保留。
 
-两种入口都会实时显示阶段、推理、工具调用和 token 消耗。没有写操作是合法结果：说明类问题会正常完成，信息不足时模型会明确追问；只有实际生成了可执行操作，界面才显示确认入口。用户可点击任务卡片的“确认执行”，也可以在存在待确认任务时输入精确确认词“执行”或“确认执行”；两种方式都会调用 `/v1/tasks/:taskId/confirm`，服务会校验任务状态和 confirmation token，并在写入前重新读取项目和文档 ID，防止计划针对的设计已经变化。当前第一条真实执行链只支持 `easyeda_schematic_move_component`，执行后自动调用 `easyeda_post_write_verify`；取消任务调用 `/v1/tasks/:taskId/cancel`。
+两种入口都会实时显示阶段、推理、工具调用和 token 消耗。没有写操作是合法结果：说明类问题会正常完成，信息不足时模型会明确追问；只有实际生成了可执行操作，界面才显示确认入口。用户可点击任务卡片的“确认执行”，也可以在存在待确认任务时输入精确确认词“执行”或“确认执行”；两种方式都会调用 `/v1/tasks/:taskId/confirm`，服务会校验任务状态和 confirmation token，并在写入前重新读取项目和文档 ID，防止计划针对的设计已经变化。执行失败后，任务卡片可通过 `/v1/tasks/:taskId/retry` 直接克隆原始 `ChangeSet` 为带 `parentTaskId` 和递增 `attempt` 的新待确认任务；输入“重试”也会走同一路径，不再重新调用模型。若希望改变方案，应使用“重新规划”。当前真实原理图执行链支持移动/放置元件，以及创建导线、总线、矩形边框、多边形和文本；执行后统一调用 `easyeda_post_write_verify`。取消任务调用 `/v1/tasks/:taskId/cancel`。
 
 测试接口：
 
@@ -401,10 +449,19 @@ Invoke-RestMethod -Method Post `
   -Body '{"sessionId":"demo","instruction":"请总结当前原理图，并指出可能需要检查的地方"}'
 ```
 
-嘉立创EDA扩展从 `ws://127.0.0.1:49630/bridge` 主动连接 Agent 服务。当前已实现上下文、原理图元件、导线、DRC，以及实验性的 `easyeda_schematic_move_component`。
+嘉立创EDA扩展从 `ws://127.0.0.1:49630/bridge` 主动连接 Agent 服务。当前已实现上下文、原理图元件、导线、DRC，以及实验性的原理图写工具：
+
+- `easyeda_schematic_move_component`：移动元件并保持已有连接；
+- `easyeda_library_search_devices`：按完整型号、关键词或立创 C 编号查询官方器件库；
+- `easyeda_schematic_place_component`：使用查询得到的 `libraryUuid` 与器件 `uuid` 放置元件；
+- `easyeda_schematic_create_wire` / `create_bus`：创建导线或总线折线；
+- `easyeda_schematic_create_rectangle` / `create_polygon`：创建模块边框；
+- `easyeda_schematic_create_text`：创建说明文本。
+
+器件库搜索是只读工具；以上写工具都先形成 ChangeSet，确认后才执行。新增 create 类工具会校验当前文档和几何参数，并返回图元 ID 的异步读回状态；尚未进入通用事务框架，批量任务中的后续操作失败时不会自动删除前面已经创建的图元，因此真实工程使用前仍需截图、DRC/ERC 和人工复核。
 
 移动元件工具不再调用实际环境中无法可靠更新既有复杂导线的 `SCH_PrimitiveWire.modify`。保持连接时，扩展保留全部原导线，按旧引脚到新引脚创建独立的水平/垂直桥接线，并使用原网络名辅助网络继承；任一桥接线创建失败时，会删除本轮已创建的桥接线并回滚元件。若创建调用已返回有效图元，但 EDA 的读取模型暂时看不到新线，则保留修改并返回 `connectionCheck=inconclusive`，交由紧随其后的 DRC/ERC 和截图复核，避免因读取缓存滞后误回滚。无法读取引脚、缺少 `SCH_PrimitiveWire.create/delete`，或没有找到任何与引脚匹配的导线端点时，则在移动前拒绝执行。确认元件原本未接线时，才可显式传入 `preserveConnections: false`。复杂总线和网络标签仍要求 DRC/ERC 与人工确认；写入必须显式传入 `confirmWrite: true`。
 
 视觉验证工具使用嘉立创EDA的 `DMT_EditorControl`：先定位或缩放画布，再获取实际渲染区域 PNG。图片目前通过 Bridge JSON 的 Base64 内容块返回，便于支持视觉输入的模型直接查看；后续可替换成二进制帧或本地制品 URL。
 
-嘉立创EDA扩展需要使用官方 `pro-api-sdk` 构建环境。本仓库的适配器已经按官方 `SCH_PrimitiveComponent`、`SCH_PrimitiveWire`、选择控制和 DRC API 预留接口，但真实 API 类型和运行时行为仍需在 EasyEDA Pro 扩展环境中验证。
+嘉立创EDA扩展需要使用官方 `pro-api-sdk` 构建环境。本仓库适配器按本地安装的官方 `@jlceda/pro-api-types` 定义调用 `SCH_PrimitiveComponent`、`Wire`、`Bus`、`Rectangle`、`Polygon`、`Text`、选择控制和 DRC API；类型和夹具测试已覆盖，真实 API 的异步刷新、撤销栈和不同 EasyEDA Pro 版本行为仍需在扩展环境中验证。

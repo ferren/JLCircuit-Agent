@@ -77,7 +77,7 @@ const toolCall = (index: number): MockAssistant => ({
 const withMockModel = async (
   assistants: MockAssistant[],
   run: (requests: Array<Record<string, unknown>>) => Promise<void>,
-  options: { sse?: boolean } = {},
+  options: { sse?: boolean; provider?: string } = {},
 ): Promise<void> => {
   const originalFetch = globalThis.fetch;
   const envKeys = [
@@ -86,9 +86,11 @@ const withMockModel = async (
     "JLCIRCUIT_LLM_API_KEY",
     "JLCIRCUIT_LLM_MODEL",
     "JLCIRCUIT_LLM_STREAMING",
+    "JLCIRCUIT_LLM_TOOL_STREAM",
     "JLCIRCUIT_LLM_MAX_LENGTH_RECOVERIES",
     "JLCIRCUIT_LLM_REASONING_EFFORT",
     "JLCIRCUIT_LLM_FINAL_REASONING_EFFORT",
+    "JLCIRCUIT_LLM_TOOL_RESULT_MAX_CHARS",
     "JLCIRCUIT_AGENT_MAX_TOOL_CALLS",
     "JLCIRCUIT_AGENT_MAX_ELAPSED_MS",
     "JLCIRCUIT_AGENT_MAX_NO_PROGRESS",
@@ -97,7 +99,7 @@ const withMockModel = async (
   ] as const;
   const originalEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
   const requests: Array<Record<string, unknown>> = [];
-  process.env.JLCIRCUIT_MODEL_PROVIDER = "test";
+  process.env.JLCIRCUIT_MODEL_PROVIDER = options.provider ?? "test";
   process.env.JLCIRCUIT_LLM_BASE_URL = "http://model.test/v1";
   process.env.JLCIRCUIT_LLM_API_KEY = "test-key";
   process.env.JLCIRCUIT_LLM_MODEL = "test-model";
@@ -262,6 +264,106 @@ test("premature confirmation requests are corrected within the same turn", { con
   );
 });
 
+test("future-turn registration instructions are corrected instead of creating a user loop", { concurrency: false }, async () => {
+  await withMockModel(
+    [
+      { content: "新开一轮发一句‘登记 U013 移动’，我下一轮再登记操作。" },
+      {
+        content: null,
+        tool_calls: [{
+          id: "write-call-after-deferral-recovery",
+          type: "function",
+          function: { name: "test_write", arguments: JSON.stringify({ target: "U013" }) },
+        }],
+      },
+      { content: "已在本轮登记 U013 修改。" },
+    ],
+    async (requests) => {
+      const result = await runAgentTurn({
+        instruction: "重试 U013 移动",
+        sessionId: "llm-test",
+        preparedContext,
+        toolDefinitions: [writeTool],
+        activeSkills: [],
+        mode: "chat",
+        executeTool: async (): Promise<ToolResponse> => {
+          assert.fail("write tools must not execute before UI confirmation");
+        },
+      });
+
+      assert.equal(result.status, "awaiting_approval");
+      assert.equal(result.plannedOperations.length, 1);
+      const recoveryMessages = requests[1]?.messages as Array<{ role?: string; content?: string }>;
+      assert.match(recoveryMessages.at(-1)?.content ?? "", /不要向用户索要口头确认/);
+    },
+  );
+});
+
+test("oversized tool results are capped before the next model request", { concurrency: false }, async () => {
+  await withMockModel(
+    [toolCall(1), { content: "已基于截断摘要完成检查。" }],
+    async (requests) => {
+      process.env.JLCIRCUIT_LLM_TOOL_RESULT_MAX_CHARS = "100";
+      const result = await runAgentTurn({
+        instruction: "读取大型结果",
+        sessionId: "llm-test",
+        preparedContext,
+        toolDefinitions: [readTool],
+        activeSkills: [],
+        executeTool: async (): Promise<ToolResponse> => ({
+          requestId: crypto.randomUUID(),
+          ok: true,
+          data: { payload: "x".repeat(1_000) },
+        }),
+      });
+
+      const secondMessages = requests[1]?.messages as Array<{ role?: string; content?: string }>;
+      const toolMessage = [...secondMessages].reverse().find((message) => message.role === "tool");
+      assert.match(toolMessage?.content ?? "", /\"truncated\":true/);
+      assert.match(toolMessage?.content ?? "", /不要重复无参数全量调用/);
+      assert.equal(result.status, "completed");
+    },
+  );
+});
+
+test("false tool restriction claims are corrected using the current tool list", { concurrency: false }, async () => {
+  await withMockModel(
+    [
+      { content: "本轮被禁止调用工具，无法登记修改。" },
+      {
+        content: null,
+        tool_calls: [{
+          id: "write-call-after-tool-availability-recovery",
+          type: "function",
+          function: { name: "test_write", arguments: JSON.stringify({ target: "U3" }) },
+        }],
+      },
+      { content: "已登记 U3 修改，请点击确认执行。" },
+    ],
+    async (requests) => {
+      const result = await runAgentTurn({
+        instruction: "继续登记 U3 修改",
+        sessionId: "llm-test",
+        preparedContext,
+        toolDefinitions: [writeTool],
+        activeSkills: [],
+        mode: "chat",
+        executeTool: async (): Promise<ToolResponse> => {
+          assert.fail("write tools must not execute before UI confirmation");
+        },
+      });
+
+      assert.equal(requests.length, 3);
+      assert.equal(result.status, "awaiting_approval");
+      assert.equal(result.plannedOperations.length, 1);
+      assert.deepEqual(result.plannedOperations[0]?.args, { target: "U3" });
+      const recoveryMessages = requests[1]?.messages as Array<{ role?: string; content?: string }>;
+      assert.match(recoveryMessages.at(-1)?.content ?? "", /实际已经提供写工具：test_write/);
+      assert.match(recoveryMessages.at(-1)?.content ?? "", /历史消息.*过期状态/);
+    },
+  );
+});
+
 test("model can explicitly pause for required user input without leaking the status marker", { concurrency: false }, async () => {
   await withMockModel(
     [{ content: "请补充 U1 的完整型号。\n[[JLCIRCUIT_STATUS:awaiting_user]]" }],
@@ -309,6 +411,7 @@ test("SSE model responses stream reasoning, content and exact token usage", { co
       });
 
       assert.equal(requests[0]?.stream, true);
+      assert.equal(requests[0]?.tool_stream, true);
       assert.equal(events.some((event) => event.type === "reasoning_delta" && event.delta === "正在核对证据。"), true);
       assert.equal(events.some((event) => event.type === "content_delta" && event.delta === "检查完成。"), true);
       assert.equal(events.some((event) => event.type === "usage"), true);
@@ -320,7 +423,7 @@ test("SSE model responses stream reasoning, content and exact token usage", { co
       });
       assert.equal(result.message, "检查完成。");
     },
-    { sse: true },
+    { sse: true, provider: "zai" },
   );
 });
 

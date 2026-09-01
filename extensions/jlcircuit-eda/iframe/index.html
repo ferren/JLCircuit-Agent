@@ -203,6 +203,7 @@
         <div class="composer-row">
           <div class="composer-options">
             <span class="hint">当前会话：<span id="sessionLabel"></span></span>
+            <select id="provider" title="选择本轮模型 Provider"><option value="">Provider：默认</option></select>
             <select id="skill" title="选择本轮技能"><option value="">技能：自动</option></select>
           </div>
           <div class="actions">
@@ -332,6 +333,7 @@
       const liveRunElapsed = document.querySelector('#liveRunElapsed');
       const liveRunMetrics = document.querySelector('#liveRunMetrics');
       const sessionLabel = document.querySelector('#sessionLabel');
+      const providerSelect = document.querySelector('#provider');
       const skillSelect = document.querySelector('#skill');
       const mcpStatus = document.querySelector('#mcpStatus');
       const mcpManager = document.querySelector('#mcpManager');
@@ -359,6 +361,7 @@
       })();
       let busy = false;
       let pendingConfirmationTask;
+      let retryableFailedTask;
       let mcpServers = [];
       let mcpConfigs = [];
       let editingMcpId = '';
@@ -374,6 +377,7 @@
       knowledgeAdminTokenInput.value = mcpAdminToken;
       sessionLabel.textContent = sessionId;
 
+      const selectedProviderId = () => providerSelect.value || undefined;
       const selectedSkillIds = () => skillSelect.value ? [skillSelect.value] : undefined;
       const skillLabel = (skills) => Array.isArray(skills) && skills.length
         ? `技能：${skills.map((skill) => skill.name || skill.id).join('、')}`
@@ -394,6 +398,35 @@
           if ([...skillSelect.options].some((option) => option.value === previous)) skillSelect.value = previous;
         } catch (error) {
           addMessage('assistant', `技能列表读取失败：${String(error)}`, '', 'error');
+        }
+      };
+
+      const loadProviders = async () => {
+        try {
+          const result = await request('/v1/providers', 'GET');
+          let previous = providerSelect.value;
+          if (!previous) {
+            try { previous = globalThis.sessionStorage?.getItem('jlcircuit-agent-provider') || ''; } catch { previous = ''; }
+          }
+          providerSelect.innerHTML = `<option value="">Provider：默认（${result.defaultProviderId || '自动'}）</option>`;
+          (result.providers || []).filter((provider) => provider.enabled).forEach((provider) => {
+            const option = document.createElement('option');
+            option.value = provider.id;
+            option.textContent = `Provider：${provider.name} · ${provider.model}`;
+            option.title = [
+              `ID: ${provider.id}`,
+              `状态: ${provider.process}`,
+              provider.apiKeyConfigured ? '密钥环境变量已配置' : `缺少环境变量 ${provider.apiKeyEnv}`,
+            ].join('\n');
+            providerSelect.appendChild(option);
+          });
+          if ([...providerSelect.options].some((option) => option.value === previous)) providerSelect.value = previous;
+          providerSelect.disabled = result.backend === 'legacy';
+          if (result.backend === 'legacy') providerSelect.title = '当前使用 legacy 模型后端，Provider 进程池未启用';
+        } catch (error) {
+          providerSelect.innerHTML = '<option value="">Provider：读取失败</option>';
+          providerSelect.disabled = true;
+          providerSelect.title = String(error);
         }
       };
 
@@ -1288,6 +1321,19 @@
         let followReasoningOutput = true;
         let currentAnswer = '';
         let exactUsage;
+        const toolEventRows = new Map();
+        const toolEventKeyByCall = new Map();
+        const formatToolTarget = (args) => {
+          if (!args || typeof args !== 'object') return '';
+          const target = args.primitiveId || args.componentId || args.refdes || args.target || args.id;
+          return target ? ` · ${String(target)}` : '';
+        };
+        const renderToolEvents = () => {
+          tools.textContent = [...toolEventRows.values()].map((row) => {
+            const repeats = row.calls.length > 1 ? ` · ${row.calls.length} 次调用` : '';
+            return `${row.status} · ${row.tool}${row.target}${repeats}${row.error ? ` · ${row.error}` : ''}`;
+          }).join('\n');
+        };
         let runFinished = false;
         const reasoningIsAtBottom = () =>
           reasoningText.scrollHeight - reasoningText.scrollTop - reasoningText.clientHeight <= 8;
@@ -1317,9 +1363,57 @@
           liveRunMetrics.textContent = metricsText;
         };
         const scroll = () => { conversation.scrollTop = conversation.scrollHeight; };
+        const approvalBoxes = new Map();
 
         return {
           event(name, payload) {
+            if (name === 'approval_required') {
+              stateText.textContent = `写操作待审批：${payload.tool || '写工具'}`;
+              liveRunState.textContent = '当前状态：等待写操作审批';
+              liveRunPhase.textContent = `${payload.tool || '写工具'} 等待你的批准（超时将退回待确认计划）`;
+              const box = document.createElement('div');
+              box.className = 'details';
+              const label = document.createElement('div');
+              label.textContent = `写操作待审批：${payload.tool || '写工具'}${formatToolTarget(payload.arguments)} · 风险等级 ${payload.riskLevel || '-'}`;
+              const argsPre = document.createElement('pre');
+              argsPre.textContent = JSON.stringify(payload.arguments || {}, null, 2);
+              const buttons = document.createElement('div');
+              buttons.className = 'plan-actions';
+              const approve = document.createElement('button');
+              const approveAll = document.createElement('button');
+              const reject = document.createElement('button');
+              const decide = async (decision, autoApproveSession) => {
+                approve.disabled = approveAll.disabled = reject.disabled = true;
+                try {
+                  await request(`/v1/approvals/${encodeURIComponent(payload.approvalId)}`, 'POST', { decision, autoApproveSession });
+                } catch (error) {
+                  label.textContent = `审批提交失败：${String(error)}`;
+                  approve.disabled = approveAll.disabled = reject.disabled = false;
+                }
+              };
+              approve.className = 'success';
+              approve.textContent = '批准执行';
+              approve.addEventListener('click', () => decide('approve', false));
+              approveAll.className = 'primary';
+              approveAll.textContent = '批准并在本会话自动批准';
+              approveAll.addEventListener('click', () => decide('approve', true));
+              reject.className = 'danger';
+              reject.textContent = '拒绝';
+              reject.addEventListener('click', () => decide('reject', false));
+              buttons.append(approve, approveAll, reject);
+              box.append(label, argsPre, buttons);
+              approvalBoxes.set(payload.approvalId, { box, label, buttons });
+              card.insertBefore(box, answer);
+            }
+            if (name === 'approval_resolved') {
+              const entry = approvalBoxes.get(payload.approvalId);
+              if (entry) {
+                entry.buttons.remove();
+                entry.label.textContent += ` · 审批结果：${payload.decision === 'approved'
+                  ? '已批准，正在执行'
+                  : payload.decision === 'rejected' ? '已拒绝' : '已超时（写操作退回待确认计划）'}`;
+              }
+            }
             if (name === 'phase') {
               stateText.textContent = payload.message || '执行中…';
               liveRunPhase.textContent = stateText.textContent;
@@ -1349,11 +1443,33 @@
               toolCalls = Math.max(toolCalls, payload.call || 0);
               liveRunState.textContent = '当前状态：调用工具';
               liveRunPhase.textContent = payload.tool || '正在调用工具';
-              tools.textContent += `${tools.textContent ? '\n' : ''}进行中 · ${payload.tool}`;
+              const key = `${payload.tool || 'tool'}:${JSON.stringify(payload.arguments || {})}`;
+              toolEventKeyByCall.set(payload.call, key);
+              const existing = toolEventRows.get(key);
+              toolEventRows.set(key, {
+                tool: payload.tool || '工具',
+                target: formatToolTarget(payload.arguments),
+                status: '进行中',
+                error: '',
+                calls: existing ? [...existing.calls, payload.call] : [payload.call],
+              });
+              renderToolEvents();
             }
             if (name === 'tool_complete') {
               toolCalls = Math.max(toolCalls, payload.call || 0);
-              tools.textContent += `${tools.textContent ? '\n' : ''}${payload.status === 'completed' ? '完成' : payload.status === 'blocked' ? '阻止' : '失败'} · ${payload.tool}${payload.error ? ` · ${payload.error}` : ''}`;
+              const key = toolEventKeyByCall.get(payload.call)
+                || `${payload.tool || 'tool'}:${JSON.stringify(payload.arguments || {})}`;
+              const existing = toolEventRows.get(key) || {
+                tool: payload.tool || '工具',
+                target: formatToolTarget(payload.arguments),
+                calls: [payload.call],
+              };
+              toolEventRows.set(key, {
+                ...existing,
+                status: payload.status === 'completed' ? '完成' : payload.status === 'blocked' ? '阻止' : '失败',
+                error: payload.error || '',
+              });
+              renderToolEvents();
             }
             updateMetrics();
             scroll();
@@ -1421,6 +1537,24 @@
           const id = operation.args?.primitiveId || '未指定元件';
           return `移动原理图元件 ${id} 到 (${operation.args?.x}, ${operation.args?.y})，保持接线：${operation.args?.preserveConnections !== false ? '是' : '否'}`;
         }
+        if (operation.tool === 'easyeda_schematic_place_component') {
+          return `放置元件 ${operation.args?.uuid || '未指定器件'} 到 (${operation.args?.x}, ${operation.args?.y})`;
+        }
+        if (operation.tool === 'easyeda_schematic_create_wire') {
+          return `创建导线${operation.args?.net ? `（网络 ${operation.args.net}）` : ''}：${JSON.stringify(operation.args?.line || [])}`;
+        }
+        if (operation.tool === 'easyeda_schematic_create_bus') {
+          return `创建总线 ${operation.args?.busName || '未命名'}：${JSON.stringify(operation.args?.line || [])}`;
+        }
+        if (operation.tool === 'easyeda_schematic_create_rectangle') {
+          return `创建矩形边框：左上 (${operation.args?.topLeftX}, ${operation.args?.topLeftY})，宽 ${operation.args?.width}，高 ${operation.args?.height}`;
+        }
+        if (operation.tool === 'easyeda_schematic_create_polygon') {
+          return `创建多边形边框：${JSON.stringify(operation.args?.line || [])}`;
+        }
+        if (operation.tool === 'easyeda_schematic_create_text') {
+          return `创建文本“${operation.args?.content || ''}”于 (${operation.args?.x}, ${operation.args?.y})`;
+        }
         return `${operation.tool}: ${JSON.stringify(operation.args || {})}`;
       };
 
@@ -1435,6 +1569,15 @@
           }
         } else if (task?.taskId && pendingConfirmationTask?.taskId === task.taskId) {
           pendingConfirmationTask = undefined;
+        }
+        if (task?.status === 'failed' && (task.changeSet?.operations || []).length > 0) {
+          if (!retryableFailedTask
+            || new Date(task.updatedAt || task.createdAt || 0).getTime()
+              >= new Date(retryableFailedTask.updatedAt || retryableFailedTask.createdAt || 0).getTime()) {
+            retryableFailedTask = task;
+          }
+        } else if (task?.taskId && retryableFailedTask?.taskId === task.taskId) {
+          retryableFailedTask = undefined;
         }
       };
 
@@ -1509,6 +1652,17 @@
           retry.addEventListener('click', () => replanTask(task, retry));
           actions.appendChild(retry);
         }
+        if (task.status === 'failed' && (task.changeSet?.operations || []).length > 0) {
+          const retry = document.createElement('button');
+          retry.className = 'success';
+          retry.textContent = '按原计划重试';
+          retry.addEventListener('click', () => retryFailedTask(task, retry));
+          const replan = document.createElement('button');
+          replan.className = 'primary';
+          replan.textContent = '重新规划';
+          replan.addEventListener('click', () => replanTask(task, replan));
+          actions.append(retry, replan);
+        }
         if (task.execution) {
           const verification = task.execution.verification;
           const detail = document.createElement('div');
@@ -1543,8 +1697,10 @@
             {
               sessionId,
               instruction,
+              providerId: selectedProviderId(),
               skillIds: selectedSkillIds(),
               forceExecutionPlan: options.forceExecutionPlan === true,
+              parentTaskId: options.parentTaskId,
             },
             (name, payload) => execution.event(name, payload),
           );
@@ -1574,6 +1730,11 @@
           instructionInput.value = '';
           addMessage('user', instruction);
           await confirmTask(pendingConfirmationTask);
+          return;
+        }
+        if (retryableFailedTask && /^(重试|再试一次|重新执行|按原计划重试|按原方案重试)(?:\s*U\d+(?:\s*移动|\s*修改)?)?[。！？.!?]?$/i.test(instruction)) {
+          instructionInput.value = '';
+          await retryFailedTask(retryableFailedTask, undefined, instruction);
           return;
         }
         await runConversation(instruction);
@@ -1606,9 +1767,34 @@
         try {
           await runConversation(task.instruction, {
             forceExecutionPlan: true,
+            parentTaskId: task.taskId,
             displayInstruction: `重新生成修改方案：${task.instruction}`,
           });
         } finally { button.disabled = false; }
+      };
+
+      const retryFailedTask = async (task, button, instruction = '按原计划重试') => {
+        if (busy) return;
+        busy = true;
+        if (button) button.disabled = true;
+        addMessage('user', instruction);
+        const pending = addMessage('assistant', '正在恢复失败任务的原始 ChangeSet…', `任务：${task.taskId}`, 'pending');
+        try {
+          const result = await request(`/v1/tasks/${encodeURIComponent(task.taskId)}/retry`, 'POST', { instruction });
+          pending.remove();
+          retryableFailedTask = undefined;
+          renderTask(result);
+          addMessage('assistant', `已恢复 ${result.changeSet?.operations?.length || 0} 条原始操作，没有重新调用模型。请检查后点击“确认执行”。`);
+          liveRunStatus.className = 'live-run-status waiting';
+          liveRunState.textContent = '当前状态：等待确认';
+          liveRunPhase.textContent = '失败任务已按原 ChangeSet 创建新的执行尝试';
+        } catch (error) {
+          pending.remove();
+          addMessage('assistant', `恢复失败任务失败：${String(error)}`, '', 'error');
+        } finally {
+          busy = false;
+          if (button) button.disabled = false;
+        }
       };
 
       const confirmTask = async (task, button) => {
@@ -1699,20 +1885,30 @@
             ].filter(Boolean).join(' · ');
             addMessage(message.role === 'user' ? 'user' : 'assistant', message.content, meta, message.metadata?.failed ? 'error' : '');
           });
-          const activeTasks = (state.tasks || [])
+          const allTasks = state.tasks || [];
+          const activeTasks = allTasks
             .filter((task) => ['planning', 'awaiting_user', 'waiting_confirmation', 'executing'].includes(task.status));
-          activeTasks
+          const currentTask = allTasks.find((task) => task.taskId === state.session?.currentTaskId);
+          const visibleTasks = [...activeTasks];
+          if (currentTask?.status === 'failed' && !visibleTasks.some((task) => task.taskId === currentTask.taskId)) {
+            visibleTasks.push(currentTask);
+          }
+          visibleTasks
+            .sort((left, right) => new Date(left.createdAt || 0).getTime() - new Date(right.createdAt || 0).getTime())
             .reverse()
             .forEach(renderTask);
-          const latestActiveTask = [...activeTasks].sort((left, right) =>
+          const latestActiveTask = [...visibleTasks].sort((left, right) =>
             new Date(right.updatedAt || right.createdAt || 0).getTime()
               - new Date(left.updatedAt || left.createdAt || 0).getTime())[0];
           if (latestActiveTask) {
             const isExecuting = latestActiveTask.status === 'executing' || latestActiveTask.status === 'planning';
-            liveRunStatus.className = `live-run-status ${isExecuting ? 'running' : 'waiting'}`;
+            const isFailed = latestActiveTask.status === 'failed';
+            liveRunStatus.className = `live-run-status ${isExecuting ? 'running' : isFailed ? 'failed' : 'waiting'}`;
             liveRunState.textContent = `当前状态：${statusLabel(latestActiveTask.status)}`;
             liveRunPhase.textContent = isExecuting
               ? '已从会话记录恢复活动任务，请查看任务卡片'
+              : isFailed
+                ? '最近一次任务执行失败，可按原 ChangeSet 重试或重新规划'
               : latestActiveTask.status === 'waiting_confirmation'
                 ? '修改操作尚未执行，等待用户确认'
                 : '等待用户补充信息';
@@ -1732,6 +1928,7 @@
         } catch {
           // Bridge may still be starting. Restore the last known project session first.
         }
+        await loadProviders();
         await loadSkills();
         await loadMcpServers(false);
         await loadKnowledgeSources();
@@ -1743,6 +1940,8 @@
         busy = true;
         try {
           await request(`/v1/sessions/${encodeURIComponent(sessionId)}/clear`, 'POST', {});
+          pendingConfirmationTask = undefined;
+          retryableFailedTask = undefined;
           conversation.innerHTML = '';
           conversation.appendChild(welcome);
           welcome.style.display = '';
@@ -1797,6 +1996,9 @@
           event.preventDefault();
           sendAnalysis();
         }
+      });
+      providerSelect.addEventListener('change', () => {
+        try { globalThis.sessionStorage?.setItem('jlcircuit-agent-provider', providerSelect.value); } catch { /* ignore */ }
       });
       initializeSession();
     </script>

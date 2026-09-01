@@ -58,8 +58,13 @@ export interface JlcEdaApi {
   dmt_EditorControl?: PrimitiveApi;
   sch_SelectControl?: { getAllSelectedPrimitives?: () => Promise<unknown> };
   pcb_SelectControl?: { getAllSelectedPrimitives?: () => Promise<unknown> };
+  lib_Device?: PrimitiveApi;
   sch_PrimitiveComponent?: PrimitiveApi;
   sch_PrimitiveWire?: PrimitiveApi;
+  sch_PrimitiveBus?: PrimitiveApi;
+  sch_PrimitiveRectangle?: PrimitiveApi;
+  sch_PrimitivePolygon?: PrimitiveApi;
+  sch_PrimitiveText?: PrimitiveApi;
   sch_Document?: PrimitiveApi;
   sch_Drc?: PrimitiveApi;
   pcb_Drc?: PrimitiveApi;
@@ -89,6 +94,15 @@ export interface MoveComponentResult {
   movedWireIds: string[];
   unresolvedWireIds: string[];
   connectionCheck: "passed" | "inconclusive" | "failed";
+  warning?: string;
+  saved: boolean;
+}
+
+export interface CreateSchematicPrimitiveResult {
+  primitiveType: "component" | "wire" | "bus" | "rectangle" | "polygon" | "text";
+  primitiveId?: string;
+  created: true;
+  readbackStatus: "verified" | "inconclusive";
   warning?: string;
   saved: boolean;
 }
@@ -159,7 +173,11 @@ export class JlcEdaAdapter {
   public async getCapabilities(): Promise<EdaCapabilities> {
     const canReadComponents = Boolean(getMethod(this.eda.sch_PrimitiveComponent, "getAll"));
     const canReadWires = Boolean(getMethod(this.eda.sch_PrimitiveWire, "getAll"));
+    const canSearchDevices = Boolean(
+      getMethod(this.eda.lib_Device, "search") || getMethod(this.eda.lib_Device, "getByLcscIds"),
+    );
     const canModifyComponent = Boolean(getMethod(this.eda.sch_PrimitiveComponent, "modify"));
+    const canPlaceComponent = Boolean(getMethod(this.eda.sch_PrimitiveComponent, "create"));
     const canCreateWire = Boolean(getMethod(this.eda.sch_PrimitiveWire, "create"));
     const canDeleteWire = Boolean(getMethod(this.eda.sch_PrimitiveWire, "delete"));
     const canCaptureCanvas = Boolean(getMethod(this.eda.dmt_EditorControl, "getCurrentRenderedAreaImage"));
@@ -172,6 +190,7 @@ export class JlcEdaAdapter {
         { name: "read_context", enabled: true, riskLevel: "read" },
         { name: "read_schematic_components", enabled: canReadComponents, riskLevel: "read", beta: true },
         { name: "read_schematic_wires", enabled: canReadWires, riskLevel: "read", beta: true },
+        { name: "search_library_devices", enabled: canSearchDevices, riskLevel: "read", beta: true },
         {
           name: "run_drc",
           enabled: Boolean(getMethod(this.eda.sch_Drc, "check") || getMethod(this.eda.pcb_Drc, "check")),
@@ -186,6 +205,32 @@ export class JlcEdaAdapter {
           reason: canCreateWire && canDeleteWire
             ? "保留原导线并创建正交桥接线；创建失败时删除新线并回滚元件。复杂总线仍需人工确认。"
             : "原理图导线 create/delete API 不完整；为避免断线，保持连接模式将拒绝移动。",
+        },
+        { name: "place_schematic_component", enabled: canPlaceComponent, riskLevel: "high", beta: true },
+        { name: "create_schematic_wire", enabled: canCreateWire, riskLevel: "high", beta: true },
+        {
+          name: "create_schematic_bus",
+          enabled: Boolean(getMethod(this.eda.sch_PrimitiveBus, "create")),
+          riskLevel: "high",
+          beta: true,
+        },
+        {
+          name: "create_schematic_rectangle",
+          enabled: Boolean(getMethod(this.eda.sch_PrimitiveRectangle, "create")),
+          riskLevel: "high",
+          beta: true,
+        },
+        {
+          name: "create_schematic_polygon",
+          enabled: Boolean(getMethod(this.eda.sch_PrimitivePolygon, "create")),
+          riskLevel: "high",
+          beta: true,
+        },
+        {
+          name: "create_schematic_text",
+          enabled: Boolean(getMethod(this.eda.sch_PrimitiveText, "create")),
+          riskLevel: "high",
+          beta: true,
         },
         { name: "canvas_capture", enabled: canCaptureCanvas, riskLevel: "read", beta: true },
         { name: "canvas_locate", enabled: canLocateCanvas, riskLevel: "read", beta: true },
@@ -208,9 +253,11 @@ export class JlcEdaAdapter {
       case "easyeda_get_context":
         return { data: await this.getContext() };
       case "easyeda_schematic_components":
-        return { data: await this.getSchematicComponents() };
+        return { data: await this.querySchematicComponents(payload) };
       case "easyeda_schematic_wires":
         return { data: await this.getSchematicWires() };
+      case "easyeda_library_search_devices":
+        return { data: await this.searchLibraryDevices(payload) };
       case "easyeda_run_drc":
         return { data: await this.runDrc() };
       case "easyeda_canvas_locate":
@@ -239,9 +286,109 @@ export class JlcEdaAdapter {
           content: evidence.content,
         };
       }
+      case "easyeda_schematic_place_component":
+        return { data: await this.placeComponent(payload) };
+      case "easyeda_schematic_create_wire":
+        return { data: await this.createWire(payload) };
+      case "easyeda_schematic_create_bus":
+        return { data: await this.createBus(payload) };
+      case "easyeda_schematic_create_rectangle":
+        return { data: await this.createRectangle(payload) };
+      case "easyeda_schematic_create_polygon":
+        return { data: await this.createPolygon(payload) };
+      case "easyeda_schematic_create_text":
+        return { data: await this.createText(payload) };
       default:
         throw new Error(`Unsupported EDA tool: ${tool}`);
     }
+  }
+
+  private async querySchematicComponents(payload: UnknownRecord): Promise<{
+    total: number;
+    matched: number;
+    returned: number;
+    truncated: boolean;
+    components: Array<Omit<SchematicComponentSummary, "raw">>;
+  }> {
+    const components = await this.getSchematicComponents();
+    const references = new Set([
+      typeof payload.reference === "string" ? payload.reference : undefined,
+      ...(Array.isArray(payload.references) ? payload.references.filter((item): item is string => typeof item === "string") : []),
+    ].filter((item): item is string => Boolean(item)).map((item) => item.toLowerCase()));
+    const primitiveIds = new Set([
+      typeof payload.primitiveId === "string" ? payload.primitiveId : undefined,
+      ...(Array.isArray(payload.primitiveIds) ? payload.primitiveIds.filter((item): item is string => typeof item === "string") : []),
+    ].filter((item): item is string => Boolean(item)));
+    const query = typeof payload.query === "string" ? payload.query.trim().toLowerCase() : "";
+    const left = optionalNumber(payload.left);
+    const right = optionalNumber(payload.right);
+    const top = optionalNumber(payload.top);
+    const bottom = optionalNumber(payload.bottom);
+    const hasRegionFilter = [left, right, top, bottom].every((value) => value !== undefined);
+    const requestedLimit = optionalNumber(payload.limit);
+    const limit = Math.max(1, Math.min(500, Math.floor(requestedLimit ?? 200)));
+    const matched = components.filter((component) => {
+      if (references.size > 0 && !references.has((component.reference ?? "").toLowerCase())) return false;
+      if (primitiveIds.size > 0 && !primitiveIds.has(component.primitiveId)) return false;
+      if (query) {
+        const searchable = [component.primitiveId, component.reference, component.name]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase();
+        if (!searchable.includes(query)) return false;
+      }
+      if (hasRegionFilter) {
+        if (component.x === undefined || component.y === undefined) return false;
+        if (component.x < (left as number) || component.x > (right as number) ||
+            component.y < (top as number) || component.y > (bottom as number)) return false;
+      }
+      return true;
+    });
+    return {
+      total: components.length,
+      matched: matched.length,
+      returned: Math.min(matched.length, limit),
+      truncated: matched.length > limit,
+      components: matched.slice(0, limit).map(({ raw: _raw, ...component }) => component),
+    };
+  }
+
+  private async searchLibraryDevices(payload: UnknownRecord): Promise<{
+    query?: string;
+    lcscIds?: string[];
+    returned: number;
+    page: number;
+    devices: Array<Record<string, unknown>>;
+  }> {
+    const query = optionalString(payload.query);
+    const lcscIds = Array.isArray(payload.lcscIds)
+      ? payload.lcscIds.filter((item): item is string => typeof item === "string" && item.length > 0).slice(0, 20)
+      : [];
+    if (!query && lcscIds.length === 0) throw new Error("query or lcscIds is required for device library search.");
+    const libraryUuid = optionalString(payload.libraryUuid);
+    const limit = Math.max(1, Math.min(50, Math.floor(optionalNumber(payload.limit) ?? 10)));
+    const page = Math.max(1, Math.floor(optionalNumber(payload.page) ?? 1));
+    let rawResults: unknown;
+    if (lcscIds.length > 0) {
+      const getByLcscIds = getMethod(this.eda.lib_Device, "getByLcscIds");
+      if (!getByLcscIds) throw new Error("LIB_Device.getByLcscIds is unavailable.");
+      rawResults = await getByLcscIds.call(this.eda.lib_Device, lcscIds, libraryUuid, false);
+    } else {
+      const search = getMethod(this.eda.lib_Device, "search");
+      if (!search) throw new Error("LIB_Device.search is unavailable.");
+      rawResults = await search.call(this.eda.lib_Device, query, libraryUuid, undefined, undefined, limit, page);
+    }
+    const results = (Array.isArray(rawResults) ? rawResults : rawResults ? [rawResults] : [])
+      .slice(0, limit)
+      .map(normalizeDeviceSearchItem)
+      .filter((item): item is Record<string, unknown> => Boolean(item));
+    return {
+      query,
+      lcscIds: lcscIds.length > 0 ? lcscIds : undefined,
+      returned: results.length,
+      page,
+      devices: results,
+    };
   }
 
   private async locateCanvas(payload: UnknownRecord): Promise<{ located: boolean; viewport?: Viewport; tabId?: string }> {
@@ -325,6 +472,140 @@ export class JlcEdaAdapter {
     throw new Error("Use explicit capability-gated tools; generic ChangeSet execution is not enabled yet.");
   }
 
+  private async placeComponent(payload: UnknownRecord): Promise<CreateSchematicPrimitiveResult> {
+    const libraryUuid = requireString(payload.libraryUuid, "libraryUuid");
+    const uuid = requireString(payload.uuid, "uuid");
+    return this.createSchematicPrimitive(
+      payload,
+      this.eda.sch_PrimitiveComponent,
+      "component",
+      [
+        { libraryUuid, uuid },
+        requireNumber(payload.x, "x"),
+        requireNumber(payload.y, "y"),
+        optionalString(payload.subPartName),
+        optionalNumber(payload.rotation) ?? 0,
+        payload.mirror === true,
+        payload.addIntoBom !== false,
+        payload.addIntoPcb !== false,
+      ],
+    );
+  }
+
+  private async createWire(payload: UnknownRecord): Promise<CreateSchematicPrimitiveResult> {
+    return this.createSchematicPrimitive(payload, this.eda.sch_PrimitiveWire, "wire", [
+      requireLine(payload.line, "line", 2, true),
+      optionalString(payload.net),
+      optionalNullableString(payload.color),
+      optionalNullableNumber(payload.lineWidth),
+      optionalNullableNumber(payload.lineType),
+    ]);
+  }
+
+  private async createBus(payload: UnknownRecord): Promise<CreateSchematicPrimitiveResult> {
+    return this.createSchematicPrimitive(payload, this.eda.sch_PrimitiveBus, "bus", [
+      requireString(payload.busName, "busName"),
+      requireLine(payload.line, "line", 2, true),
+      optionalNullableString(payload.color),
+      optionalNullableNumber(payload.lineWidth),
+      optionalNullableNumber(payload.lineType),
+    ]);
+  }
+
+  private async createRectangle(payload: UnknownRecord): Promise<CreateSchematicPrimitiveResult> {
+    const width = requirePositiveNumber(payload.width, "width");
+    const height = requirePositiveNumber(payload.height, "height");
+    return this.createSchematicPrimitive(payload, this.eda.sch_PrimitiveRectangle, "rectangle", [
+      requireNumber(payload.topLeftX, "topLeftX"),
+      requireNumber(payload.topLeftY, "topLeftY"),
+      width,
+      height,
+      optionalNumber(payload.cornerRadius) ?? 0,
+      optionalNumber(payload.rotation) ?? 0,
+      optionalNullableString(payload.color),
+      optionalNullableString(payload.fillColor),
+      optionalNullableNumber(payload.lineWidth),
+      optionalNullableNumber(payload.lineType),
+      optionalNullableString(payload.fillStyle),
+    ]);
+  }
+
+  private async createPolygon(payload: UnknownRecord): Promise<CreateSchematicPrimitiveResult> {
+    return this.createSchematicPrimitive(payload, this.eda.sch_PrimitivePolygon, "polygon", [
+      requireLine(payload.line, "line", 3, false) as number[],
+      optionalNullableString(payload.color),
+      optionalNullableString(payload.fillColor),
+      optionalNullableNumber(payload.lineWidth),
+      optionalNullableNumber(payload.lineType),
+    ]);
+  }
+
+  private async createText(payload: UnknownRecord): Promise<CreateSchematicPrimitiveResult> {
+    return this.createSchematicPrimitive(payload, this.eda.sch_PrimitiveText, "text", [
+      requireNumber(payload.x, "x"),
+      requireNumber(payload.y, "y"),
+      requireString(payload.content, "content"),
+      optionalNumber(payload.rotation) ?? 0,
+      optionalNullableString(payload.textColor),
+      optionalNullableString(payload.fontName),
+      optionalNullableNumber(payload.fontSize),
+      payload.bold === true,
+      payload.italic === true,
+      payload.underLine === true,
+      optionalNumber(payload.alignMode) ?? 1,
+    ]);
+  }
+
+  private async createSchematicPrimitive(
+    payload: UnknownRecord,
+    api: unknown,
+    primitiveType: CreateSchematicPrimitiveResult["primitiveType"],
+    args: unknown[],
+  ): Promise<CreateSchematicPrimitiveResult> {
+    if (payload.confirmWrite !== true) throw new Error(`Creating schematic ${primitiveType} requires confirmWrite=true.`);
+    await this.assertSchematicDocument();
+    const create = getMethod(api, "create");
+    if (!create) throw new Error(`SCH_Primitive${capitalize(primitiveType)}.create is unavailable.`);
+    const beforeIds = new Set(await readPrimitiveIds(api));
+    const primitive = await create.call(api, ...args);
+    if (!primitive) throw new Error(`SCH_Primitive${capitalize(primitiveType)}.create returned no primitive.`);
+    let primitiveId = await readString(
+      primitive,
+      ["getState_PrimitiveId", "getState_primitiveId", "primitiveId", "id"],
+    );
+    for (const settleMs of [0, 50, 150, 300]) {
+      if (primitiveId) break;
+      if (settleMs > 0) await waitFor(settleMs);
+      primitiveId = await readString(
+        primitive,
+        ["getState_PrimitiveId", "getState_primitiveId", "primitiveId", "id"],
+      );
+      if (!primitiveId) {
+        const addedIds = (await readPrimitiveIds(api)).filter((id) => !beforeIds.has(id));
+        if (addedIds.length === 1) primitiveId = addedIds[0];
+      }
+    }
+    const save = payload.save === true;
+    if (save) await callMethod(this.eda.sch_Document, "save");
+    return {
+      primitiveType,
+      primitiveId,
+      created: true,
+      readbackStatus: primitiveId ? "verified" : "inconclusive",
+      warning: primitiveId
+        ? undefined
+        : "EDA 已确认 create 调用，但异步读取模型尚未返回图元 ID；请使用截图和 DRC/ERC 复核。",
+      saved: save,
+    };
+  }
+
+  private async assertSchematicDocument(): Promise<void> {
+    const document = normalizeDocument(await this.eda.dmt_SelectControl?.getCurrentDocumentInfo?.());
+    if (document?.type !== "schematic" && document?.type !== "schematic-page") {
+      throw new Error("The active document is not a schematic page.");
+    }
+  }
+
   private async moveComponent(payload: UnknownRecord): Promise<MoveComponentResult> {
     if (payload.confirmWrite !== true) throw new Error("Moving a component requires confirmWrite=true.");
     const primitiveId = requireString(payload.primitiveId, "primitiveId");
@@ -359,7 +640,7 @@ export class JlcEdaAdapter {
     const bridgePlans = preserveConnections
       ? pinMoves.flatMap((move) => {
           const attachedWires = beforeWires.filter((wire) =>
-            linePoints(wire.line).some((point) => samePoint(point, move.from)));
+            lineContainsPoint(wire.line, move.from));
           if (attachedWires.length === 0) return [];
           const namedNets = [...new Set(attachedWires.map((wire) => wire.net).filter((net): net is string => Boolean(net)))];
           if (namedNets.length > 1) {
@@ -381,7 +662,12 @@ export class JlcEdaAdapter {
         "Use preserveConnections=false only after confirming that the component is intentionally unconnected.",
       );
     }
-    const createdWires: Array<{ primitiveId: string; move: { from: PinPosition; to: PinPosition } }> = [];
+    const createdWires: Array<{
+      primitiveId?: string;
+      primitive: unknown;
+      move: { from: PinPosition; to: PinPosition };
+    }> = [];
+    const knownWireIds = new Set(beforeWires.map((wire) => wire.primitiveId));
     let componentMoved = false;
     try {
       const modifiedComponent = await modifyComponent.call(componentApi, primitiveId, { x, y });
@@ -392,12 +678,27 @@ export class JlcEdaAdapter {
         if (!createdWire) {
           throw new Error(`SCH_PrimitiveWire.create failed for pin at (${plan.move.to.x}, ${plan.move.to.y}).`);
         }
-        const createdWireId = await readString(createdWire, ["getState_PrimitiveId", "getState_primitiveId", "primitiveId", "id"]);
-        const createdLine = await readLine(createdWire);
-        if (!createdWireId || !createdLine || !linePoints(createdLine).some((point) => samePoint(point, plan.move.to))) {
-          throw new Error(`SCH_PrimitiveWire.create returned an unverifiable bridge for pin at (${plan.move.to.x}, ${plan.move.to.y}).`);
+        let createdWireId: string | undefined;
+        // Some EDA builds acknowledge create() before the returned proxy has an
+        // ID. First retry the proxy, then identify the newly persisted wire by
+        // diffing getAll() and matching both bridge endpoints.
+        for (const settleMs of [0, 50, 150, 300, 500]) {
+          if (settleMs > 0) await waitFor(settleMs);
+          createdWireId = await readString(
+            createdWire,
+            ["getState_PrimitiveId", "getState_primitiveId", "primitiveId", "id"],
+          );
+          if (!createdWireId) {
+            const candidates = (await this.getSchematicWires()).filter((wire) =>
+              !knownWireIds.has(wire.primitiveId)
+              && lineContainsPoint(wire.line, plan.move.from)
+              && lineContainsPoint(wire.line, plan.move.to));
+            if (candidates.length === 1) createdWireId = candidates[0]?.primitiveId;
+          }
+          if (createdWireId) break;
         }
-        createdWires.push({ primitiveId: createdWireId, move: plan.move });
+        createdWires.push({ primitiveId: createdWireId, primitive: createdWire, move: plan.move });
+        if (createdWireId) knownWireIds.add(createdWireId);
       }
       const currentComponent = await findPrimitive(componentApi, primitiveId);
       const currentX = await readNumber(currentComponent, ["getState_X", "getState_x", "x"]);
@@ -405,10 +706,12 @@ export class JlcEdaAdapter {
       if (currentX === undefined || currentY === undefined || !samePoint({ x: currentX, y: currentY }, { x, y })) {
         throw new Error("Component position verification failed after modify.");
       }
-      let unresolvedWireIds = createdWires.map((wire) => wire.primitiveId);
+      let unresolvedWireIds = createdWires.map((wire) =>
+        wire.primitiveId ?? `unresolved-pin@(${wire.move.to.x},${wire.move.to.y})`);
       for (const settleMs of [0, 50, 150, 300, 500]) {
         if (settleMs > 0) await waitFor(settleMs);
         const verificationResults = await Promise.all(createdWires.map(async (created) => {
+          if (!created.primitiveId) return `unresolved-pin@(${created.move.to.x},${created.move.to.y})`;
           const currentWire = await findPrimitive(wireApi, created.primitiveId);
           const currentLine = await readLine(currentWire);
           return currentLine && linePoints(currentLine).some((point) => samePoint(point, created.move.to))
@@ -421,7 +724,9 @@ export class JlcEdaAdapter {
       const save = payload.save === true;
       if (save) await callMethod(this.eda.sch_Document, "save");
       const connectionCheck = preserveConnections && unresolvedWireIds.length === 0 ? "passed" : "inconclusive";
-      const createdWireIds = createdWires.map((wire) => wire.primitiveId);
+      const createdWireIds = createdWires
+        .map((wire) => wire.primitiveId)
+        .filter((wireId): wireId is string => typeof wireId === "string");
       return {
         primitiveId,
         requestedPosition: { x, y },
@@ -441,10 +746,11 @@ export class JlcEdaAdapter {
       const rollbackErrors: string[] = [];
       for (const created of [...createdWires].reverse()) {
         try {
-          const deleted = await deleteWire?.call(wireApi, created.primitiveId);
-          if (deleted !== true) rollbackErrors.push(`created wire rollback returned no success: ${created.primitiveId}`);
+          const deleteTarget = created.primitiveId ?? created.primitive;
+          const deleted = await deleteWire?.call(wireApi, deleteTarget);
+          if (deleted !== true) rollbackErrors.push(`created wire rollback returned no success: ${created.primitiveId ?? "unknown"}`);
         } catch (rollbackError) {
-          rollbackErrors.push(`created wire rollback failed for ${created.primitiveId}: ${String(rollbackError)}`);
+          rollbackErrors.push(`created wire rollback failed for ${created.primitiveId ?? "unknown"}: ${String(rollbackError)}`);
         }
       }
       if (componentMoved) {
@@ -519,6 +825,15 @@ const readNumber = async (value: unknown, names: string[]): Promise<number | und
   return typeof result === "number" && Number.isFinite(result) ? result : undefined;
 };
 
+const readPrimitiveIds = async (api: unknown): Promise<string[]> => {
+  const ids: string[] = [];
+  for (const primitive of await readAll(api, "getAll")) {
+    const id = await readString(primitive, ["getState_PrimitiveId", "getState_primitiveId", "primitiveId", "id"]);
+    if (id) ids.push(id);
+  }
+  return ids;
+};
+
 const normalizeComponent = async (primitive: unknown): Promise<SchematicComponentSummary> => ({
   primitiveId:
     (await readString(primitive, ["getState_PrimitiveId", "getState_primitiveId", "primitiveId", "id"])) ??
@@ -530,6 +845,31 @@ const normalizeComponent = async (primitive: unknown): Promise<SchematicComponen
   rotation: await readNumber(primitive, ["getState_Rotation", "getState_rotation", "rotation"]),
   raw: primitive,
 });
+
+const normalizeDeviceSearchItem = (value: unknown): Record<string, unknown> | undefined => {
+  if (!value || typeof value !== "object") return undefined;
+  const item = value as UnknownRecord;
+  if (typeof item.uuid !== "string" || typeof item.libraryUuid !== "string") return undefined;
+  const compactAssociation = (association: unknown): Record<string, unknown> | undefined => {
+    if (!association || typeof association !== "object") return undefined;
+    const record = association as UnknownRecord;
+    return {
+      name: typeof record.name === "string" ? record.name : undefined,
+      uuid: typeof record.uuid === "string" ? record.uuid : undefined,
+      libraryUuid: typeof record.libraryUuid === "string" ? record.libraryUuid : undefined,
+    };
+  };
+  return {
+    uuid: item.uuid,
+    libraryUuid: item.libraryUuid,
+    name: typeof item.name === "string" ? item.name : undefined,
+    description: typeof item.description === "string" ? item.description : undefined,
+    classification: item.classification,
+    symbol: compactAssociation(item.symbol),
+    footprint: compactAssociation(item.footprint),
+    otherProperty: item.otherProperty && typeof item.otherProperty === "object" ? item.otherProperty : undefined,
+  };
+};
 
 const normalizeProject = (value: unknown): DesignContext["project"] => {
   if (!value || typeof value !== "object") return undefined;
@@ -630,6 +970,9 @@ const linePoints = (line: Array<number> | Array<Array<number>>): PinPosition[] =
       ? flatLinePoints(line as Array<number>)
       : (line as Array<Array<number>>).flatMap((segment) => flatLinePoints(segment));
 
+const lineContainsPoint = (line: Array<number> | Array<Array<number>>, point: PinPosition): boolean =>
+  linePoints(line).some((candidate) => samePoint(candidate, point));
+
 const createOrthogonalBridgeLine = (from: PinPosition, to: PinPosition): Array<number> =>
   sameCoordinate(from.x, to.x) || sameCoordinate(from.y, to.y)
     ? [from.x, from.y, to.x, to.y]
@@ -652,6 +995,48 @@ const requireNumber = (value: unknown, name: string): number => {
   if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`${name} must be a finite number.`);
   return value;
 };
+
+const requirePositiveNumber = (value: unknown, name: string): number => {
+  const result = requireNumber(value, name);
+  if (result <= 0) throw new Error(`${name} must be greater than zero.`);
+  return result;
+};
+
+const requireLine = (
+  value: unknown,
+  name: string,
+  minimumPoints: number,
+  allowSegments: boolean,
+): Array<number> | Array<Array<number>> => {
+  if (!Array.isArray(value) || value.length === 0) throw new Error(`${name} must be a coordinate array.`);
+  const validFlat = (line: unknown[]): line is number[] =>
+    line.length >= minimumPoints * 2
+    && line.length % 2 === 0
+    && line.every((item) => typeof item === "number" && Number.isFinite(item));
+  if (validFlat(value)) return [...value];
+  if (
+    allowSegments
+    && value.every((segment) => Array.isArray(segment) && validFlat(segment))
+  ) {
+    return value.map((segment) => [...segment]) as number[][];
+  }
+  throw new Error(
+    `${name} must contain at least ${minimumPoints} finite x/y points${allowSegments ? " in a flat line or valid segments" : " in one flat line"}.`,
+  );
+};
+
+const optionalString = (value: unknown): string | undefined =>
+  typeof value === "string" && value.length > 0 ? value : undefined;
+
+const optionalNullableString = (value: unknown): string | null | undefined =>
+  value === null ? null : optionalString(value);
+
+const optionalNullableNumber = (value: unknown): number | null | undefined =>
+  value === null ? null : optionalNumber(value);
+
+const capitalize = (value: string): string => value.length > 0
+  ? `${value[0]?.toUpperCase()}${value.slice(1)}`
+  : value;
 
 const optionalNumber = (value: unknown): number | undefined =>
   typeof value === "number" && Number.isFinite(value) ? value : undefined;

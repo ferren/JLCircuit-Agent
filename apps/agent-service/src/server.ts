@@ -11,14 +11,25 @@ import {
 import type { ChangeOperation, ChangeSet } from "../../../packages/contracts/src/index.ts";
 import { JLCIRCUIT_TOOLS, getTool } from "../../../packages/mcp/src/index.ts";
 import { ContextEngine } from "./context-engine.ts";
+import { CodexProviderPool } from "./codex-provider-pool.ts";
 import {
   KNOWLEDGE_TOOL_DEFINITIONS,
   KnowledgeService,
   KnowledgeServiceError,
 } from "./knowledge-service.ts";
-import { runAgentTurn, type AgentRunEvent } from "./llm.ts";
+import {
+  runAgentTurn,
+  type AgentRunEvent,
+  type WriteApprovalDecision,
+  type WriteApprovalRequester,
+} from "./llm.ts";
 import { McpRegistry, McpRegistryError } from "./mcp-registry.ts";
 import { SkillRegistry, SkillRegistryError } from "./skill-registry.ts";
+import {
+  createRetryTask,
+  isRetryInstruction,
+  shouldForceExecutionPlanFromHistory,
+} from "./task-lifecycle.ts";
 import {
   AgentStore,
   type PersistedTask as AgentTask,
@@ -27,6 +38,7 @@ import {
 
 const host = process.env.JLCIRCUIT_AGENT_HOST ?? "127.0.0.1";
 const port = Number(process.env.JLCIRCUIT_AGENT_PORT ?? 49630);
+const agentBackend = (process.env.JLCIRCUIT_AGENT_BACKEND ?? "codex-app-server").trim().toLowerCase();
 const bridgeTimeoutMs = Number(process.env.JLCIRCUIT_BRIDGE_TIMEOUT_MS ?? 15_000);
 const localAdminToken = process.env.JLCIRCUIT_ADMIN_TOKEN?.trim()
   || process.env.JLCIRCUIT_MCP_ADMIN_TOKEN?.trim()
@@ -47,11 +59,79 @@ const log = (message: string, details?: unknown): void => {
 };
 
 const store = new AgentStore();
+const codexProviderPool = new CodexProviderPool(store, log);
 const contextEngine = new ContextEngine(store, log);
 const knowledgeService = new KnowledgeService(store, log);
 const builtinToolDefinitions = [...JLCIRCUIT_TOOLS, ...KNOWLEDGE_TOOL_DEFINITIONS];
 const skillRegistry = new SkillRegistry(store, builtinToolDefinitions);
 const mcpRegistry = new McpRegistry(store, log);
+
+const writeApprovalMode = (process.env.JLCIRCUIT_WRITE_APPROVAL_MODE ?? "inline").trim().toLowerCase();
+const writeApprovalTimeoutMs = Number(process.env.JLCIRCUIT_WRITE_APPROVAL_TIMEOUT_MS ?? 180_000);
+const pendingWriteApprovals = new Map<string, {
+  sessionId: string;
+  settle: (decision: "approved" | "rejected") => void;
+}>();
+const autoApproveSessions = new Set<string>();
+
+const createWriteApprovalRequester = (
+  sessionId: string,
+  onEvent: (event: AgentRunEvent) => void,
+  signal?: AbortSignal,
+): WriteApprovalRequester => async (request) => {
+  if (autoApproveSessions.has(sessionId)) {
+    store.appendAuditEvent({
+      sessionId,
+      eventType: "write_approval.auto_approved",
+      payload: { tool: request.tool, arguments: request.arguments },
+    });
+    return "approved";
+  }
+  const approvalId = crypto.randomUUID();
+  const expiresAt = new Date(Date.now() + writeApprovalTimeoutMs).toISOString();
+  store.appendAuditEvent({
+    sessionId,
+    eventType: "write_approval.requested",
+    payload: { approvalId, tool: request.tool, riskLevel: request.riskLevel, arguments: request.arguments },
+  });
+  onEvent({
+    type: "approval_required",
+    approvalId,
+    tool: request.tool,
+    arguments: request.arguments,
+    riskLevel: request.riskLevel,
+    description: request.description,
+    expiresAt,
+  });
+  return await new Promise<WriteApprovalDecision>((resolveDecision) => {
+    let settled = false;
+    const finish = (decision: WriteApprovalDecision, eventDecision: "approved" | "rejected" | "expired"): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      pendingWriteApprovals.delete(approvalId);
+      store.appendAuditEvent({
+        sessionId,
+        eventType: "write_approval.resolved",
+        payload: { approvalId, tool: request.tool, decision: eventDecision },
+      });
+      try {
+        onEvent({ type: "approval_resolved", approvalId, decision: eventDecision });
+      } catch {
+        // The stream may already be closed; the decision still stands.
+      }
+      resolveDecision(decision);
+    };
+    const onAbort = (): void => finish("unavailable", "expired");
+    const timer = setTimeout(() => finish("unavailable", "expired"), writeApprovalTimeoutMs);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    pendingWriteApprovals.set(approvalId, {
+      sessionId,
+      settle: (decision) => finish(decision, decision),
+    });
+  });
+};
 
 class LocalBridgeGateway {
   private socket?: WebSocket;
@@ -306,9 +386,14 @@ const runModelTurn = async (
   mode: "chat" | "plan" = "chat",
   userInstruction = instruction,
   requestedSkillIds?: string[],
-  options: { onEvent?: (event: AgentRunEvent) => void; signal?: AbortSignal } = {},
+  options: { onEvent?: (event: AgentRunEvent) => void; signal?: AbortSignal; providerId?: string } = {},
 ) => {
-  log("[llm] turn started", { sessionId, mode, provider: process.env.JLCIRCUIT_MODEL_PROVIDER ?? "stub" });
+  log("[agent] turn started", {
+    sessionId,
+    mode,
+    backend: agentBackend,
+    provider: options.providerId ?? codexProviderPool.defaultProviderId,
+  });
   const requestedPlanSkills = mode === "plan" && skillRegistry.list().some((skill) =>
     skill.id === "schematic-layout" && skill.enabled)
     ? [...new Set([...(requestedSkillIds ?? []), "schematic-layout"])]
@@ -336,7 +421,10 @@ const runModelTurn = async (
       beforeSequence: userMessage.sequence,
       readDesignContext: () => callTool("easyeda_get_context", sessionId, {}),
     });
-    const result = await runAgentTurn({
+    const requestWriteApproval = writeApprovalMode === "inline" && options.onEvent
+      ? createWriteApprovalRequester(sessionId, options.onEvent, options.signal)
+      : undefined;
+    const turnArgs = {
       instruction,
       sessionId,
       preparedContext,
@@ -346,8 +434,12 @@ const runModelTurn = async (
       mode,
       signal: options.signal,
       onEvent: options.onEvent,
-    });
-    contextEngine.completeTurn({
+      requestWriteApproval,
+    };
+    const result = agentBackend === "legacy"
+      ? await runAgentTurn(turnArgs)
+      : await codexProviderPool.runTurn({ ...turnArgs, providerId: options.providerId });
+    const assistantMessage = contextEngine.completeTurn({
       sessionId,
       mode,
       content: result.message,
@@ -356,7 +448,7 @@ const runModelTurn = async (
       plannedOperationCount: result.plannedOperations.length,
       metadata: { skills: skillRefs, status: result.status, runState: result.runState },
     });
-    log("[llm] turn completed", {
+    log("[agent] turn completed", {
       model: result.model,
       toolCount: result.toolTrace.length,
       plannedOperationCount: result.plannedOperations.length,
@@ -365,7 +457,13 @@ const runModelTurn = async (
       modelRequests: result.runState.modelRequests,
       skills: skillRefs.map((skill) => skill.id),
     });
-    return result;
+    return {
+      ...result,
+      persistence: {
+        userMessageId: userMessage.id,
+        assistantMessageId: assistantMessage.id,
+      },
+    };
   } catch (error) {
     contextEngine.failTurn(sessionId, mode, error);
     throw error;
@@ -383,19 +481,48 @@ const createChangeSet = (result: Awaited<ReturnType<typeof runModelTurn>>): Chan
   createdBy: "agent",
 });
 
-const isExecutableOperation = (operation: ChangeOperation): boolean =>
-  operation.tool === "easyeda_schematic_move_component" &&
-  typeof operation.args.primitiveId === "string" &&
-  typeof operation.args.x === "number" && Number.isFinite(operation.args.x) &&
-  typeof operation.args.y === "number" && Number.isFinite(operation.args.y);
+const finiteNumber = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+const nonEmptyString = (value: unknown): value is string => typeof value === "string" && value.length > 0;
+const validCoordinateLine = (value: unknown, minimumPoints = 2, allowSegments = true): boolean => {
+  if (!Array.isArray(value) || value.length === 0) return false;
+  const validFlat = (line: unknown[]): boolean =>
+    line.length >= minimumPoints * 2 && line.length % 2 === 0 && line.every(finiteNumber);
+  return validFlat(value) || (allowSegments && value.every((line) => Array.isArray(line) && validFlat(line)));
+};
+
+const isExecutableOperation = (operation: ChangeOperation): boolean => {
+  const args = operation.args;
+  switch (operation.tool) {
+    case "easyeda_schematic_move_component":
+      return nonEmptyString(args.primitiveId) && finiteNumber(args.x) && finiteNumber(args.y);
+    case "easyeda_schematic_place_component":
+      return nonEmptyString(args.libraryUuid) && nonEmptyString(args.uuid)
+        && finiteNumber(args.x) && finiteNumber(args.y);
+    case "easyeda_schematic_create_wire":
+      return validCoordinateLine(args.line);
+    case "easyeda_schematic_create_bus":
+      return nonEmptyString(args.busName) && validCoordinateLine(args.line);
+    case "easyeda_schematic_create_rectangle":
+      return finiteNumber(args.topLeftX) && finiteNumber(args.topLeftY)
+        && finiteNumber(args.width) && args.width > 0
+        && finiteNumber(args.height) && args.height > 0;
+    case "easyeda_schematic_create_polygon":
+      return validCoordinateLine(args.line, 3, false);
+    case "easyeda_schematic_create_text":
+      return finiteNumber(args.x) && finiteNumber(args.y) && nonEmptyString(args.content);
+    default:
+      return false;
+  }
+};
 
 const buildPlanInstruction = (instruction: string, forceExecutionPlan: boolean): string => {
   if (!forceExecutionPlan) return instruction;
   return [
     "这是用户明确要求生成可执行修改计划的请求。",
     "请优先生成结构化写操作，不要只返回说明。",
-    "如果缺少 primitiveId，先调用 easyeda_schematic_components 查找匹配的元件。",
-    "信息足够时必须调用 easyeda_schematic_move_component；参数必须包含 primitiveId、x、y，并设置 preserveConnections=true。",
+    "如果缺少 primitiveId，先调用 easyeda_schematic_components，并使用 reference、references、primitiveId、query 或区域参数缩小范围；禁止无参数重复拉取整页元件。",
+    "根据目标选择写工具：移动元件使用 easyeda_schematic_move_component；放置元件使用 easyeda_schematic_place_component；导线/总线/矩形边框/多边形/文本分别使用对应 easyeda_schematic_create_* 工具。",
+    "放置元件必须使用器件库查询得到的 libraryUuid 和 uuid，不得编造；移动已接线元件时设置 preserveConnections=true。",
     "不要要求用户先回复确认、登记或批准；调用写工具后系统会自动生成确认执行按钮。",
     "如果即使读取元件列表后仍然缺少关键信息，请明确指出需要用户补充什么，不要猜测参数。",
     `原始用户需求：${instruction}`,
@@ -407,9 +534,14 @@ const createTaskFromResult = (
   instruction: string,
   result: Awaited<ReturnType<typeof runModelTurn>>,
   persistWithoutOperations = false,
+  parentTaskId?: string,
 ): AgentTask | undefined => {
   const changeSet = createChangeSet(result);
-  if (!persistWithoutOperations && changeSet.operations.length === 0) return undefined;
+  if (!persistWithoutOperations && changeSet.operations.length === 0 && result.status === "completed") return undefined;
+  const parentTask = parentTaskId ? store.getTask(parentTaskId) : undefined;
+  if (parentTask && parentTask.sessionId !== sessionId) {
+    throw new Error("Cannot create a child task from a different session.");
+  }
   const now = new Date().toISOString();
   const taskStatus: AgentTask["status"] = changeSet.operations.length > 0
     ? "waiting_confirmation"
@@ -421,6 +553,8 @@ const createTaskFromResult = (
   const task: AgentTask = {
     taskId: crypto.randomUUID(),
     sessionId,
+    parentTaskId: parentTask?.taskId,
+    attempt: parentTask ? (parentTask.attempt ?? 1) + 1 : 1,
     instruction,
     status: taskStatus,
     model: result.model,
@@ -433,17 +567,98 @@ const createTaskFromResult = (
     createdAt: now,
     updatedAt: now,
   };
-  store.saveTask(task);
+  store.saveTask(task, {
+    setCurrent: true,
+    messageIds: [result.persistence.userMessageId, result.persistence.assistantMessageId],
+  });
   store.appendAuditEvent({
     sessionId,
     taskId: task.taskId,
     eventType: "task.created",
-    payload: { status: task.status, operationCount: task.changeSet.operations.length },
+    payload: {
+      status: task.status,
+      operationCount: task.changeSet.operations.length,
+      parentTaskId: task.parentTaskId,
+      attempt: task.attempt,
+    },
   });
   return task;
 };
 
 const taskView = (task: AgentTask) => ({ ...task });
+
+const turnView = (result: Awaited<ReturnType<typeof runModelTurn>>) => {
+  const { persistence: _persistence, ...publicResult } = result;
+  return publicResult;
+};
+
+const latestAssistantMessage = (sessionId: string): string | undefined =>
+  store.listMessages(sessionId, 12).filter((message) => message.role === "assistant").at(-1)?.content;
+
+const currentTaskForSession = (sessionId: string): AgentTask | undefined => {
+  const currentTaskId = store.getSession(sessionId)?.currentTaskId;
+  return currentTaskId ? store.getTask(currentTaskId) : undefined;
+};
+
+const resolveParentTaskId = (sessionId: string, parentTaskId?: string): string | undefined => {
+  if (!parentTaskId) return undefined;
+  const parent = store.getTask(parentTaskId);
+  if (!parent || parent.sessionId !== sessionId) {
+    throw new HttpRequestError(400, "parentTaskId does not identify a task in the current session.");
+  }
+  return parent.taskId;
+};
+
+const createRetryAttempt = (
+  source: AgentTask,
+  instruction = `按原计划重试任务 ${source.taskId}`,
+): AgentTask => {
+  // Validate and clone the failed ChangeSet before persisting a new conversation turn.
+  // This prevents an invalid retry from leaving behind a half-written user turn.
+  const task = createRetryTask(source);
+  const userMessage = contextEngine.beginTurn(source.sessionId, instruction, "chat", {
+    retryOfTaskId: source.taskId,
+  });
+  const assistantMessage = contextEngine.completeTurn({
+    sessionId: source.sessionId,
+    mode: "chat",
+    content: task.message,
+    model: task.model,
+    toolCount: 0,
+    plannedOperationCount: task.changeSet.operations.length,
+    metadata: {
+      status: "awaiting_approval",
+      retryOfTaskId: source.taskId,
+      attempt: task.attempt,
+    },
+  });
+  store.saveTask(task, {
+    setCurrent: true,
+    messageIds: [userMessage.id, assistantMessage.id],
+  });
+  store.appendAuditEvent({
+    sessionId: task.sessionId,
+    taskId: task.taskId,
+    eventType: "task.retried",
+    payload: {
+      parentTaskId: source.taskId,
+      attempt: task.attempt,
+      operationCount: task.changeSet.operations.length,
+    },
+  });
+  return task;
+};
+
+const retryTurnView = (task: AgentTask) => ({
+  status: "awaiting_approval" as const,
+  message: task.message,
+  model: task.model,
+  context: task.context,
+  plannedOperations: task.changeSet.operations,
+  skills: task.skills ?? [],
+  toolTrace: [],
+  task: taskView(task),
+});
 
 const getTaskIdFromPath = (pathname: string, suffix: string): string | undefined => {
   const prefix = "/v1/tasks/";
@@ -497,12 +712,12 @@ const executeTask = async (task: AgentTask): Promise<boolean> => {
   }
   const operations: TaskExecution["operations"] = [];
   for (const operation of task.changeSet.operations) {
-    if (operation.tool !== "easyeda_schematic_move_component") {
+    if (!isExecutableOperation(operation)) {
       operations.push({
         operationId: operation.id,
         tool: operation.tool,
         ok: false,
-        error: "当前阶段只允许执行原理图元件移动操作。",
+        error: "写操作类型不受支持或参数未通过执行前校验。",
       });
       continue;
     }
@@ -517,18 +732,6 @@ const executeTask = async (task: AgentTask): Promise<boolean> => {
       ok: result.ok,
       data: result.ok ? result.data : undefined,
       error: result.ok ? undefined : result.error?.message,
-    });
-    if (!result.ok) break;
-  }
-
-  const executedOperationIds = new Set(operations.map((operation) => operation.operationId));
-  for (const operation of task.changeSet.operations) {
-    if (executedOperationIds.has(operation.id)) continue;
-    operations.push({
-      operationId: operation.id,
-      tool: operation.tool,
-      ok: false,
-      error: "前序写操作失败，为避免扩大影响，本操作未执行。",
     });
   }
 
@@ -546,6 +749,13 @@ const executeTask = async (task: AgentTask): Promise<boolean> => {
   };
   const operationsOk = operations.length > 0 && operations.every((operation) => operation.ok);
   task.status = operationsOk && verification.ok ? "completed" : "failed";
+  const failedOperations = operations.filter((operation) => !operation.ok);
+  if (failedOperations.length > 0 && failedOperations.length < operations.length) {
+    task.message = [
+      task.message,
+      `执行结果：${operations.length - failedOperations.length}/${operations.length} 条操作成功，${failedOperations.length} 条失败。已成功的操作保持生效；可“按原计划重试”仅重试失败的操作。`,
+    ].filter(Boolean).join("\n\n");
+  }
   task.updatedAt = new Date().toISOString();
   store.saveTask(task);
   store.appendAuditEvent({
@@ -563,7 +773,9 @@ const server = createServer(async (request, response) => {
 
     if (request.method === "OPTIONS") {
       const origin = typeof request.headers.origin === "string" ? request.headers.origin : undefined;
-      const isLocalManagement = url.pathname.startsWith("/v1/mcp/") || url.pathname.startsWith("/v1/knowledge/");
+      const isLocalManagement = url.pathname.startsWith("/v1/mcp/")
+        || url.pathname.startsWith("/v1/knowledge/")
+        || url.pathname.startsWith("/v1/providers/");
       if (isLocalManagement && origin && !localAdminAllowedOrigins.has(origin)) {
         throw new HttpRequestError(403, `Local management origin is not allowed: ${origin}`);
       }
@@ -584,6 +796,8 @@ const server = createServer(async (request, response) => {
         bridge: bridge.connected ? "connected" : "not-connected",
         bridgeProtocolVersion: 1,
         persistence: { type: "sqlite", status: "ready" },
+        agentBackend,
+        codexProviders: codexProviderPool.list(),
         mcp: {
           configured: mcpRegistry.list().length,
           connected: mcpRegistry.list().filter((server) => server.status === "connected").length,
@@ -594,6 +808,23 @@ const server = createServer(async (request, response) => {
         },
         timestamp: new Date().toISOString(),
       });
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/v1/providers") {
+      json(response, 200, {
+        backend: agentBackend,
+        defaultProviderId: codexProviderPool.defaultProviderId,
+        providers: codexProviderPool.list(),
+      });
+      return;
+    }
+
+    const providerRestartMatch = /^\/v1\/providers\/([^/]+)\/restart$/.exec(url.pathname);
+    if (request.method === "POST" && providerRestartMatch) {
+      requireLocalAdmin(request);
+      const providerId = decodeURIComponent(providerRestartMatch[1] as string);
+      json(response, 200, { provider: await codexProviderPool.restart(providerId) });
       return;
     }
 
@@ -827,22 +1058,75 @@ const server = createServer(async (request, response) => {
       return;
     }
 
+    if (request.method === "POST" && url.pathname.startsWith("/v1/approvals/")) {
+      const approvalId = decodeURIComponent(url.pathname.slice("/v1/approvals/".length));
+      const body = (await readBody(request)) as {
+        decision?: string;
+        autoApproveSession?: boolean;
+      };
+      const pending = pendingWriteApprovals.get(approvalId);
+      if (!pending) {
+        json(response, 404, {
+          error: "approval_not_found",
+          message: "该审批请求不存在或已过期（超时后写操作会退回待确认 ChangeSet）。",
+        });
+        return;
+      }
+      const decision = body.decision === "approve" ? "approved" : body.decision === "reject" ? "rejected" : undefined;
+      if (!decision) {
+        json(response, 400, { error: "invalid_request", message: "decision 必须是 approve 或 reject。" });
+        return;
+      }
+      if (decision === "approved" && body.autoApproveSession === true) {
+        autoApproveSessions.add(pending.sessionId);
+        store.appendAuditEvent({
+          sessionId: pending.sessionId,
+          eventType: "write_approval.session_auto_approve_enabled",
+          payload: { approvalId },
+        });
+      }
+      pending.settle(decision);
+      json(response, 200, { approvalId, decision });
+      return;
+    }
+
     if (request.method === "POST" && url.pathname === "/v1/chat/stream") {
       const body = (await readBody(request)) as {
         sessionId?: string;
         instruction?: string;
         skillIds?: string[];
+        providerId?: string;
         forceExecutionPlan?: boolean;
+        parentTaskId?: string;
       };
       const sessionId = body.sessionId ?? "default";
       const instruction = body.instruction?.trim();
-      const forceExecutionPlan = body.forceExecutionPlan === true;
-      log(`[http] POST ${url.pathname}`, { sessionId, instructionLength: instruction?.length ?? 0, forceExecutionPlan });
       if (!instruction) {
         json(response, 400, { error: "invalid_request", message: "instruction is required." });
         return;
       }
-
+      const currentTask = currentTaskForSession(sessionId);
+      const directRetry = isRetryInstruction(instruction)
+        && currentTask?.status === "failed"
+        && currentTask.changeSet.operations.length > 0
+        ? currentTask
+        : undefined;
+      const autoForceExecutionPlan = shouldForceExecutionPlanFromHistory(
+        instruction,
+        latestAssistantMessage(sessionId),
+      );
+      const forceExecutionPlan = body.forceExecutionPlan === true || autoForceExecutionPlan;
+      const parentTaskId = resolveParentTaskId(
+        sessionId,
+        body.parentTaskId ?? (autoForceExecutionPlan ? currentTask?.taskId : undefined),
+      );
+      log(`[http] POST ${url.pathname}`, {
+        sessionId,
+        instructionLength: instruction?.length ?? 0,
+        forceExecutionPlan,
+        autoForceExecutionPlan,
+        directRetry: Boolean(directRetry),
+      });
       startSse(response);
       const abortController = new AbortController();
       const heartbeat = setInterval(() => {
@@ -853,6 +1137,19 @@ const server = createServer(async (request, response) => {
       });
       writeSse(response, "connected", { sessionId, status: "running", startedAt: new Date().toISOString() });
       try {
+        if (directRetry) {
+          const task = createRetryAttempt(directRetry, instruction);
+          writeSse(response, "result", { sessionId, ...retryTurnView(task) });
+          writeSse(response, "done", { sessionId, status: "awaiting_approval" });
+          return;
+        }
+        if (autoForceExecutionPlan) {
+          store.appendAuditEvent({
+            sessionId,
+            eventType: "turn.auto_force_execution_plan",
+            payload: { instruction, parentTaskId },
+          });
+        }
         const result = await runModelTurn(
           sessionId,
           buildPlanInstruction(instruction, forceExecutionPlan),
@@ -864,10 +1161,11 @@ const server = createServer(async (request, response) => {
           {
             signal: abortController.signal,
             onEvent: (event) => writeSse(response, event.type, event),
+            providerId: body.providerId,
           },
         );
-        const task = createTaskFromResult(sessionId, instruction, result);
-        writeSse(response, "result", { sessionId, ...result, task: task ? taskView(task) : undefined });
+        const task = createTaskFromResult(sessionId, instruction, result, false, parentTaskId);
+        writeSse(response, "result", { sessionId, ...turnView(result), task: task ? taskView(task) : undefined });
         writeSse(response, "done", { sessionId, status: result.status });
       } catch (error) {
         if (!abortController.signal.aborted) {
@@ -888,15 +1186,45 @@ const server = createServer(async (request, response) => {
         sessionId?: string;
         instruction?: string;
         skillIds?: string[];
+        providerId?: string;
         forceExecutionPlan?: boolean;
+        parentTaskId?: string;
       };
       const sessionId = body.sessionId ?? "default";
       const instruction = body.instruction?.trim();
-      const forceExecutionPlan = body.forceExecutionPlan === true;
-      log(`[http] POST ${url.pathname}`, { sessionId, instructionLength: instruction?.length ?? 0 });
       if (!instruction) {
         json(response, 400, { error: "invalid_request", message: "instruction is required." });
         return;
+      }
+      const currentTask = currentTaskForSession(sessionId);
+      if (isRetryInstruction(instruction)
+        && currentTask?.status === "failed"
+        && currentTask.changeSet.operations.length > 0) {
+        const task = createRetryAttempt(currentTask, instruction);
+        json(response, 200, { sessionId, ...retryTurnView(task) });
+        return;
+      }
+      const autoForceExecutionPlan = shouldForceExecutionPlanFromHistory(
+        instruction,
+        latestAssistantMessage(sessionId),
+      );
+      const forceExecutionPlan = body.forceExecutionPlan === true || autoForceExecutionPlan;
+      const parentTaskId = resolveParentTaskId(
+        sessionId,
+        body.parentTaskId ?? (autoForceExecutionPlan ? currentTask?.taskId : undefined),
+      );
+      log(`[http] POST ${url.pathname}`, {
+        sessionId,
+        instructionLength: instruction.length,
+        forceExecutionPlan,
+        autoForceExecutionPlan,
+      });
+      if (autoForceExecutionPlan) {
+        store.appendAuditEvent({
+          sessionId,
+          eventType: "turn.auto_force_execution_plan",
+          payload: { instruction, parentTaskId },
+        });
       }
       const result = await runModelTurn(
         sessionId,
@@ -906,14 +1234,22 @@ const server = createServer(async (request, response) => {
         forceExecutionPlan
           ? [...new Set([...(body.skillIds ?? []), "schematic-layout"])]
           : body.skillIds,
+        { providerId: body.providerId },
       );
-      const task = createTaskFromResult(sessionId, instruction, result);
-      json(response, 200, { sessionId, ...result, task: task ? taskView(task) : undefined });
+      const task = createTaskFromResult(sessionId, instruction, result, false, parentTaskId);
+      json(response, 200, { sessionId, ...turnView(result), task: task ? taskView(task) : undefined });
       return;
     }
 
     if (request.method === "POST" && url.pathname === "/v1/plan") {
-      const body = (await readBody(request)) as { sessionId?: string; instruction?: string; forceExecutionPlan?: boolean; skillIds?: string[] };
+      const body = (await readBody(request)) as {
+        sessionId?: string;
+        instruction?: string;
+        forceExecutionPlan?: boolean;
+        skillIds?: string[];
+        providerId?: string;
+        parentTaskId?: string;
+      };
       const sessionId = body.sessionId ?? "default";
       const instruction = body.instruction?.trim();
       const forceExecutionPlan = body.forceExecutionPlan === true;
@@ -928,8 +1264,15 @@ const server = createServer(async (request, response) => {
         "plan",
         instruction,
         body.skillIds,
+        { providerId: body.providerId },
       );
-      const task = createTaskFromResult(sessionId, instruction, result, true)!;
+      const task = createTaskFromResult(
+        sessionId,
+        instruction,
+        result,
+        true,
+        resolveParentTaskId(sessionId, body.parentTaskId),
+      )!;
       json(response, 200, taskView(task));
       return;
     }
@@ -944,6 +1287,37 @@ const server = createServer(async (request, response) => {
         return;
       }
       json(response, 200, taskView(task));
+      return;
+    }
+
+    const taskIdForRetry = request.method === "POST"
+      ? getTaskIdFromPath(url.pathname, "/retry")
+      : undefined;
+    if (taskIdForRetry) {
+      const source = store.getTask(taskIdForRetry);
+      if (!source) {
+        json(response, 404, { error: "not_found", message: "task not found" });
+        return;
+      }
+      if (source.status !== "failed") {
+        json(response, 409, {
+          error: "invalid_state",
+          message: `任务当前状态为 ${source.status}，只有失败任务可以按原计划重试。`,
+          task: taskView(source),
+        });
+        return;
+      }
+      const body = (await readBody(request)) as { instruction?: string };
+      try {
+        const task = createRetryAttempt(source, body.instruction?.trim() || undefined);
+        json(response, 201, taskView(task));
+      } catch (error) {
+        json(response, 409, {
+          error: "retry_unavailable",
+          message: error instanceof Error ? error.message : String(error),
+          task: taskView(source),
+        });
+      }
       return;
     }
 
@@ -1095,6 +1469,8 @@ server.listen(port, host, () => {
   console.log(`JLCircuit Agent listening on http://${host}:${port}`);
   console.log(`EDA bridge waiting on ws://${host}:${port}/bridge`);
   console.log(`Session database: ${store.path}`);
+  console.log(`Agent backend: ${agentBackend}`);
+  console.log(`Codex providers: ${codexProviderPool.list().map((provider) => provider.id).join(", ")}`);
   console.log(`MCP config: ${mcpRegistry.path}`);
   console.log(`Local management: loopback only, admin token ${localAdminToken ? "required" : "not configured"}`);
   void mcpRegistry.start().catch((error) => log("[mcp] startup failed", {
@@ -1111,6 +1487,7 @@ const shutdown = (signal: string): void => {
   server.close(async () => {
     bridgeServer.close();
     await mcpRegistry.close();
+    await codexProviderPool.close();
     store.close();
     process.exit(0);
   });

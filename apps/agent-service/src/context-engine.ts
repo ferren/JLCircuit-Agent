@@ -5,6 +5,8 @@ import {
   type ConversationMessage,
   type ConversationMode,
   type PersistedTask,
+  sanitizeHistoricalAssistantContent,
+  sanitizeHistoricalSummary,
 } from "./storage.ts";
 
 const positiveInteger = (value: string | undefined, fallback: number): number => {
@@ -92,16 +94,49 @@ const selectMessagesByBudget = (
 
 const taskForContext = (task: PersistedTask) => ({
   taskId: task.taskId,
+  parentTaskId: task.parentTaskId,
+  attempt: task.attempt ?? 1,
   status: task.status,
   instruction: task.instruction,
-  assistantMessage: task.message,
+  assistantMessage: sanitizeHistoricalAssistantContent(task.message),
   operations: task.changeSet.operations.map((operation) => ({
     tool: operation.tool,
     args: operation.args,
     description: operation.description,
   })),
+  execution: task.execution ? {
+    operations: task.execution.operations.map((operation) => ({
+      operationId: operation.operationId,
+      tool: operation.tool,
+      ok: operation.ok,
+      error: operation.error,
+    })),
+    verification: task.execution.verification ? {
+      ok: task.execution.verification.ok,
+      error: task.execution.verification.error,
+    } : undefined,
+  } : undefined,
   updatedAt: task.updatedAt,
 });
+
+const messageForModel = (message: ConversationMessage): ConversationMessage => {
+  if (message.role !== "assistant") return message;
+  const metadata = isRecord(message.metadata) ? message.metadata : {};
+  const runState = isRecord(metadata.runState) ? metadata.runState : {};
+  const checkpoint = isRecord(runState.checkpoint) ? runState.checkpoint : undefined;
+  const status = typeof metadata.status === "string" ? metadata.status : undefined;
+  const stopReason = typeof runState.stopReason === "string" ? runState.stopReason : undefined;
+  const continuation = status || stopReason || checkpoint
+    ? stringifyForModel({ status, stopReason, checkpoint })
+    : undefined;
+  return {
+    ...message,
+    content: [
+      sanitizeHistoricalAssistantContent(message.content),
+      continuation ? `[结构化回合状态] ${continuation}` : undefined,
+    ].filter(Boolean).join("\n"),
+  };
+};
 
 export type PreparedAgentContext = {
   sessionId: string;
@@ -298,11 +333,21 @@ export class ContextEngine {
       input.beforeSequence,
       this.recentMessageLimit,
     );
-    const recentMessages = selectMessagesByBudget(recentCandidates, this.historyMaxChars);
-    const sessionSummary = truncateText(session.summary, this.summaryMaxChars);
-    const activeTasks = this.store
-      .listTasksForSession(input.sessionId, 20)
-      .filter((task) => ["planning", "awaiting_user", "waiting_confirmation", "executing"].includes(task.status))
+    const recentMessages = selectMessagesByBudget(recentCandidates, this.historyMaxChars)
+      .map(messageForModel);
+    const sessionSummary = truncateText(sanitizeHistoricalSummary(session.summary), this.summaryMaxChars);
+    const sessionTasks = this.store.listTasksForSession(input.sessionId, 20);
+    const currentTask = session.currentTaskId
+      ? sessionTasks.find((task) => task.taskId === session.currentTaskId) ?? this.store.getTask(session.currentTaskId)
+      : undefined;
+    const activeStatuses = ["planning", "awaiting_user", "waiting_confirmation", "executing"];
+    const additionalTasks = sessionTasks.filter((task) =>
+      task.taskId !== currentTask?.taskId &&
+      (currentTask
+        ? ["planning", "waiting_confirmation", "executing"].includes(task.status)
+        : activeStatuses.includes(task.status)));
+    const activeTasks = [currentTask, ...additionalTasks]
+      .filter((task): task is PersistedTask => Boolean(task))
       .slice(0, this.activeTaskLimit)
       .map(taskForContext);
     const activeTasksText = truncateText(stringifyForModel(activeTasks), this.activeTaskMaxChars);

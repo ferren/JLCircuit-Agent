@@ -29,6 +29,8 @@ export type PersistedSkillRef = {
 export type PersistedTask = {
   taskId: string;
   sessionId: string;
+  parentTaskId?: string;
+  attempt?: number;
   instruction: string;
   status: PersistedTaskStatus;
   model: string;
@@ -47,8 +49,19 @@ export type SessionRecord = {
   id: string;
   projectId?: string;
   projectName?: string;
+  currentTaskId?: string;
   summary: string;
   summaryThroughSequence: number;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type CodexThreadRecord = {
+  sessionId: string;
+  providerId: string;
+  threadId: string;
+  model: string;
+  toolSignature: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -154,10 +167,31 @@ const jsonParse = <T>(value: unknown, fallback: T): T => {
 const optionalString = (value: unknown): string | undefined =>
   typeof value === "string" && value.length > 0 ? value : undefined;
 
+const staleToolAvailabilityPatterns = [
+  /本(?:轮|回合).{0,20}(?:被)?(?:禁止|不可|无法|不能).{0,12}调用(?:写)?工具/giu,
+  /(?:受|由于).{0,20}[“"]?禁止调用工具[”"]?.{0,20}(?:限制)?/giu,
+  /(?:当前|本轮|本回合).{0,20}(?:写)?工具.{0,12}(?:未挂载|未提供|被禁用|不可用)/giu,
+] as const;
+
+export const sanitizeHistoricalAssistantContent = (content: string): string => {
+  let sanitized = content;
+  for (const pattern of staleToolAvailabilityPatterns) {
+    sanitized = sanitized.replace(pattern, "[过期工具状态已忽略]");
+  }
+  return sanitized;
+};
+
+export const sanitizeHistoricalSummary = (summary: string): string =>
+  summary
+    .split("\n")
+    .map((line) => line.startsWith("助手：") ? sanitizeHistoricalAssistantContent(line) : line)
+    .join("\n");
+
 const rowToSession = (row: SqlRow): SessionRecord => ({
   id: String(row.id),
   projectId: optionalString(row.project_id),
   projectName: optionalString(row.project_name),
+  currentTaskId: optionalString(row.current_task_id),
   summary: typeof row.summary === "string" ? row.summary : "",
   summaryThroughSequence: Number(row.summary_through_sequence ?? 0),
   createdAt: String(row.created_at),
@@ -177,9 +211,21 @@ const rowToMessage = (row: SqlRow): ConversationMessage => ({
   createdAt: String(row.created_at),
 });
 
+const rowToCodexThread = (row: SqlRow): CodexThreadRecord => ({
+  sessionId: String(row.session_id),
+  providerId: String(row.provider_id),
+  threadId: String(row.thread_id),
+  model: String(row.model),
+  toolSignature: String(row.tool_signature),
+  createdAt: String(row.created_at),
+  updatedAt: String(row.updated_at),
+});
+
 const rowToTask = (row: SqlRow): PersistedTask => ({
   taskId: String(row.task_id),
   sessionId: String(row.session_id),
+  parentTaskId: optionalString(row.parent_task_id),
+  attempt: Math.max(1, Number(row.attempt ?? 1)),
   instruction: String(row.instruction),
   status: String(row.status) as PersistedTaskStatus,
   model: String(row.model),
@@ -269,6 +315,7 @@ export class AgentStore {
         id TEXT PRIMARY KEY,
         project_id TEXT,
         project_name TEXT,
+        current_task_id TEXT,
         summary TEXT NOT NULL DEFAULT '',
         summary_through_sequence INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL,
@@ -293,6 +340,8 @@ export class AgentStore {
       CREATE TABLE IF NOT EXISTS tasks (
         task_id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        parent_task_id TEXT,
+        attempt INTEGER NOT NULL DEFAULT 1,
         instruction TEXT NOT NULL,
         status TEXT NOT NULL,
         model TEXT NOT NULL,
@@ -318,6 +367,19 @@ export class AgentStore {
         captured_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS codex_threads (
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        provider_id TEXT NOT NULL,
+        thread_id TEXT NOT NULL,
+        model TEXT NOT NULL,
+        tool_signature TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (session_id, provider_id)
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_codex_threads_provider_thread
+        ON codex_threads(provider_id, thread_id);
 
       CREATE TABLE IF NOT EXISTS audit_events (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -394,12 +456,33 @@ export class AgentStore {
         tokenize='trigram'
       );
 
-      PRAGMA user_version = 4;
+      PRAGMA user_version = 6;
     `);
+    const sessionColumns = this.database.prepare("PRAGMA table_info(sessions)").all() as SqlRow[];
+    if (!sessionColumns.some((column) => column.name === "current_task_id")) {
+      this.database.exec("ALTER TABLE sessions ADD COLUMN current_task_id TEXT;");
+    }
     const taskColumns = this.database.prepare("PRAGMA table_info(tasks)").all() as SqlRow[];
     if (!taskColumns.some((column) => column.name === "skills_json")) {
       this.database.exec("ALTER TABLE tasks ADD COLUMN skills_json TEXT NOT NULL DEFAULT '[]';");
     }
+    if (!taskColumns.some((column) => column.name === "parent_task_id")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN parent_task_id TEXT;");
+    }
+    if (!taskColumns.some((column) => column.name === "attempt")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1;");
+    }
+    this.database.exec(`
+      UPDATE sessions
+      SET current_task_id = (
+        SELECT task_id FROM tasks
+        WHERE tasks.session_id = sessions.id
+        ORDER BY tasks.updated_at DESC LIMIT 1
+      )
+      WHERE current_task_id IS NULL
+        AND EXISTS (SELECT 1 FROM tasks WHERE tasks.session_id = sessions.id);
+      PRAGMA user_version = 6;
+    `);
   }
 
   public ensureSession(
@@ -489,9 +572,10 @@ export class AgentStore {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       this.database.prepare("DELETE FROM messages WHERE session_id = ?").run(sessionId);
+      this.database.prepare("DELETE FROM codex_threads WHERE session_id = ?").run(sessionId);
       this.database.prepare(`
         UPDATE sessions
-        SET summary = '', summary_through_sequence = 0, updated_at = ?
+        SET summary = '', summary_through_sequence = 0, current_task_id = NULL, updated_at = ?
         WHERE id = ?
       `).run(now, sessionId);
       this.database.exec("COMMIT");
@@ -499,6 +583,53 @@ export class AgentStore {
       this.database.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  public getCodexThread(sessionId: string, providerId: string): CodexThreadRecord | undefined {
+    const row = this.database.prepare(`
+      SELECT * FROM codex_threads WHERE session_id = ? AND provider_id = ?
+    `).get(sessionId, providerId) as SqlRow | undefined;
+    return row ? rowToCodexThread(row) : undefined;
+  }
+
+  public upsertCodexThread(input: {
+    sessionId: string;
+    providerId: string;
+    threadId: string;
+    model: string;
+    toolSignature: string;
+  }): CodexThreadRecord {
+    this.ensureSession(input.sessionId);
+    const now = new Date().toISOString();
+    this.database.prepare(`
+      INSERT INTO codex_threads (
+        session_id, provider_id, thread_id, model, tool_signature, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(session_id, provider_id) DO UPDATE SET
+        thread_id = excluded.thread_id,
+        model = excluded.model,
+        tool_signature = excluded.tool_signature,
+        updated_at = excluded.updated_at
+    `).run(
+      input.sessionId,
+      input.providerId,
+      input.threadId,
+      input.model,
+      input.toolSignature,
+      now,
+      now,
+    );
+    return this.getCodexThread(input.sessionId, input.providerId) as CodexThreadRecord;
+  }
+
+  public deleteCodexThread(sessionId: string, providerId?: string): void {
+    if (providerId) {
+      this.database.prepare(`
+        DELETE FROM codex_threads WHERE session_id = ? AND provider_id = ?
+      `).run(sessionId, providerId);
+      return;
+    }
+    this.database.prepare("DELETE FROM codex_threads WHERE session_id = ?").run(sessionId);
   }
 
   public refreshSessionSummary(sessionId: string, keepRecent: number, maxChars: number): string {
@@ -517,10 +648,13 @@ export class AgentStore {
     const additions = rows.map((row) => {
       const message = rowToMessage(row);
       const label = message.role === "user" ? "用户" : "助手";
-      const compact = message.content.replace(/\s+/g, " ").trim().slice(0, 1_200);
+      const modelSafeContent = message.role === "assistant"
+        ? sanitizeHistoricalAssistantContent(message.content)
+        : message.content;
+      const compact = modelSafeContent.replace(/\s+/g, " ").trim().slice(0, 1_200);
       return `${label}：${compact}`;
     });
-    let summary = [session.summary, ...additions].filter(Boolean).join("\n");
+    let summary = [sanitizeHistoricalSummary(session.summary), ...additions].filter(Boolean).join("\n");
     if (summary.length > maxChars) {
       summary = `[较早内容已压缩]\n${summary.slice(-Math.max(0, maxChars - 12))}`;
     }
@@ -532,41 +666,80 @@ export class AgentStore {
     return summary;
   }
 
-  public saveTask(task: PersistedTask): void {
+  public saveTask(
+    task: PersistedTask,
+    options: { setCurrent?: boolean; messageIds?: string[] } = {},
+  ): void {
     this.ensureSession(task.sessionId);
+    const persist = () => {
+      this.database.prepare(`
+        INSERT INTO tasks (
+          task_id, session_id, parent_task_id, attempt, instruction, status, model, message,
+          context_json, tool_trace_json, change_set_json, confirmation_token,
+          execution_json, skills_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(task_id) DO UPDATE SET
+          parent_task_id = excluded.parent_task_id,
+          attempt = excluded.attempt,
+          status = excluded.status,
+          model = excluded.model,
+          message = excluded.message,
+          context_json = excluded.context_json,
+          tool_trace_json = excluded.tool_trace_json,
+          change_set_json = excluded.change_set_json,
+          confirmation_token = excluded.confirmation_token,
+          execution_json = excluded.execution_json,
+          skills_json = excluded.skills_json,
+          updated_at = excluded.updated_at
+      `).run(
+        task.taskId,
+        task.sessionId,
+        task.parentTaskId ?? null,
+        task.attempt ?? 1,
+        task.instruction,
+        task.status,
+        task.model,
+        task.message,
+        jsonStringify(task.context),
+        jsonStringify(task.toolTrace),
+        jsonStringify(task.changeSet),
+        task.confirmationToken ?? null,
+        task.execution ? jsonStringify(task.execution) : null,
+        jsonStringify(task.skills ?? []),
+        task.createdAt,
+        task.updatedAt,
+      );
+      for (const messageId of options.messageIds ?? []) {
+        this.database.prepare(`
+          UPDATE messages SET task_id = ? WHERE id = ? AND session_id = ?
+        `).run(task.taskId, messageId, task.sessionId);
+      }
+      if (options.setCurrent) {
+        this.database.prepare(`
+          UPDATE sessions SET current_task_id = ?, updated_at = ? WHERE id = ?
+        `).run(task.taskId, task.updatedAt, task.sessionId);
+      }
+    };
+    const useTransaction = options.setCurrent === true || (options.messageIds?.length ?? 0) > 0;
+    if (!useTransaction) {
+      persist();
+      return;
+    }
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      persist();
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  public setCurrentTask(sessionId: string, taskId: string | undefined): void {
+    this.ensureSession(sessionId);
     this.database.prepare(`
-      INSERT INTO tasks (
-        task_id, session_id, instruction, status, model, message,
-        context_json, tool_trace_json, change_set_json, confirmation_token,
-        execution_json, skills_json, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(task_id) DO UPDATE SET
-        status = excluded.status,
-        model = excluded.model,
-        message = excluded.message,
-        context_json = excluded.context_json,
-        tool_trace_json = excluded.tool_trace_json,
-        change_set_json = excluded.change_set_json,
-        confirmation_token = excluded.confirmation_token,
-        execution_json = excluded.execution_json,
-        skills_json = excluded.skills_json,
-        updated_at = excluded.updated_at
-    `).run(
-      task.taskId,
-      task.sessionId,
-      task.instruction,
-      task.status,
-      task.model,
-      task.message,
-      jsonStringify(task.context),
-      jsonStringify(task.toolTrace),
-      jsonStringify(task.changeSet),
-      task.confirmationToken ?? null,
-      task.execution ? jsonStringify(task.execution) : null,
-      jsonStringify(task.skills ?? []),
-      task.createdAt,
-      task.updatedAt,
-    );
+      UPDATE sessions SET current_task_id = ?, updated_at = ? WHERE id = ?
+    `).run(taskId ?? null, new Date().toISOString(), sessionId);
   }
 
   public getTask(taskId: string): PersistedTask | undefined {

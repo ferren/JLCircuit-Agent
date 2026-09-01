@@ -113,3 +113,117 @@ test("Context Engine blocks conversation history from crossing EDA projects", as
     store.close();
   }
 });
+
+test("Context Engine removes stale assistant tool-availability claims from model history", async () => {
+  const store = new AgentStore(":memory:");
+  try {
+    const engine = new ContextEngine(store);
+    store.ensureSession("sanitized-history");
+    store.appendMessage({
+      sessionId: "sanitized-history",
+      role: "assistant",
+      mode: "chat",
+      content: "本轮被禁止调用工具，下一轮再登记 U1。",
+    });
+    const current = engine.beginTurn("sanitized-history", "继续登记", "chat");
+    const prepared = await engine.prepareTurn({
+      sessionId: "sanitized-history",
+      beforeSequence: current.sequence,
+      readDesignContext: async () => ({
+        requestId: "sanitized-history-context",
+        ok: true,
+        data: {
+          project: { id: "project-1" },
+          activeDocument: { id: "sheet-1" },
+          summary: {},
+          capturedAt: "2026-08-28T00:00:00.000Z",
+        },
+      }),
+    });
+
+    assert.doesNotMatch(prepared.recentMessages[0]?.content ?? "", /被禁止调用工具/);
+    assert.match(prepared.recentMessages[0]?.content ?? "", /过期工具状态已忽略/);
+    assert.equal(store.listMessages("sanitized-history")[0]?.content, "本轮被禁止调用工具，下一轮再登记 U1。");
+  } finally {
+    store.close();
+  }
+});
+
+test("Context Engine carries the current failed task and structured checkpoint into retries", async () => {
+  const store = new AgentStore(":memory:");
+  try {
+    const engine = new ContextEngine(store);
+    store.ensureSession("retry-context");
+    store.saveTask({
+      taskId: "failed-task",
+      sessionId: "retry-context",
+      attempt: 1,
+      instruction: "移动 U013",
+      status: "failed",
+      model: "test-model",
+      message: "桥接线创建失败。",
+      context: {},
+      toolTrace: [],
+      changeSet: {
+        id: "failed-change",
+        summary: "移动 U013",
+        operations: [{
+          id: "failed-operation",
+          tool: "easyeda_schematic_move_component",
+          args: { primitiveId: "ie5035", x: 700, y: 520 },
+          targets: [],
+          riskLevel: "high",
+          description: "移动元件",
+        }],
+        requiresConfirmation: true,
+        createdAt: "2026-08-28T00:00:00.000Z",
+        createdBy: "agent",
+      },
+      execution: {
+        operations: [{
+          operationId: "failed-operation",
+          tool: "easyeda_schematic_move_component",
+          ok: false,
+          error: "unverifiable bridge",
+        }],
+      },
+      createdAt: "2026-08-28T00:00:00.000Z",
+      updatedAt: "2026-08-28T00:01:00.000Z",
+    }, { setCurrent: true });
+    store.appendMessage({
+      sessionId: "retry-context",
+      role: "assistant",
+      mode: "chat",
+      content: "下一轮再重试。",
+      metadata: {
+        status: "awaiting_user",
+        runState: {
+          stopReason: "model_completed",
+          checkpoint: { plannedOperationCount: 0, resumable: true },
+        },
+      },
+    });
+    const current = engine.beginTurn("retry-context", "重试 U013 移动", "chat");
+    const prepared = await engine.prepareTurn({
+      sessionId: "retry-context",
+      beforeSequence: current.sequence,
+      readDesignContext: async () => ({
+        requestId: "retry-context-request",
+        ok: true,
+        data: {
+          project: { id: "project-1" },
+          activeDocument: { id: "sheet-1" },
+          summary: {},
+          capturedAt: "2026-08-28T00:02:00.000Z",
+        },
+      }),
+    });
+
+    assert.match(prepared.activeTasksText, /failed-task/);
+    assert.match(prepared.activeTasksText, /unverifiable bridge/);
+    assert.match(prepared.recentMessages[0]?.content ?? "", /结构化回合状态/);
+    assert.match(prepared.recentMessages[0]?.content ?? "", /resumable/);
+  } finally {
+    store.close();
+  }
+});

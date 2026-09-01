@@ -3,14 +3,14 @@
   "id": "schematic-layout",
   "name": "原理图布局调整",
   "version": "1.0.0",
-  "description": "分析原理图布局与接线可读性，并生成保持接线的元件移动计划。",
+  "description": "分析和修改原理图布局：移动或放置元件，创建导线、总线、模块边框和说明文本。",
   "entry": "SKILL.md",
   "enabledByDefault": true,
   "riskLevel": "high",
   "priority": 100,
   "activation": {
     "always": false,
-    "keywords": ["移动", "修改", "调整", "整理", "集中", "重排", "布局", "排版", "可读性", "重叠", "交叉", "连线", "move", "modify", "layout"],
+    "keywords": ["移动", "放置", "添加元件", "画框", "矩形", "多边形", "总线", "文本", "标注", "修改", "调整", "整理", "集中", "重排", "布局", "排版", "可读性", "重叠", "交叉", "连线", "确认", "登记", "执行修改", "继续登记", "move", "place", "draw", "modify", "layout"],
     "modes": ["chat", "plan"]
   },
   "tools": {
@@ -18,12 +18,19 @@
       "easyeda_get_context",
       "easyeda_schematic_components",
       "easyeda_schematic_wires",
+      "easyeda_library_search_devices",
       "easyeda_run_drc",
       "easyeda_canvas_locate",
       "easyeda_canvas_capture",
       "easyeda_canvas_capture_region",
       "easyeda_post_write_verify",
-      "easyeda_schematic_move_component"
+      "easyeda_schematic_move_component",
+      "easyeda_schematic_place_component",
+      "easyeda_schematic_create_wire",
+      "easyeda_schematic_create_bus",
+      "easyeda_schematic_create_rectangle",
+      "easyeda_schematic_create_polygon",
+      "easyeda_schematic_create_text"
     ],
     "required": [
       "easyeda_schematic_components",

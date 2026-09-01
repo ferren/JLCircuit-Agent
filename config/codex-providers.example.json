@@ -1,0 +1,40 @@
+{
+  "defaultProvider": "openai",
+  "providers": {
+    "openai": {
+      "name": "OpenAI",
+      "baseUrl": "https://api.openai.com/v1",
+      "model": "gpt-5.4",
+      "apiKeyEnv": "OPENAI_API_KEY",
+      "wireApi": "responses",
+      "reasoningEffort": "medium",
+      "enabled": true,
+      "requestMaxRetries": 4,
+      "streamMaxRetries": 5,
+      "streamIdleTimeoutMs": 300000,
+      "modelMetadata": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000,
+        "inputModalities": ["text"],
+        "reasoningEfforts": ["low", "high", "max"],
+        "defaultReasoningEffort": "max"
+      }
+    },
+    "openrouter": {
+      "name": "OpenRouter",
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "model": "openai/gpt-5.4",
+      "apiKeyEnv": "OPENROUTER_API_KEY",
+      "wireApi": "responses",
+      "reasoningEffort": "medium",
+      "enabled": false,
+      "requestMaxRetries": 4,
+      "streamMaxRetries": 5,
+      "streamIdleTimeoutMs": 300000,
+      "httpHeaders": {
+        "HTTP-Referer": "http://127.0.0.1:49630",
+        "X-Title": "JLCircuit Agent"
+      }
+    }
+  }
+}

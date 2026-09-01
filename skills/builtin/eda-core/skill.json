@@ -19,6 +19,7 @@
       "easyeda_get_context",
       "easyeda_schematic_components",
       "easyeda_schematic_wires",
+      "easyeda_library_search_devices",
       "easyeda_run_drc",
       "easyeda_canvas_locate",
       "easyeda_canvas_capture",

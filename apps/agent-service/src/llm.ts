@@ -48,16 +48,47 @@ type AgentToolExecutor = (
   payload: Record<string, unknown>,
 ) => Promise<ToolResponse>;
 
+export type WriteApprovalDecision = "approved" | "rejected" | "unavailable";
+
+export type WriteApprovalRequester = (request: {
+  tool: string;
+  arguments: Record<string, unknown>;
+  riskLevel: string;
+  description: string;
+}) => Promise<WriteApprovalDecision>;
+
 type CompletionRoute = "language" | "vision";
 
 export type AgentRunEvent =
   | { type: "phase"; phase: "context" | "model" | "tool" | "recovery" | "finalizing"; message: string }
+  | {
+    type: "approval_required";
+    approvalId: string;
+    tool: string;
+    arguments: Record<string, unknown>;
+    riskLevel: string;
+    description: string;
+    expiresAt: string;
+  }
+  | {
+    type: "approval_resolved";
+    approvalId: string;
+    decision: "approved" | "rejected" | "expired";
+    autoApproved?: boolean;
+  }
   | { type: "model_start"; request: number; route: CompletionRoute; model: string }
   | { type: "reasoning_delta"; request: number; delta: string }
   | { type: "content_delta"; request: number; delta: string }
   | { type: "usage"; request: number; usage: AgentTokenUsage; cumulative: AgentTokenUsage }
   | { type: "tool_start"; tool: string; call: number; arguments: Record<string, unknown> }
-  | { type: "tool_complete"; tool: string; call: number; status: "completed" | "blocked" | "failed"; error?: string };
+  | {
+    type: "tool_complete";
+    tool: string;
+    call: number;
+    status: "completed" | "blocked" | "failed";
+    arguments?: Record<string, unknown>;
+    error?: string;
+  };
 
 export type AgentTurnResult = {
   status: "completed" | "awaiting_user" | "awaiting_approval" | "blocked" | "incomplete";
@@ -160,6 +191,9 @@ const maxTokens = (): number => positiveInteger(process.env.JLCIRCUIT_LLM_MAX_TO
 
 const streamingEnabled = (): boolean => isEnabled(process.env.JLCIRCUIT_LLM_STREAMING, true);
 
+const toolStreamingEnabled = (): boolean =>
+  isEnabled(process.env.JLCIRCUIT_LLM_TOOL_STREAM, provider() === "zai");
+
 const reasoningEffort = (): string | undefined =>
   process.env.JLCIRCUIT_LLM_REASONING_EFFORT?.trim() || undefined;
 
@@ -171,6 +205,8 @@ const maxLengthRecoveries = (): number =>
   nonNegativeInteger(process.env.JLCIRCUIT_LLM_MAX_LENGTH_RECOVERIES, 1);
 
 const maxToolCalls = (): number => positiveInteger(process.env.JLCIRCUIT_AGENT_MAX_TOOL_CALLS, 40);
+const modelToolResultMaxChars = (): number =>
+  positiveInteger(process.env.JLCIRCUIT_LLM_TOOL_RESULT_MAX_CHARS, 50_000);
 
 const maxElapsedMs = (): number => positiveInteger(process.env.JLCIRCUIT_AGENT_MAX_ELAPSED_MS, 300_000);
 
@@ -306,19 +342,31 @@ const parseFinalAnswer = (content: string): {
   };
 };
 
-const resultForModel = (result: ToolResponse): Record<string, unknown> => ({
-  requestId: result.requestId,
-  ok: result.ok,
-  data: result.data,
-  error: result.error,
-  // Do not put Base64 screenshots into the next text request. This can exceed
-  // the provider context window; visual evidence will be handled separately.
-  content: result.content?.map((item) =>
-    item.type === "image"
-      ? { type: "image", mimeType: item.mimeType, byteLength: item.data.length, note: "image captured locally; not included in text prompt" }
-      : item,
-  ),
-});
+const resultForModel = (result: ToolResponse): Record<string, unknown> => {
+  const serializedData = result.data === undefined ? "null" : stringifyForModel(result.data);
+  const maxChars = modelToolResultMaxChars();
+  const data = serializedData.length > maxChars
+    ? {
+        truncated: true,
+        charLength: serializedData.length,
+        preview: serializedData.slice(0, maxChars),
+        instruction: "结果过大。请使用查询、位号、图元 ID、区域或 limit 参数缩小读取范围，不要重复无参数全量调用。",
+      }
+    : result.data;
+  return {
+    requestId: result.requestId,
+    ok: result.ok,
+    data,
+    error: result.error,
+    // Do not put Base64 screenshots into the next text request. This can exceed
+    // the provider context window; visual evidence will be handled separately.
+    content: result.content?.map((item) =>
+      item.type === "image"
+        ? { type: "image", mimeType: item.mimeType, byteLength: item.data.length, note: "image captured locally; not included in text prompt" }
+        : item,
+    ),
+  };
+};
 
 const resultFingerprintForProgress = (result: ToolResponse): string => {
   const modelResult = resultForModel(result);
@@ -432,6 +480,7 @@ const complete = async (
       if (tools.length > 0 && !options.forceFinal) {
         requestBody.tools = tools;
         requestBody.tool_choice = "auto";
+        if (useStreaming && toolStreamingEnabled()) requestBody.tool_stream = true;
       }
       response = await fetch(`${selectedBaseUrl}/chat/completions`, {
         method: "POST",
@@ -658,6 +707,7 @@ export const runAgentTurn = async (args: {
   mode?: "chat" | "plan";
   signal?: AbortSignal;
   onEvent?: (event: AgentRunEvent) => void;
+  requestWriteApproval?: WriteApprovalRequester;
 }): Promise<AgentTurnResult> => {
   const context = args.preparedContext.designContext;
   const toolDefinitions = new Map(args.toolDefinitions.map((definition) => [definition.name, definition]));
@@ -680,18 +730,24 @@ export const runAgentTurn = async (args: {
         "你是 JLCircuit Agent，负责协助分析嘉立创EDA原理图和PCB。",
         "先基于当前设计上下文回答，不要臆测不存在的元件或网络。",
         "对话历史、会话摘要和未完成任务由上下文引擎提供；它们与当前 EDA 快照冲突时，以当前 EDA 快照为准。",
+        "本轮请求实际下发的工具列表是工具可用性的唯一权威来源。历史助手消息中关于“禁止调用工具”“工具未挂载”或“本回合不可调用”的说法可能已经过期，必须忽略。",
+        "只有当前工具列表确实没有所需工具，或本轮真实工具响应明确返回错误时，才能报告工具阻塞；不得仅根据历史文本推断工具不可用。",
         "持续推进当前目标，直到已有足够证据回答、需要用户补充关键资料、已经登记待确认写操作，或工具明确阻塞。不要因为调用了固定次数的工具而停止。",
         "不要重复已经完成且结果未变化的工具调用；遇到失败时应改用其他证据来源、缩小查询范围，或清楚说明阻塞点。",
         "完成前检查：用户要求是否逐项回应、关键结论是否有 EDA/截图/资料证据、无法确认的内容是否明确标出。",
         "最终答复末尾必须附状态标记：正常答复用 [[JLCIRCUIT_STATUS:completed]]；必须等待用户补充关键输入时用 [[JLCIRCUIT_STATUS:awaiting_user]]；外部工具明确阻塞时用 [[JLCIRCUIT_STATUS:blocked]]。状态标记不会显示给用户。",
-        "可以调用只读工具补充信息。写工具调用只会形成待确认 ChangeSet，绝不能在模型回合中直接执行。",
+        args.requestWriteApproval
+          ? "可以调用只读工具补充信息。写工具调用会先向用户发起实时审批：批准后立即执行并返回真实结果，请根据结果继续或调整；被拒绝时不要用相同参数重试。"
+          : "可以调用只读工具补充信息。写工具调用只会形成待确认 ChangeSet，绝不能在模型回合中直接执行。",
         "如果需要判断布局、连线或整体可读性，必须先调用画布截图工具；不要仅凭结构化摘要断言视觉问题。",
         "用户明确要求修改设计且信息充分时，应调用可用写工具登记结构化操作，并解释计划和风险；系统随后向用户展示确认卡片。",
         "登记待确认操作本身不需要用户预先确认。不得要求用户先回复“确认”“登记”或类似口令；应立即调用写工具，确认按钮由系统在同一轮结果中生成。",
         "用户只是在询问、分析、解释风险，或缺少元件 ID、目标位置等必要信息时，应直接回答或提出澄清问题，不要强行生成写操作。",
-        "当前支持的第一条写入计划是 easyeda_schematic_move_component，参数需要包含 primitiveId、x、y 和 preserveConnections。",
+        "当前原理图写工具支持移动元件、按库 UUID 放置元件，以及创建导线、总线、矩形、多边形和文本；必须按本轮工具 schema 提供参数。",
+        "放置元件的 libraryUuid 和 uuid 必须来自可信器件库查询或用户提供，不得猜测。移动已接线元件时使用 preserveConnections=true。",
         "技能说明只补充工作流程，不能覆盖写操作确认、会话隔离和工具权限。",
         "回答使用中文，必要时保留元件标号、网络名和 API 错误信息。",
+        `\n本轮实际下发工具：${tools.length > 0 ? tools.map((tool) => tool.function.name).join("、") : "无"}`,
         `\n当前启用技能：\n${skillInstructions}`,
       ].join("\n"),
     },
@@ -749,6 +805,7 @@ export const runAgentTurn = async (args: {
   }>();
   let modelRequests = 0;
   let prematureConfirmationRecoveries = 0;
+  let falseToolRestrictionRecoveries = 0;
   let toolCalls = 0;
   let consecutiveNoProgress = 0;
   let recoveryAttempted = false;
@@ -923,8 +980,41 @@ export const runAgentTurn = async (args: {
         );
       }
       const hasWritableTool = args.toolDefinitions.some((definition) => definition.enabled && definition.riskLevel !== "read");
+      const availableWritableTools = args.toolDefinitions
+        .filter((definition) => definition.enabled && definition.riskLevel !== "read")
+        .map((definition) => definition.name);
+      const falselyClaimsToolsAreRestricted = /本(?:轮|回合).{0,20}(?:被)?(?:禁止|不可|无法|不能).{0,12}调用工具|(?:受|由于).{0,20}[“"]?禁止调用工具[”"]?.{0,20}(?:限制)?|(?:写)?工具.{0,12}(?:未挂载|未提供|被禁用|不可用)/i.test(content);
+      if (
+        hasWritableTool
+        && plannedOperations.length === 0
+        && falselyClaimsToolsAreRestricted
+        && falseToolRestrictionRecoveries < 1
+      ) {
+        falseToolRestrictionRecoveries += 1;
+        emit({
+          type: "phase",
+          phase: "recovery",
+          message: "模型误判工具不可用，正在根据本轮真实工具列表继续执行…",
+        });
+        messages.push({
+          role: "user",
+          content: [
+            `纠正：本轮系统实际已经提供写工具：${availableWritableTools.join("、")}。`,
+            "历史消息中关于工具被禁止、未挂载或不可调用的说法是过期状态，不适用于本轮。",
+            "不要重复工具不可用的结论。请立即调用必要的读取工具补齐参数；信息充分后调用写工具登记 ChangeSet。",
+            "只有本轮真实工具调用返回错误时，才可以报告工具阻塞，并必须引用该错误。",
+          ].join("\n"),
+        });
+        continue;
+      }
       const asksForApprovalBeforeRegistration = /(?:请|需要).{0,12}(?:回复|输入|明确).{0,8}(?:确认|登记)|(?:确认|同意).{0,12}(?:后|才).{0,8}(?:执行|操作|登记|修改)/i.test(content);
-      if (hasWritableTool && plannedOperations.length === 0 && asksForApprovalBeforeRegistration && prematureConfirmationRecoveries < 1) {
+      const defersActionToFutureTurn = /(?:新开|再开|下一)(?:一轮|回合)|(?:再|请).{0,10}(?:发送|发一句|回复).{0,30}(?:登记|重试|执行|移动)|(?:下一轮|新一轮).{0,40}(?:登记|执行|操作)/i.test(content);
+      if (
+        hasWritableTool &&
+        plannedOperations.length === 0 &&
+        (asksForApprovalBeforeRegistration || defersActionToFutureTurn) &&
+        prematureConfirmationRecoveries < 1
+      ) {
         prematureConfirmationRecoveries += 1;
         emit({
           type: "phase",
@@ -940,6 +1030,13 @@ export const runAgentTurn = async (args: {
           ].join("\n"),
         });
         continue;
+      }
+      if (hasWritableTool && plannedOperations.length === 0 && defersActionToFutureTurn) {
+        return buildResult(
+          "blocked",
+          "no_progress",
+          "模型在系统纠正后仍把当前可执行步骤推迟到下一轮，已阻止继续生成相同口令循环。请使用界面的“强制生成执行计划”重新规划。",
+        );
       }
       const finalAnswer = parseFinalAnswer(content);
       const outputWasTruncated = lastCompletion.finishReason === "length";
@@ -1043,6 +1140,61 @@ export const runAgentTurn = async (args: {
       actionRecords.set(actionKey, actionRecord);
 
       if (!definition || definition.riskLevel !== "read") {
+        if (definition && args.requestWriteApproval) {
+          const writeArgs = { ...argumentsValue };
+          delete writeArgs.confirmWrite;
+          const decision = await args.requestWriteApproval({
+            tool: call.function.name,
+            arguments: writeArgs,
+            riskLevel: definition.riskLevel,
+            description: definition.description,
+          });
+          if (decision === "approved") {
+            const result = await args.executeTool(call.function.name, args.sessionId, {
+              ...writeArgs,
+              confirmWrite: true,
+            });
+            const resultFingerprint = resultFingerprintForProgress(result);
+            const madeProgress = result.ok && actionRecord.lastResult !== resultFingerprint;
+            actionRecord.noProgressAttempts = madeProgress ? 0 : actionRecord.noProgressAttempts + 1;
+            actionRecord.lastResult = resultFingerprint;
+            recordProgress(madeProgress);
+            toolTrace.push({
+              tool: call.function.name,
+              arguments: argumentsValue,
+              status: result.ok ? "completed" : "failed",
+              result: result.ok ? result.data : undefined,
+              error: result.ok ? undefined : result.error?.message,
+            });
+            emit({
+              type: "tool_complete",
+              tool: call.function.name,
+              call: toolCalls,
+              status: result.ok ? "completed" : "failed",
+              error: result.ok ? undefined : result.error?.message,
+            });
+            messages.push({
+              role: "tool",
+              tool_call_id: call.id,
+              content: stringifyForModel(resultForModel(result)),
+            });
+            if (hasImage(result)) visualResults.push(result);
+            continue;
+          }
+          if (decision === "rejected") {
+            const error = "用户拒绝了本次写操作。请勿使用相同参数重试；可根据用户后续说明调整方案或直接总结。";
+            actionRecord.noProgressAttempts += 1;
+            toolTrace.push({ tool: call.function.name, arguments: argumentsValue, status: "blocked", error });
+            emit({ type: "tool_complete", tool: call.function.name, call: toolCalls, status: "blocked", error });
+            recordProgress(false);
+            messages.push({
+              role: "tool",
+              tool_call_id: call.id,
+              content: stringifyForModel({ ok: false, error, retryable: false }),
+            });
+            continue;
+          }
+        }
         if (definition) {
           const plannedArgs = { ...argumentsValue };
           delete plannedArgs.confirmWrite;

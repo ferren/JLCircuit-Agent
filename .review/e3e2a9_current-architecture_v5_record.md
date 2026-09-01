@@ -3,7 +3,7 @@
 - **源文件**：current-architecture.md
 - **源文件路径**：c:/Users/Ferren/Projects/JLCircuit-Agent/docs/current-architecture.md
 - **源文件版本**：未知
-- **批阅时间**：20260827_0918
+- **批阅时间**：20260831_1041
 - **批阅版本**：v5
 - **批注数量**：0
   - 评论：0

@@ -1,9 +1,9 @@
 # JLCircuit Agent 完整架构与实现状态
 
 > 文档状态：唯一维护的架构文档；同时描述当前实现和完整目标架构
-> 最后复核：2026-08-28
+> 最后复核：2026-09-01
 > Agent Service：0.1.0
-> 嘉立创 EDA 扩展：0.3.8
+> 嘉立创 EDA 扩展：0.3.9
 
 ## 1. 文档目的
 
@@ -25,7 +25,7 @@
 | **部分实现** | 主链路存在，但能力范围、兼容性或真实 EDA 验证仍不完整 |
 | **开发中** | 属于目标架构，当前没有可依赖的完整运行链路 |
 
-目前系统是一个带声明式 Skill Registry、MCP Gateway MVP、Local Knowledge MVP 和专业 Datasheet Review MVP 的本地 EDA Agent。外部目录授权、PDF/文本解析、中英文全文检索、按芯片/主题组织证据及与当前 EDA 数据交叉审查已经形成基础闭环；向量检索、OCR、结构化器件参数库、完整插件安装/隔离生命周期、项目语义长期记忆、通用回滚和多数 PCB 写入能力仍为**开发中**。
+目前系统是一个以 Codex App Server 为默认智能体内核、带 Provider 子进程池、声明式 Skill Registry、MCP Gateway MVP、Local Knowledge MVP 和专业 Datasheet Review MVP 的本地 EDA Agent。外部目录授权、PDF/文本解析、中英文全文检索、按芯片/主题组织证据及与当前 EDA 数据交叉审查已经形成基础闭环；向量检索、OCR、结构化器件参数库、完整插件安装/隔离生命周期、跨 Provider 自动降级、项目语义长期记忆、通用回滚和多数 PCB 写入能力仍为**开发中**。
 
 ## 2. 架构原则与当前结论
 
@@ -39,8 +39,11 @@
   -> Skill Registry 自动或显式选择工作流并裁剪可见工具
   -> 按需检索已授权的本地手册、BOM、网表并返回来源引用
   -> Datasheet Review 按芯片和主题生成证据包，与 EDA 元件/连线/DRC 对照
-  -> LLM 分析或生成结构化 ChangeSet
-  -> 用户确认高风险操作
+  -> Codex App Server 在选定 Provider 进程内执行持久化智能体回合
+  -> 只读动态工具立即返回证据
+  -> 写动态工具在流式回合内发起实时审批：用户批准后立即执行并把真实结果回喂模型
+  -> 非流式路径、审批超时或流中断时，写操作退回结构化 ChangeSet 待确认计划
+  -> 用户确认高风险操作（在线审批卡片或 ChangeSet 确认按钮）
   -> EDA 扩展执行受限工具
   -> DRC/ERC + 画布截图验证
   -> SQLite 保存消息、任务、快照和审计事件
@@ -75,7 +78,7 @@ flowchart TB
     end
 
     subgraph AGENT[主智能体编排层]
-        ORCH[目标驱动 Supervisor、进展检测与任务状态机<br/>部分实现]:::partial
+        ORCH[任务编排、状态机与安全熔断<br/>部分实现]:::partial
         INTENT[显式意图分类与专业路由<br/>开发中]:::developing
         PLANNER[多步规划 / ChangeSet<br/>部分实现]:::partial
         EXECUTOR[事务执行、旧值校验、回滚点<br/>开发中]:::developing
@@ -100,10 +103,12 @@ flowchart TB
         DATASHEET[专业 Datasheet 证据包与审查技能 MVP<br/>部分实现]:::partial
     end
 
-    subgraph MODELS[模型路由层]
-        ROUTER[OpenAI-compatible LLM Router<br/>部分实现]:::partial
+    subgraph MODELS[模型与智能体运行时]
+        ROUTER[Codex App Server Provider 进程池<br/>已实现]:::done
+        PROVIDERCFG[单进程 Provider 参数注入<br/>已实现]:::done
         LANGUAGE[语言模型<br/>已实现]:::done
-        VISION[当前模型或独立视觉模型<br/>已实现]:::done
+        VISION[当前 Codex Provider 图像输入<br/>部分实现]:::partial
+        LEGACY[旧 Chat Completions 后端<br/>兼容保留]:::partial
         FALLBACK[按任务/成本/失败自动路由与降级<br/>开发中]:::developing
     end
 
@@ -149,8 +154,10 @@ flowchart TB
     SEARCH --> CTX
     KNOWLEDGE --> DATASHEET --> CTX
     ORCH --> ROUTER
-    ROUTER --> LANGUAGE
-    ROUTER --> VISION
+    ROUTER --> PROVIDERCFG
+    PROVIDERCFG --> LANGUAGE
+    PROVIDERCFG --> VISION
+    ROUTER --> LEGACY
     ROUTER --> FALLBACK
     SKILL --> CATALOG
     MCP --> CATALOG
@@ -196,7 +203,8 @@ flowchart LR
         SKILLS[Skill Registry]
         MCPGW[MCP Registry / Gateway]
         KNOWLEDGE[Local Knowledge Service<br/>PDF.js / FTS5 / Datasheet evidence]
-        LLM[LLM Router]
+        POOL[Codex Provider Pool]
+        LEGACY[Legacy LLM Router]
         CATALOG[静态工具目录]
         BRIDGE[WebSocket Bridge Gateway]
         STORE[(SQLite)]
@@ -206,17 +214,18 @@ flowchart LR
         HTTP --> KNOWLEDGE
         SESSION --> CONTEXT
         CONTEXT --> STORE
-        SESSION --> LLM
+        SESSION --> POOL
+        SESSION -. legacy .-> LEGACY
         SESSION --> SKILLS
-        SKILLS --> LLM
+        SKILLS --> POOL
         SKILLS --> CATALOG
         SKILLS --> STORE
-        LLM --> MCPGW
-        LLM --> KNOWLEDGE
+        POOL --> MCPGW
+        POOL --> KNOWLEDGE
         MCPGW --> STORE
         KNOWLEDGE --> STORE
-        LLM --> CATALOG
-        LLM --> BRIDGE
+        POOL --> CATALOG
+        POOL --> BRIDGE
         SESSION --> STORE
         BRIDGE --> STORE
     end
@@ -226,18 +235,20 @@ flowchart LR
     BRIDGE -- ToolRequest --> ADAPTER
     MCPGW -- stdio / Streamable HTTP --> MCPSERVER[外部 MCP Server]
     KNOWLEDGE -- 只读扫描已授权根目录 --> LOCALFILES[本地 PDF / 文本 / BOM / 网表]
-    LLM -- OpenAI-compatible HTTPS --> PROVIDER[语言模型 / 视觉模型]
+    POOL -- JSON-RPC stdio --> APPSERVER[按 Provider 启动的 codex app-server]
+    APPSERVER -- Responses HTTPS --> PROVIDER[语言/视觉模型 Provider]
+    LEGACY -- Chat Completions HTTPS --> PROVIDER
 ```
 
 ### 3.3 组件实现状态总表
 
 | 层 | 当前状态 | 当前边界 | 下一完整能力 |
 | --- | --- | --- | --- |
-| EDA 多轮交互面板 | 已实现 | 统一流式对话、修改确认、历史、技能选择、MCP 配置与资料库管理 | 差异预览、任务树、回滚入口 |
+| EDA 多轮交互面板 | 已实现 | 统一流式对话、Provider/技能选择、修改确认、历史、MCP 配置与资料库管理 | Provider 配置编辑、差异预览、任务树、回滚入口 |
 | Session / Context Engine | 已实现 | 项目隔离、消息、摘要、任务、最新快照 | 项目语义长期记忆与来源置信度 |
-| Agent Orchestrator | 部分实现 | 目标驱动工具循环、进展/重复检测、多维预算、阶段总结、统一对话、ChangeSet、确认、单类写操作 | 显式意图节点、持久化子任务图、跨回合自动恢复、事务与回滚 |
+| Agent Orchestrator | 部分实现 | Codex App Server 持久化工具循环、JLCircuit 任务状态机、总时长/工具熔断、统一对话、ChangeSet、确认、单类写操作；旧 Supervisor 可回退 | 显式意图节点、持久化子任务图、跨回合自动恢复、事务与回滚 |
 | Skill Registry | 已实现 | 声明式清单、提示、启停、自动选择、工具裁剪及专业手册审查工作流 | 依赖、签名、版本、安装和热更新 |
-| LLM Router | 部分实现 | 单语言路由及独立视觉路由 | 多供应商策略、重试、降级、成本/延迟策略 |
+| Provider 进程池 | 已实现 | 每 Provider 一个按需 Codex App Server 进程、请求级选择、CLI 参数注入、状态/重启 API、会话 thread 恢复；只支持 Responses wire API | 空闲淘汰、配置热重载、健康熔断、自动降级和成本/延迟策略 |
 | MCP / Plugin Gateway | 部分实现 | 官方客户端、stdio/HTTP、配置 CRUD、连接测试、能力查看、命名空间、allowlist、状态和审计 | OAuth、安装、自动重连、进程沙箱和外部写执行器 |
 | 外部资料与知识库 | 部分实现 | 授权目录、PDF/文本/BOM/网表解析、FTS5 中英文检索、页码/行号/哈希引用、按芯片和主题构建证据包、管理界面 | OCR、向量/混合检索、网页采集、永久结构化器件参数库 |
 | EDA 工具 | 部分实现 | 读取、DRC、截图、实验性元件移动 | 完整原理图、PCB、BOM、规则和脚本工具 |
@@ -254,7 +265,8 @@ flowchart LR
 | EDA 扩展入口 | 嘉立创 EDA | 打开 iframe、启动 Bridge Client |
 | EDA Adapter | 嘉立创 EDA | 调用官方 Pro API，读取图元、执行移动、DRC 和截图 |
 | Agent Service | 独立 Node.js 进程 | HTTP API、会话、任务、上下文、模型调用、知识索引、风险控制和审计 |
-| SQLite | Agent Service 本地文件 | 消息、任务、技能状态、知识文档/分块/FTS、快照和审计持久化 |
+| Codex App Server Pool | Agent Service 子进程 | 每个 Provider 独立配置和连接池槽位；承载模型线程、工具循环和流式事件 |
+| SQLite | Agent Service 本地文件 | 消息、任务、Codex thread 映射、技能状态、知识文档/分块/FTS、快照和审计持久化 |
 | 已授权资料目录 | 本机文件系统 | 由管理员显式配置的只读 PDF、文本、BOM 和网表来源 |
 | LLM Provider | 本地或远端服务 | 语言理解、规划、工具选择和视觉分析 |
 
@@ -267,7 +279,8 @@ apps/agent-service/
   src/server.ts             HTTP、WebSocket、任务编排和执行入口
   src/context-engine.ts     上下文预算、历史、摘要、任务和设计快照组装
   src/storage.ts            SQLite schema 和持久化访问
-  src/llm.ts                OpenAI-compatible 模型调用和工具循环
+  src/codex-provider-pool.ts Codex App Server JSON-RPC、Provider 进程池、动态工具与流式事件
+  src/llm.ts                旧 OpenAI-compatible Chat Completions 后端（迁移回退）
   src/skill-registry.ts     技能扫描、校验、选择、启停与工具权限并集
   src/mcp-registry.ts       MCP 配置、连接生命周期、能力发现、命名空间和调用网关
   src/knowledge-service.ts  目录授权、文件发现、PDF/文本解析、分块、检索与引用
@@ -276,6 +289,7 @@ packages/contracts/         DesignContext、ChangeSet、ToolRequest 等共享契
 packages/bridge/            Bridge 消息和类型化传输封装
 packages/mcp/               内置 EDA 静态工具目录（MCP 风格 schema）
 config/
+  codex-providers.example.json Provider 进程池安全配置示例
   mcp-servers.example.json  stdio 与 Streamable HTTP 安全配置示例
 skills/builtin/             内置声明式技能（含 local-knowledge）
 
@@ -308,9 +322,14 @@ Skill Registry 只加载声明式清单和 Markdown 工作流，不执行技能�
 
 当前原理图元件和导线读取是 best-effort 兼容层。不同 EDA 版本可能暴露不同字段或方法名，适配器会尝试多个候选字段。
 
-### 5.2 ChangeSet
+### 5.2 写操作审批与 ChangeSet
 
-模型在统一对话中调用非只读工具时，不会立即执行，而是转换为 `ChangeOperation` 并收集到 `ChangeSet`：
+写工具有两条确认路径，由 `JLCIRCUIT_WRITE_APPROVAL_MODE` 控制（默认 `inline`）：
+
+- **在线审批（inline，默认）**：流式回合（`/v1/chat/stream`）中模型调用非只读工具时，回合暂停并通过 SSE 事件 `approval_required` 向面板推送审批卡片；用户批准后该操作立即以 `confirmWrite=true` 真实执行，执行结果（成功或失败详情）回喂给模型，模型可以逐条观察并自适应调整后续操作。拒绝时模型收到不可重试错误。用户可选择“批准并在本会话自动批准”，之后同会话写操作不再逐条询问。审批决定通过 `POST /v1/approvals/:approvalId` 提交，全程写入审计事件（`write_approval.requested/resolved/auto_approved`）。
+- **ChangeSet 计划（兜底与兼容）**：非流式路径（`/v1/chat`、`/v1/plan`）、审批超时（默认 180s）或 SSE 断开时，写调用转换为 `ChangeOperation` 收集到 `ChangeSet`，回合结束后由用户整包确认执行。设 `JLCIRCUIT_WRITE_APPROVAL_MODE=changeset` 可恢复全量走此路径。
+
+`ChangeSet` 结构：
 
 ```text
 ChangeSet
@@ -326,7 +345,7 @@ ChangeSet
   requiresConfirmation
 ```
 
-当前可进入真实执行链的操作只允许 `easyeda_schematic_move_component`，并且必须具有合法的 `primitiveId`、`x` 和 `y`。
+当前可进入真实执行链的原理图操作包括移动/放置元件，以及创建导线、总线、矩形、多边形和文本。每种操作在服务端有独立参数校验；放置元件必须具有可信的 `libraryUuid`、器件 `uuid` 和坐标，几何图元必须满足最小点数或正宽高约束。
 
 ### 5.3 Task
 
@@ -355,9 +374,10 @@ stateDiagram-v2
     waiting_confirmation --> executing: 确认令牌通过
     executing --> completed: 写入和验证均通过
     executing --> failed: 写入、上下文校验或验证失败
+    failed --> waiting_confirmation: 克隆原 ChangeSet 为新 attempt
 ```
 
-当前每次重新规划会创建一个新任务，不会原地修改旧任务。
+当前每次重新规划会创建一个新任务，不会原地修改旧任务。失败后的“按原计划重试”同样创建新任务，但不调用模型：它只克隆失败任务中**未成功执行**的操作（依据 `execution.operations` 的逐条结果过滤，已成功的操作不再重复执行），记录 `parentTaskId` 并递增 `attempt`，然后重新进入待确认状态。若全部操作已成功、失败仅发生在写后验证阶段，则拒绝重试并提示重新运行 DRC/ERC。
 
 ## 6. 会话与 Context Engine
 
@@ -551,9 +571,10 @@ flowchart LR
 
 | 表 | 主键 | 内容 | 保留策略 |
 | --- | --- | --- | --- |
-| `sessions` | `id` | 项目绑定、滚动摘要、摘要游标 | 长期保留 |
+| `sessions` | `id` | 项目绑定、滚动摘要、摘要游标、当前任务指针 | 长期保留；清空对话时断开当前任务指针 |
 | `messages` | `sequence` | 用户/助手消息、模式、模型、元数据 | 清空对话时删除 |
 | `tasks` | `task_id` | 状态、上下文、技能、ChangeSet、确认令牌、执行结果 | 清空对话时保留 |
+| `codex_threads` | `(session_id, provider_id)` | App Server thread ID、模型和动态工具签名 | 服务重启后恢复；清空对话或工具签名变化时删除/替换 |
 | `context_snapshots` | `session_id` | 每个会话最新完整 EDA 快照及 SHA-256 | 新快照覆盖旧快照 |
 | `audit_events` | `sequence` | 回合、工具、任务状态和错误事件 | 清空对话时保留 |
 | `skill_states` | `skill_id` | 技能启用/禁用覆盖状态 | 长期保留 |
@@ -569,36 +590,63 @@ flowchart LR
 
 ### 9.1 模型协议
 
-Agent Service 使用 OpenAI-compatible `POST /chat/completions`，默认发送 `stream: true`，并解析供应商 SSE 中的正文、reasoning、工具调用片段、结束原因和 usage。非流式 JSON 响应仍作为兼容回退。请求还包含：
+默认后端由 Agent Service 为每个启用的 Provider 按需启动一个 `codex app-server`。进程间使用 stdin/stdout JSON-RPC：先执行 `initialize` 并启用 experimental API，再使用 `thread/start` 或 `thread/resume`，最后通过 `turn/start` 启动本轮。Provider 的 `base_url`、`model`、`wire_api=responses`、重试参数和密钥环境变量由子进程启动参数注入，不写入 Codex 全局 `config.toml`。每个 Provider 使用独立 `CODEX_HOME` 和空工作目录，避免加载用户全局 Skills/MCP；启动参数禁用 Plugin/App/Hook/Skill Search、Shell/Unified Exec、Browser/Computer Use、多智能体等内置能力，只保留 JLCircuit 动态工具。子进程环境只复制必要系统变量、本 Provider 密钥和显式 `envHttpHeaders` 引用。
 
-- `model`；
-- `messages`；
-- `tools`；
-- `tool_choice: auto`；
-- `temperature: 0.2`；
-- `max_tokens`。
+JLCircuit 把本轮 Skill 过滤后的 EDA/MCP/知识工具作为 App Server `dynamicTools`。App Server 发起 `item/tool/call` 时：
 
-EDA 面板通过 `POST /v1/chat/stream` 接收第二层 SSE。事件包括上下文准备、模型请求、reasoning/content 增量、工具开始/完成、精确 token usage、最终结果和错误。OpenRouter 的精确 usage 位于最后一个 SSE 消息；到达前 UI 只显示明确标注的近似生成 token。模型请求超时按“流空闲时间”计算，每次收到数据都会重置，不会因为持续正常输出而触发总时长超时。
+- `riskLevel=read`：Agent Service 调用受限工具并返回 `inputText`，截图额外返回 `inputImage`；
+- 非只读（流式回合且 `inline` 审批模式）：先通过 `approval_required` SSE 事件请求用户实时审批；批准后立即以 `confirmWrite=true` 执行并把真实结果返回模型，拒绝时返回不可重试错误；
+- 非只读（无审批通道、审批超时或 `changeset` 模式）：创建 `ChangeOperation` 并返回 `planned=true`，不触达 EDA 写执行器，回合结束后走 ChangeSet 确认；
+- 未注册、超出预算或执行失败：返回 `success=false` 并记录工具轨迹。
 
-如果模型以 `finish_reason=length` 结束，尤其是只有 reasoning 没有正文时，Supervisor 不再直接标记 `empty_response`。它会禁用工具、要求模型基于现有证据直接给出简洁结论，并使用独立的低 reasoning 配置；恢复仍失败才返回 `output_length/incomplete`。
+App Server 的 reasoning/正文 delta、工具状态、`thread/tokenUsage/updated` 和 turn 完成事件被转换为现有 `AgentRunEvent`，再由 `POST /v1/chat/stream` 通过 SSE 转发给 EDA 面板。也就是说，浏览器侧仍是 SSE，Agent Service 与智能体内核之间是 JSON-RPC 流。
 
-支持当前语言模型直接看图，或单独配置视觉模型。Base URL 可以是 `/v1` 根地址，也可以带 `/chat/completions`，服务会进行规范化。
+每个 `(sessionId, providerId)` 持久化独立 thread。动态工具签名变化时创建新 thread，并把 SQLite 中的会话摘要和最近消息重新注入；进程重启而工具未变化时调用 `thread/resume`。同一 Provider 复用一个 App Server 进程，不同 Provider 之间进程、密钥和模型上下文隔离。
 
-### 9.2 目标驱动工具循环
+旧 `llm.ts` 的 Chat Completions + SSE Supervisor 仍可通过 `JLCIRCUIT_AGENT_BACKEND=legacy` 启用，用于尚不支持 Responses API 的兼容供应商。它不是默认路径。
 
-模型工具循环不以固定请求轮数作为完成条件。Supervisor 持续执行“观察上下文 → 选择工具 → 记录证据 → 判断进展 → 继续或结束”，直到模型给出用户答复、缺少关键用户输入、产生待确认写操作，或工具明确阻塞。
+### 9.2 智能体工具循环与停止条件
 
-每次运行维护目标、模型请求数、工具调用数、连续无进展次数、相同动作重试次数和可恢复检查点。工具名、标准化参数及当前 EDA 快照版本共同组成动作指纹；相同动作返回相同结果不算新进展。第一次达到无进展阈值时要求模型换工具、缩小范围或说明缺口；恢复后仍无进展才进入 `blocked`。
+Codex App Server 自己驱动一次 turn 内的多次模型响应和动态工具调用，JLCircuit 不再用固定“最多三轮模型请求”判断完成。turn 在模型返回最终答复、请求用户补充、登记出待确认写操作、被中断或明确失败时结束。
 
-工具调用总数和运行时间仍有安全预算，但只作为异常熔断，不代表任务已经完成。预算触发后，Supervisor 禁用全部工具，额外执行一次最终总结请求，要求模型返回已完成工作、证据、未完成项、停止原因和继续方式。结果标记为 `incomplete` 并携带检查点，而不是返回固定的“超过工具轮数”。
+JLCircuit 保留两类确定性熔断：`JLCIRCUIT_AGENT_MAX_TOOL_CALLS` 限制动态工具总数，`JLCIRCUIT_AGENT_MAX_ELAPSED_MS` 限制整轮时间。熔断只表示 `incomplete`/失败，不会伪装成已完成。模型最终通过隐藏状态标记区分 `completed`、`awaiting_user` 和 `blocked`；存在已登记写操作时，服务强制转为 `awaiting_approval`。
 
-- 统一对话：只读工具正常执行；技能允许的非只读工具统一转换为待确认的 `ChangeOperation`，模型回合不执行写入。
-- 自动技能选择：修改、移动、布局、整理等请求会启用 `schematic-layout`，普通分析只使用所需只读技能。
-- 先登记、后确认：登记 ChangeSet 不需要口头确认；操作形成后由 UI 在同一轮显示确认按钮。模型若提前要求用户回复“确认”或“登记”，Supervisor 会在同一请求内自动纠偏一次。
-- 没有写操作：允许模型直接回答或追问；普通信息答复进入 `completed`，确实缺少关键输入时由模型状态标记进入 `awaiting_user`。
-- “优先生成修改方案”：仍调用同一个流式接口，只附加更明确的内部指令并显式启用 `schematic-layout`；它是快捷入口，不是独立模式。
+- 统一对话：只读工具正常执行；流式回合中非只读工具走在线审批（批准即执行、结果回喂模型），无审批通道时转换为待确认的 `ChangeOperation`。
+- 自动技能选择：修改、移动、布局、整理等请求启用 `schematic-layout`，普通分析只使用所需只读技能。
+- 在线审批优先、ChangeSet 兜底：批准的写操作在回合内执行，模型可根据真实结果调整后续操作；退回 ChangeSet 的操作在同一轮结果中显示“确认执行”按钮。
+- 失败精确重试：失败任务只克隆未成功的操作为新任务，不调用模型；重新规划才建立父子任务关系并开启新 turn。
+- 结果预算：单个工具结果默认限制为 50000 字符；超限返回截断信息和缩小查询范围提示。
+- 工具权威性：App Server 当前收到的 `dynamicTools` 是本轮唯一可用工具来源；历史中的旧工具声明不授予权限。
+- 没有写操作：允许正常说明、给出结论或追问；只有实际登记了操作才显示确认入口。
+- “优先生成修改方案”：仍调用同一流式接口，只增强本轮指令并显式启用布局技能。
+
+`legacy` 后端仍保留动作指纹、无进展检测、长度恢复和最终总结等旧 Supervisor 行为；这些能力不应被描述成 Codex App Server 默认路径的实现。
 
 ## 10. 修改执行和验证
+
+在线审批（inline 模式默认路径）：
+
+```mermaid
+sequenceDiagram
+    participant UI as EDA 面板
+    participant Agent as Agent Service
+    participant Bridge as WebSocket Bridge
+    participant EDA as EDA Adapter
+
+    UI->>Agent: POST /v1/chat/stream（自然语言修改要求）
+    Agent->>Bridge: easyeda_get_context 等只读工具
+    loop 模型每次调用写工具
+        Agent-->>UI: SSE approval_required（工具、参数、风险）
+        UI->>Agent: POST /v1/approvals/:id（approve / reject，可选本会话自动批准）
+        Agent->>Bridge: 批准后立即执行（confirmWrite=true）
+        Bridge->>EDA: 修改元件 / 创建图元
+        Agent-->>UI: SSE approval_resolved + tool_complete
+        Agent->>Agent: 真实执行结果回喂模型，模型据此调整后续操作
+    end
+    Agent-->>UI: 流式最终答复（无需再整包确认）
+```
+
+ChangeSet 兜底路径（非流式、审批超时或 changeset 模式）：
 
 ```mermaid
 sequenceDiagram
@@ -618,8 +666,11 @@ sequenceDiagram
     Agent->>DB: 清除并持久化 confirmationToken
     Agent->>Bridge: 再次 easyeda_get_context
     Agent->>Agent: 比较 projectId/documentId
-    Agent->>Bridge: easyeda_schematic_move_component
-    Bridge->>EDA: 修改元件并创建正交桥接线
+    loop 每条 ChangeOperation 独立执行
+        Agent->>Bridge: easyeda_schematic_move_component 等写工具
+        Bridge->>EDA: 修改元件并创建正交桥接线
+        Note over Agent: 单条失败不阻断后续操作，逐条记录成败
+    end
     Agent->>Bridge: easyeda_post_write_verify
     Bridge->>EDA: DRC/ERC + 画布截图
     Agent->>DB: 保存 completed/failed 和验证结果
@@ -640,9 +691,9 @@ sequenceDiagram
 `easyeda_schematic_move_component`：
 
 1. 读取元件旧坐标、旧引脚位置和完整导线快照；
-2. 解析全部导线端点，按旧引脚坐标查找其当前连接线和网络名；
+2. 按旧引脚坐标查找其当前连接线和网络名；匹配使用 `lineContainsPoint`，即引脚落在导线折点或线段中间（T 形连接）都算连接，与写后验证逻辑一致；
 3. 为每个已接线引脚预计算从旧位置到新位置的水平/垂直桥接路径；
-4. 无法读取引脚、缺少导线创建/删除能力，或没有任何导线端点与引脚匹配时，在移动前拒绝执行；只有确认元件原本未接线时才允许显式关闭 `preserveConnections`；
+4. 无法读取引脚、缺少导线创建/删除能力，或没有任何导线与引脚接触时，在移动前拒绝执行；只有确认元件原本未接线时才允许显式关闭 `preserveConnections`；
 5. 调用 `SCH_PrimitiveComponent.modify` 修改坐标，保留全部原导线，再通过 `SCH_PrimitiveWire.create` 为每个已接线引脚创建独立正交桥接线；
 6. 校验创建调用返回的图元，再通过按 ID 重读和短时重试等待画布读模型刷新；若返回图元有效但读模型仍不可见，则返回 `inconclusive` 并交给 DRC/ERC 和截图复核，不因缓存滞后自动回滚；
 7. 创建失败时删除本轮已创建的桥接线并恢复元件旧坐标；
@@ -678,7 +729,7 @@ EDA 扩展主动连接，并使用官方 `eda.sys_WebSocket.register/send/close`
   "type": "hello",
   "protocolVersion": 1,
   "client": "jlcircuit-eda-extension",
-  "extensionVersion": "0.3.8",
+  "extensionVersion": "0.3.9",
   "capabilities": {}
 }
 ```
@@ -718,12 +769,19 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 | `easyeda_get_context` | read | 可用 | 项目、文档、选区和摘要 |
 | `easyeda_schematic_components` | read | Beta | 原理图元件和坐标 |
 | `easyeda_schematic_wires` | read | Beta | 导线几何、网络和图元 ID |
+| `easyeda_library_search_devices` | read | Beta | 按关键词或立创 C 编号查询器件库，返回放置所需 UUID |
 | `easyeda_run_drc` | read | Beta | 当前文档 DRC/ERC |
 | `easyeda_canvas_locate` | read | Beta | 画布定位和区域缩放 |
 | `easyeda_canvas_capture` | read | Beta | 当前渲染区域 PNG |
 | `easyeda_canvas_capture_region` | read | Beta | 指定区域 PNG |
 | `easyeda_post_write_verify` | read | Beta | 上下文、DRC 和截图闭环 |
 | `easyeda_schematic_move_component` | high | Beta | 移动元件并为已接线引脚创建正交桥接线 |
+| `easyeda_schematic_place_component` | high | Beta | 按器件库 UUID 与器件 UUID 放置原理图元件 |
+| `easyeda_schematic_create_wire` | high | Beta | 创建普通导线折线及可选网络名 |
+| `easyeda_schematic_create_bus` | high | Beta | 创建命名总线折线 |
+| `easyeda_schematic_create_rectangle` | high | Beta | 创建矩形模块边框 |
+| `easyeda_schematic_create_polygon` | high | Beta | 创建不规则多边形边框 |
+| `easyeda_schematic_create_text` | high | Beta | 创建原理图说明文本 |
 | `knowledge_sources` | read | 可用 | 已授权资料源和索引统计，不返回绝对路径 |
 | `knowledge_search` | read | 可用 | 中英文全文检索及页码/行号/哈希引用 |
 | `knowledge_read` | read | 可用 | 仅按已索引文档或分块 ID 读取内容 |
@@ -774,7 +832,9 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 | POST | `/v1/chat/stream` | 统一 SSE 对话；实时阶段、推理、正文、工具状态、Token、可选 ChangeSet 和最终结果 |
 | POST | `/v1/plan` | 旧客户端兼容接口；新 EDA 面板不再调用 |
 | GET | `/v1/tasks/:taskId` | 查询任务 |
-| POST | `/v1/tasks/:taskId/confirm` | 确认并执行写操作 |
+| POST | `/v1/approvals/:approvalId` | 提交流式回合内写操作的实时审批决定（approve/reject，可选会话级自动批准） |
+| POST | `/v1/tasks/:taskId/retry` | 将失败任务中未成功的操作克隆为新的待确认 attempt，不调用模型 |
+| POST | `/v1/tasks/:taskId/confirm` | 确认并执行写操作（逐条执行，单条失败不阻断其余操作） |
 | POST | `/v1/tasks/:taskId/cancel` | 取消等待确认的任务 |
 | POST | `/v1/context` | 读取并保存最新 EDA 快照 |
 | POST | `/v1/drc` | 直接运行 DRC/ERC |
@@ -793,6 +853,8 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 | `JLCIRCUIT_BRIDGE_TIMEOUT_MS` | `15000` |
 | `JLCIRCUIT_ADMIN_TOKEN` | 可选；统一保护 MCP 与资料库配置/生命周期 API |
 | `JLCIRCUIT_ADMIN_ALLOWED_ORIGINS` | 可选；额外管理请求 Origin allowlist；Agent 自身回环 Origin 默认允许 |
+| `JLCIRCUIT_WRITE_APPROVAL_MODE` | `inline`；流式回合内实时审批写操作；设为 `changeset` 恢复全量待确认计划流程 |
+| `JLCIRCUIT_WRITE_APPROVAL_TIMEOUT_MS` | `180000`；单条写操作审批等待上限，超时退回 ChangeSet（等待时间计入 `JLCIRCUIT_AGENT_MAX_ELAPSED_MS` 总预算） |
 
 ### 14.2 Skill Registry
 
@@ -830,29 +892,46 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 | `JLCIRCUIT_KNOWLEDGE_CHUNK_CHARS` | `4000`，分块字符数 |
 | `JLCIRCUIT_KNOWLEDGE_CHUNK_OVERLAP` | `300`，相邻分块重叠字符数，最大不超过块长一半 |
 
-### 14.5 语言模型
+### 14.5 Codex App Server Provider 进程池
+
+| 配置 | 默认值/作用 |
+| --- | --- |
+| `JLCIRCUIT_AGENT_BACKEND` | `codex-app-server`；设为 `legacy` 启用旧后端 |
+| `JLCIRCUIT_CODEX_COMMAND` | `codex`；可指定 Codex CLI 可执行文件 |
+| `JLCIRCUIT_CODEX_PROVIDERS_CONFIG` | `.jlcircuit-data/codex-providers.json` |
+| `JLCIRCUIT_CODEX_HOME_ROOT` | `.jlcircuit-data/codex-home`；每 Provider 独立 App Server 状态和空工作目录 |
+| `JLCIRCUIT_CODEX_MAX_PROCESSES` | `4`；可同时驻留的 Provider 子进程数 |
+| `JLCIRCUIT_CODEX_REQUEST_TIMEOUT_MS` | `30000`；App Server JSON-RPC 控制请求超时，不是整轮模型超时 |
+| `JLCIRCUIT_LLM_TOOL_RESULT_MAX_CHARS` | 单个工具结果回传模型的字符预算，默认 50000；超限时截断并提示使用筛选参数 |
+| `JLCIRCUIT_AGENT_MAX_TOOL_CALLS` | 单次运行工具调用总预算，默认 40 |
+| `JLCIRCUIT_AGENT_MAX_ELAPSED_MS` | 单次运行时间预算，默认 300000ms |
+
+Provider JSON 包含 `defaultProvider` 和 `providers`；每个 Provider 必须配置 `baseUrl`、`model`、`apiKeyEnv`、`wireApi: "responses"`，并可配置 `reasoningEffort`、请求/流重试、流空闲超时、HTTP Headers、Query Params 和 `modelMetadata`。第三方模型的 `modelMetadata` 以 `contextWindow`、`maxOutputTokens`、`inputModalities`、可选 `reasoningEfforts`/`defaultReasoningEffort` 描述模型能力；服务会为该 Provider 生成隔离的 `jlcircuit-model-catalog.json` 并以 `model_catalog_json` 传给其 App Server。目录文件无密钥、属于运行时产物，避免修改用户全局 Codex 配置，也避免未知模型回落到不准确的默认元数据。密钥由 Agent Service 的环境复制到对应子进程；静态 `httpHeaders` 中禁止 Authorization/API-Key 类敏感头，额外敏感头必须通过 `envHttpHeaders` 引用环境变量。示例见 `config/codex-providers.example.json`。
+
+如果 Provider 配置文件不存在，服务会尝试从旧 `JLCIRCUIT_MODEL_PROVIDER`/`JLCIRCUIT_LLM_*` 环境合成一个进程内配置，便于迁移；正式部署应使用独立 JSON。配置在服务启动时加载，当前尚无热重载。
+
+### 14.6 Legacy Chat Completions 与视觉路由
+
+以下配置只完整适用于 `JLCIRCUIT_AGENT_BACKEND=legacy`；其中工具结果预算和 Agent 总预算由两个后端共用。
 
 | 配置 | 作用 |
 | --- | --- |
-| `JLCIRCUIT_MODEL_PROVIDER` | 提供方标识或 `stub` |
-| `JLCIRCUIT_LLM_BASE_URL` | OpenAI-compatible Base URL |
+| `JLCIRCUIT_MODEL_PROVIDER` | 旧提供方标识或 `stub` |
+| `JLCIRCUIT_LLM_BASE_URL` | Chat Completions-compatible Base URL |
 | `JLCIRCUIT_LLM_API_KEY` | API Key |
 | `JLCIRCUIT_LLM_MODEL` | 语言模型名 |
-| `JLCIRCUIT_LLM_TIMEOUT_MS` | 请求超时 |
-| `JLCIRCUIT_LLM_MAX_TOKENS` | 单次请求最大输出 token（含部分模型的 reasoning）；默认 `4096` |
+| `JLCIRCUIT_LLM_TIMEOUT_MS` | 请求流空闲超时 |
+| `JLCIRCUIT_LLM_MAX_TOKENS` | 单次请求最大输出 token，默认 `4096` |
 | `JLCIRCUIT_LLM_STREAMING` | 是否使用模型 SSE，默认 true |
-| `JLCIRCUIT_LLM_REASONING_EFFORT` | 普通请求 reasoning 强度；留空使用供应商默认 |
-| `JLCIRCUIT_LLM_FINAL_REASONING_EFFORT` | 最终总结和长度恢复 reasoning 强度；OpenRouter 默认 minimal |
+| `JLCIRCUIT_LLM_TOOL_STREAM` | 是否发送流式 Function Call 扩展参数 |
+| `JLCIRCUIT_LLM_REASONING_EFFORT` | 普通请求 reasoning 强度 |
+| `JLCIRCUIT_LLM_FINAL_REASONING_EFFORT` | 最终总结和长度恢复 reasoning 强度 |
 | `JLCIRCUIT_LLM_MAX_LENGTH_RECOVERIES` | `finish_reason=length` 后自动总结次数，默认 1 |
-| `JLCIRCUIT_AGENT_MAX_TOOL_CALLS` | 单次运行工具调用总预算，默认 40 |
-| `JLCIRCUIT_AGENT_MAX_ELAPSED_MS` | 单次运行时间预算，默认 300000ms |
-| `JLCIRCUIT_AGENT_MAX_NO_PROGRESS` | 触发换策略的连续无进展操作数，默认 2 |
-| `JLCIRCUIT_AGENT_MAX_RETRIES_PER_ACTION` | 相同动作额外重试次数，默认 2 |
-| `JLCIRCUIT_AGENT_FINALIZE_TIMEOUT_MS` | 预算触发后最终总结超时，默认 60000ms |
+| `JLCIRCUIT_AGENT_MAX_NO_PROGRESS` | 旧 Supervisor 连续无进展阈值，默认 2 |
+| `JLCIRCUIT_AGENT_MAX_RETRIES_PER_ACTION` | 旧 Supervisor 相同动作重试上限，默认 2 |
+| `JLCIRCUIT_AGENT_FINALIZE_TIMEOUT_MS` | 旧 Supervisor 最终总结超时，默认 60000ms |
 
-### 14.6 视觉模型
-
-| 配置 | 作用 |
+| 视觉配置 | 作用 |
 | --- | --- |
 | `JLCIRCUIT_LLM_SUPPORTS_VISION` | 当前语言模型是否直接支持图片 |
 | `JLCIRCUIT_VISION_LLM_BASE_URL` | 独立视觉模型地址 |
@@ -860,14 +939,16 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 | `JLCIRCUIT_VISION_LLM_MODEL` | 独立视觉模型名 |
 | `JLCIRCUIT_VISION_LLM_TIMEOUT_MS` | 视觉请求超时 |
 
+Codex App Server 路径把截图作为动态工具 `inputImage` 返回当前 Provider；因此当前要求所选 Provider 模型本身支持图像。跨 Provider 独立视觉降级尚未接入进程池。
+
 ## 15. 安全边界
 
 ### 15.1 已实现
 
 - 服务默认只监听 `127.0.0.1`；
 - 模型不直接访问 EDA API；
-- 模型回合中的非只读工具只记录为待确认操作，不立即执行；
-- 写操作需要确认令牌；
+- 模型回合中的非只读工具必须经过用户批准才执行：流式回合内逐条实时审批（可会话级自动批准），无审批通道时记录为待确认 ChangeSet；
+- 在线审批的请求、决定和自动批准均写入审计事件；ChangeSet 路径的写操作需要确认令牌；
 - 写入前重新校验项目和文档；
 - 项目级会话隔离；
 - EDA 工具有风险等级和静态 allowlist；
@@ -892,6 +973,7 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 - capability 上报没有用于服务端动态禁用不可用工具；
 - 确认令牌会持久化并通过任务 API 返回，当前安全前提是 Agent 只在可信本机运行；
 - SQLite 中包含项目上下文和对话，不应放到公共同步目录；
+- Provider JSON 不保存密钥；Provider 子进程只继承必要系统环境、本 Provider 密钥和显式 Header 环境变量，并使用独立 `CODEX_HOME`，但仍只能使用受信的 `codex` 可执行文件和配置；
 - 审计日志可被本机用户修改，不是合规级防篡改日志；
 - 直接 `/v1/tools/:toolName` 调用仍依赖工具自身的 `confirmWrite` 校验，不应暴露到非本机网络。
 - 尚无 MCP OAuth 交互授权、自动重连、签名安装和强进程沙箱；stdio Server 是本机子进程，必须只配置可信命令。
@@ -900,7 +982,7 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 
 ## 16. 当前已知限制
 
-1. 真实写入只支持原理图元件移动。
+1. 原理图已支持器件库搜索、移动/放置元件和创建导线、总线、矩形、多边形、文本；删除、替换、属性修改、网络标签、端口和电源符号尚未开放。
 2. 元件移动不是鼠标拖拽的完全等价实现。
 3. 通用 `applyChangeSet` 明确未启用。
 4. PCB 写入、自动布线、铺铜和规则修改尚未开放。
@@ -910,10 +992,15 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 8. Skill Registry 目前只支持声明式提示与静态工具权限，不执行代码，也不支持依赖解析和热安装。
 9. 本地资料库目前只有 FTS5 全文检索，没有向量/混合检索、OCR、网页采集或嘉立创专有设计格式解析。
 10. Datasheet Review 尚未建立永久结构化参数库、表格级解析器或文档版本优先级；交叉检查质量仍受 EDA 引脚/网络可见性限制。
-11. 任务执行没有通用事务或自动回滚点；元件移动工具已单独实现写前快照、失败回滚和端点复核。
-12. Bridge 只支持单个活动 EDA 连接。
-13. MCP 外部写工具不会提供给模型，也没有确认执行链。
-14. Node.js 内置 SQLite 在当前 Node 24 运行时可能打印 `ExperimentalWarning`。
+11. Codex Provider 进程池目前只支持 Responses wire API；Chat Completions-only 供应商必须使用旧后端。
+12. App Server 动态工具接口仍属于 experimental API；当前已用 Codex CLI 0.151.0 生成的协议类型复核，并由本地协议夹具回归，升级 CLI 时必须重跑兼容测试。
+13. Provider 配置只在 Agent Service 启动时加载，尚无热重载、空闲进程淘汰或自动故障转移。
+14. Codex 后端的截图交给当前 Provider 模型，尚未接入独立视觉 Provider 降级。
+15. Codex thread 使用 `read-only` sandbox、空工作目录和禁止 shell/文件读取的开发指令；当前仍没有独立 OS 账户或容器级强隔离，部署方必须把 Provider 子进程视为受信本机代码。
+16. 任务执行没有通用事务或自动回滚点；ChangeSet 批量执行为逐条独立执行，单条失败不阻断也不回滚其他操作（部分成功会在任务消息中给出成功/失败统计，重试仅重放失败项）。元件移动工具已单独实现写前快照、失败回滚和端点复核，新增 create 类工具目前只有单项参数/读回校验。
+17. Bridge 只支持单个活动 EDA 连接。
+18. MCP 外部写工具不会提供给模型，也没有确认执行链。
+19. Node.js 内置 SQLite 在当前 Node 24 运行时可能打印 `ExperimentalWarning`。
 
 ## 17. 完整目标架构的开发路线
 
@@ -924,6 +1011,7 @@ Bridge 当前只保留一个活动 EDA 连接；新连接会替换旧连接。�
 | 阶段 0：EDA Bridge 与可视验证 | 部分实现 | WebSocket Bridge、上下文读取、DRC、截图、实验性元件移动；复杂连线和更多 EDA API 仍需验证 |
 | 阶段 1：多轮交互与安全计划 | 已实现 | 统一流式对话、允许正常回答或追问、ChangeSet、确认/取消、任务卡片 |
 | 阶段 2：上下文、会话与持久化 | 已实现 | 项目级会话、消息历史、滚动摘要、活动任务、EDA 快照、SQLite 和审计 |
+| 阶段 2.1：Codex 智能体内核与 Provider 池 | 部分实现 | App Server 子进程池、请求级 Provider 选择、动态工具、流式事件、token、thread 持久化和旧后端回退已完成；热重载、自动路由/降级和独立视觉降级仍在开发 |
 | 阶段 3：声明式 Skill Registry | 已实现 | 扫描、校验、自动/显式选择、提示注入、工具权限裁剪、状态持久化和 EDA 面板选择器；仍需扩大真实 EDA 多技能回归范围 |
 | 阶段 4：Plugin/MCP Gateway | 部分实现 | 官方 MCP Client、stdio/Streamable HTTP、配置管理界面、CRUD、连接测试、能力查看、发现、命名空间、allowlist、风险、超时和审计；OAuth、自动重连、安装沙箱及外部写执行仍在开发 |
 | 阶段 5：Local Knowledge | 部分实现 | 已完成授权目录、PDF/文本/BOM/网表解析、FTS5 检索、来源引用、管理界面和只读模型工具；向量检索、OCR、网页/专有设计格式解析仍在开发 |
@@ -1019,18 +1107,19 @@ npm run build:extension
 输出：
 
 ```text
-extensions/jlcircuit-eda/build/dist/jlcircuit-agent_v0.3.8.eext
+extensions/jlcircuit-eda/build/dist/jlcircuit-agent_v0.3.9.eext
 ```
 
 测试覆盖当前包括：
 
 - SQLite 关闭并重新打开后的会话、消息、任务、技能状态和审计恢复；
-- SQLite v1 到 v4 的技能、MCP 状态和知识索引迁移；
+- SQLite v1 到 v6 的技能、MCP 状态、知识索引和 Codex thread 映射迁移；
 - 较早消息滚动摘要；
 - Context Engine 合并历史、活动任务和最新 EDA 快照；
 - 跨项目会话污染阻止；
 - 目标驱动 Agent 可跨越三次工具请求继续运行，并在工具/时间预算或无进展熔断后执行无工具阶段总结；
 - 模型可区分普通完成、等待用户输入和工具阻塞，内部状态标记不会显示给用户；
+- Codex Provider 配置校验、App Server JSON-RPC 初始化、动态只读/写工具、流式 reasoning/content/usage、进程复用和 thread 持久化恢复；
 - Skill Registry 的 always、关键字和显式选择；
 - 内置 Datasheet Review 技能自动激活、专业证据工具与 EDA 只读权限联合裁剪；
 - 技能工具权限并集、启停持久化和非法清单诊断；
